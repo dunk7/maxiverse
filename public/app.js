@@ -9,7 +9,7 @@ const objects = [
     name: "AppController",
     type: "controller",
     media: [
-      { id: 1, name: "blue circle", type: "image", path: "/media/blue_circle.png" }
+      { id: 1, name: "gear", type: "image", path: "/images/gear.png" }
     ],
     code: [
       { id: 0, type: "start", location: {x: 0, y: 0}, content: "start", val_a: null, val_b: null, next_block: 1, position: {x: 20, y: 20} },
@@ -319,6 +319,17 @@ function createBox(boxData) {
     box.className = "box";
     box.dataset.id = boxData.id;
 
+    // Create icon element
+    const icon = document.createElement("img"); // Use <img> instead of <image>
+    // Check if media exists and has a valid path
+    if (boxData.media && boxData.media.length > 0 && boxData.media[0].path) {
+        icon.src = boxData.media[0].path; // Set src to the media path
+        icon.alt = boxData.media[0].name; // Optional: set alt text
+        icon.style.width = "75px"; // Optional: set a size for the icon
+        icon.style.height = "75px";
+        box.appendChild(icon);
+    }
+
     const name = document.createElement("span");
     name.className = "object-name";
     name.textContent = boxData.name;
@@ -329,7 +340,7 @@ function createBox(boxData) {
             otherBox.classList.remove("selected");
         });
         box.classList.add("selected");
-        selected_object = box.dataset.id;
+        selected_object = boxData.id;
         updateWorkspace();
     });
 
