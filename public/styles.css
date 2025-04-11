@@ -138,8 +138,8 @@ button {
 }
 
 /* Mobile Adjustments */
-@media (max-width: 768px) {
-  #node-window {
+@media (max-width: 1000px) {
+ /* #node-window {
     width: 100vw;
     height: 50vh;
     top: 0;
@@ -154,17 +154,17 @@ button {
     height: 25vh;
     bottom: 0;
     right: 0;
-  }
+  }*/
   .grid {
-    grid-template-columns: repeat(auto-fit, 100px);
+    grid-template-columns: repeat(auto-fit, 120px);
   }
   .box {
-    width: 80px;
-    height: 80px;
-    padding: 5px;
+    width: 90px;
+    height: 90px;
+    /*padding: 0px;*/
   }
   .node-block {
-    min-width: 120px;
+    min-width: 100px;
     font-size: 0.8rem;
   }
 }

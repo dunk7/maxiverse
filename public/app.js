@@ -13,7 +13,6 @@ const objects = [
     ],
     code: [
       { id: 0, type: "start", location: {x: 0, y: 0}, content: "start", val_a: null, val_b: null, next_block: 1, position: {x: 20, y: 20} },
-      { id: 1, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 5, val_b: 5, next_block: null, position: {x: 20, y: 100} }
     ]
   },
   {
@@ -23,6 +22,9 @@ const objects = [
     media: [],
     code: [
         { id: 0, type: "start", location: {x: 0, y: 0}, content: "When Created", val_a: null, val_b: null, next_block: 1, position: {x: 20, y: 20} },
+        { id: 1, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 5, val_b: 5, next_block: 2, position: {x: 20, y: 100} },
+        { id: 2, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 10, val_b: 0, next_block: 3, position: {x: 20, y: 150} },
+        { id: 3, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 15, val_b: -5, next_block: 4, position: {x: 20, y: 200} }
 
     ]
   },
