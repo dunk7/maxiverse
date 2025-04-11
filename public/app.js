@@ -9,7 +9,7 @@ const objects = [
     name: "AppController",
     type: "controller",
     media: [
-      { id: 1, name: "gear", type: "image", path: "/images/gear.png" }
+      { id: 1, name: "gear", type: "image", path: "./images/gear.png" }
     ],
     code: [
       { id: 0, type: "start", location: {x: 0, y: 0}, content: "start", val_a: null, val_b: null, next_block: 1, position: {x: 20, y: 20} },
