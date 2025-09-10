@@ -1,0 +1,16 @@
+{
+  "name": "maxiverse-editor",
+  "version": "1.0.0",
+  "description": "Visual game development editor",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  },
+  "keywords": ["game", "editor", "visual-programming"],
+  "author": "",
+  "license": "ISC"
+}

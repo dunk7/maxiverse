@@ -11,7 +11,38 @@
 <body>
   <div class="container">
     <div class="workspace">
-      <div id="node-window"></canvas>
+      <div class="top-bar">
+        <div class="logo">
+          <img src="./images/gear.png" alt="Maxiverse Logo">
+          <span>Maxiverse</span>
+        </div>
+        <div class="menu-bar">
+          <button class="menu-btn">File</button>
+          <div class="edit-menu-container">
+            <button class="menu-btn edit-menu-btn" onclick="toggleEditMenu()" onmouseenter="console.log('Edit button hovered')" onmouseleave="console.log('Edit button left')">Edit</button>
+            <div class="undo-menu" id="edit-dropdown">
+              <button class="undo-menu-item" onclick="handleEditAction('undo')">Undo</button>
+              <div class="menu-separator"></div>
+              <button class="undo-menu-item" onclick="handleEditAction('cut')">Cut</button>
+              <button class="undo-menu-item" onclick="handleEditAction('copy')">Copy</button>
+              <button class="undo-menu-item" onclick="handleEditAction('paste')">Paste</button>
+              <div class="menu-separator"></div>
+              <button class="undo-menu-item" onclick="handleEditAction('selectAll')">Select All</button>
+            </div>
+          </div>
+        </div>
+        <div class="asset-tabs">
+          <button class="asset-tab code-tab">Code</button>
+          <button class="asset-tab images-tab">Images</button>
+          <button class="asset-tab sound-tab">Sound</button>
+          <button class="asset-tab threed-tab">3D</button>
+        </div>
+        <div class="profile-section">
+          <img src="./images/gear.png" alt="Profile Photo" class="profile-photo">
+          <button class="profile-btn">Profile</button>
+        </div>
+      </div>
+      <div id="node-window"></div>
     </div>
     <div class="stage">
       <canvas id="game-window"></canvas>
