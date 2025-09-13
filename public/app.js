@@ -10,7 +10,7 @@ const objects = [
     type: "controller",
     media: [],
     code: [
-      { id: 0, type: "start", location: {x: 0, y: 0}, content: "start", val_a: null, val_b: null, next_block: 1, position: {x: 20, y: 20} },
+      { id: 0, type: "start", location: {x: 0, y: 0}, content: "start", val_a: null, val_b: null, next_block_a: null, next_block_b: null, position: {x: 20, y: 20} },
     ]
   },
   {
@@ -19,10 +19,10 @@ const objects = [
     type: "object",
     media: [],
     code: [
-        { id: 0, type: "start", location: {x: 0, y: 0}, content: "When Created", val_a: null, val_b: null, next_block: 1, position: {x: 20, y: 20} },
-        { id: 1, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 5, val_b: 5, next_block: 2, position: {x: 20, y: 100} },
-        { id: 2, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 10, val_b: 0, next_block: 3, position: {x: 20, y: 150} },
-        { id: 3, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 15, val_b: -5, next_block: null, position: {x: 20, y: 200} }
+        { id: 0, type: "start", location: {x: 0, y: 0}, content: "When Created", val_a: null, val_b: null, next_block_a: 1, next_block_b: null, position: {x: 20, y: 20} },
+        { id: 1, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 5, val_b: 5, next_block_a: 2, next_block_b: null, position: {x: 20, y: 100} },
+        { id: 2, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 10, val_b: 0, next_block_a: 3, next_block_b: null, position: {x: 20, y: 150} },
+        { id: 3, type: "action", location: {x: 0, y: 0}, content: "move_xy", val_a: 15, val_b: -5, next_block_a: null, next_block_b: null, position: {x: 20, y: 200} }
 
     ]
   },
@@ -34,6 +34,63 @@ const objects = [
     code: []
   }
 ];
+
+// Migrate legacy code links from next_block to next_block_a/next_block_b
+function migrateCodeModel() {
+    objects.forEach(o => {
+        if (!Array.isArray(o.code)) return;
+        o.code.forEach(b => {
+            if (b && typeof b.next_block !== 'undefined') {
+                b.next_block_a = (b.next_block === null || typeof b.next_block === 'undefined') ? null : b.next_block;
+                b.next_block_b = (typeof b.next_block_b === 'undefined') ? null : b.next_block_b;
+                delete b.next_block;
+            } else {
+                if (typeof b.next_block_a === 'undefined') b.next_block_a = null;
+                if (typeof b.next_block_b === 'undefined') b.next_block_b = null;
+            }
+        });
+    });
+}
+
+// Ensure all objects have a start block
+function ensureStartBlocks() {
+    objects.forEach(obj => {
+        if (!Array.isArray(obj.code)) obj.code = [];
+        const hasStartBlock = obj.code.some(block => block && block.type === 'start');
+        if (!hasStartBlock) {
+            const startBlock = {
+                id: 0,
+                type: "start",
+                location: {x: 0, y: 0},
+                content: obj.type === 'controller' ? "start" : "When Created",
+                val_a: null,
+                val_b: null,
+                next_block_a: null,
+                next_block_b: null,
+                position: {x: 20, y: 20}
+            };
+            obj.code.unshift(startBlock);
+        }
+    });
+}
+
+migrateCodeModel();
+ensureStartBlocks();
+// Ensure a default public variable 'i' exists on the AppController
+function ensureDefaultPublicVariableI() {
+    try {
+        const app = objects.find(o => o.type === 'controller' || o.name === 'AppController');
+        if (!app) return;
+        if (!Array.isArray(app.variables)) app.variables = [];
+        if (!app.variables.includes('i')) app.variables.push('i');
+    } catch (_) {}
+}
+ensureDefaultPublicVariableI();
+
+// Silence existing debug logs while allowing explicit print() block to log
+const __ORIG_CONSOLE__ = { log: console.log.bind(console), warn: console.warn.bind(console) };
+console.log = function(){};
+console.warn = function(){};
 
 // Variables
 let selected_object = 0;
@@ -53,9 +110,49 @@ const tabs = ['images', 'code', 'sound', 'threed'];
 // ===== Runtime/Play State =====
 let isPlaying = false;
 let runtimePositions = {}; // world coords centered at (0,0): { [objectId]: { x, y } }
+let runtimeExecState = {}; // per object execution state
+let runtimeVariables = {}; // per instance variables: { [instanceId]: { [name]: number } }
+let runtimeGlobalVariables = {}; // shared public variables across all instances: { [name]: number }
+let lastCreatedVariable = null; // { name: string, isPrivate: boolean }
+let lastCreatedVariableByObject = {}; // { [objectId: number]: { name: string, isPrivate: true } }
+let lastCreatedPublicVariable = null; // { name: string, isPrivate: false }
 let playLoopHandle = null;
 let playStartTime = 0;
 let lastFrameTime = 0;
+// Mouse and keyboard state for input blocks
+const runtimeMouse = { x: 0, y: 0 };
+let runtimeMousePressed = false;
+const runtimeKeys = {};
+// Runtime instances are the only things that "exist" in the game world while playing
+// Each instance references a template object in `objects` by templateId
+let runtimeInstances = []; // { instanceId, templateId }
+let nextInstanceId = 1;
+let instancesPendingRemoval = new Set();
+let instancesPendingCreation = [];
+
+// Track mouse relative to game window center
+const gameCanvas = document.getElementById('game-window');
+if (gameCanvas) {
+    gameCanvas.addEventListener('mousemove', (e) => {
+        const rect = gameCanvas.getBoundingClientRect();
+        const localX = e.clientX - rect.left;
+        const localY = e.clientY - rect.top;
+        runtimeMouse.x = Math.round(localX - rect.width / 2);
+        runtimeMouse.y = Math.round(rect.height / 2 - localY);
+    });
+    gameCanvas.addEventListener('mousedown', () => { runtimeMousePressed = true; });
+    gameCanvas.addEventListener('mouseup', () => { runtimeMousePressed = false; });
+    gameCanvas.addEventListener('mouseleave', () => { runtimeMousePressed = false; });
+}
+// Ensure mouse release anywhere clears pressed
+window.addEventListener('mouseup', () => { runtimeMousePressed = false; });
+// Track key pressed state (normalize Space key)
+function normalizeKeyName(k) {
+    if (k === ' ' || k === 'Spacebar') return 'Space';
+    return k;
+}
+document.addEventListener('keydown', (e) => { const k = normalizeKeyName(e.key); runtimeKeys[k] = true; });
+document.addEventListener('keyup', (e) => { const k = normalizeKeyName(e.key); runtimeKeys[k] = false; });
 // Cache images by URL so we don't reload every frame
 const imageCache = {};
 function getCanvasCenter() {
@@ -70,46 +167,380 @@ function worldToCanvas(x, y, canvas) {
 }
 function resetRuntimePositions() {
     runtimePositions = {};
-    objects.forEach(o => {
-        if (o.media && o.media[0] && o.media[0].path) {
-            runtimePositions[o.id] = { x: 0, y: 0 };
-        }
+    runtimeInstances.forEach(inst => {
+        runtimePositions[inst.instanceId] = { x: 0, y: 0 };
     });
 }
 function stepInterpreter(dtMs) {
-    // For simplicity, on play start we immediately execute the "When Created" chains once
-    // and then stop further interpreting (we still animate render positions).
     if (!isPlaying) return;
+    // Fair scheduling: limit per-instance steps to avoid one instance starving others
+    const maxStepsPerObject = 50;
+    for (const inst of runtimeInstances) {
+        const o = objects.find(obj => obj.id === inst.templateId);
+        const exec = runtimeExecState[inst.instanceId];
+        if (!o || !exec) continue;
+        const code = o.code || [];
+
+        // Handle active wait first
+        if (exec.waitMs > 0) {
+            exec.waitMs -= dtMs;
+            if (exec.waitMs > 0) continue; // still waiting
+            exec.waitMs = 0;
+            if (exec.waitingBlockId != null) {
+                const waitingBlock = code.find(b => b && b.id === exec.waitingBlockId);
+                exec.waitingBlockId = null;
+                if (waitingBlock) {
+                    exec.pc = (typeof waitingBlock.next_block_a === 'number') ? waitingBlock.next_block_a : null;
+                }
+            }
+        }
+
+        let steps = 0;
+        while (isPlaying && exec.pc != null && steps++ < maxStepsPerObject) {
+            const block = code.find(b => b && b.id === exec.pc);
+            if (!block) { exec.pc = null; break; }
+            // Resolve inputs for numeric fields if connected
+            const resolveInput = (blockRef, key) => {
+                const inputId = blockRef[key];
+                if (inputId == null) return null;
+                const node = code.find(b => b && b.id === inputId);
+                if (!node) return null;
+                if (node.content === 'mouse_x') return runtimeMouse.x;
+                if (node.content === 'mouse_y') return runtimeMouse.y;
+                if (node.content === 'object_x') { const pos = runtimePositions[inst.instanceId] || { x: 0, y: 0 }; return (typeof pos.x === 'number') ? pos.x : 0; }
+                if (node.content === 'object_y') { const pos = runtimePositions[inst.instanceId] || { x: 0, y: 0 }; return (typeof pos.y === 'number') ? pos.y : 0; }
+                if (node.content === 'rotation') { const pos = runtimePositions[inst.instanceId] || { rot: 0 }; return (typeof pos.rot === 'number') ? pos.rot : 0; }
+                if (node.content === 'size') { const pos = runtimePositions[inst.instanceId] || { scale: 1 }; return (typeof pos.scale === 'number') ? pos.scale : 1; }
+                if (node.content === 'mouse_pressed') return runtimeMousePressed ? 1 : 0;
+                if (node.content === 'key_pressed') return runtimeKeys[node.key_name] ? 1 : 0;
+                if (node.content === 'image_name') {
+                    try {
+                        // Determine current image name for this instance
+                        const tmpl = objects.find(o => o.id === inst.templateId);
+                        const path = (runtimePositions[inst.instanceId] && runtimePositions[inst.instanceId].spritePath)
+                            || (tmpl && tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
+                        if (!tmpl || !path) return '';
+                        const images = objectImages[String(tmpl.id)] || [];
+                        const base = path.split('?')[0];
+                        const found = images.find(img => (img.src || '').split('?')[0] === base);
+                        return (found && found.name) ? found.name : '';
+                    } catch (_) { return ''; }
+                }
+                if (node.content === 'distance_to') {
+                    const pos = runtimePositions[inst.instanceId] || { x: 0, y: 0 };
+                    const tx = Number((node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0));
+                    const ty = Number((node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0));
+                    const dx = (typeof pos.x === 'number' ? pos.x : 0) - tx;
+                    const dy = (typeof pos.y === 'number' ? pos.y : 0) - ty;
+                    return Math.hypot(dx, dy);
+                }
+                if (node.content === 'random_int') {
+                    const minVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const maxVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
+                    let a = Number(minVal);
+                    let b = Number(maxVal);
+                    if (Number.isNaN(a)) a = 0;
+                    if (Number.isNaN(b)) b = 0;
+                    if (a > b) { const t = a; a = b; b = t; }
+                    return Math.floor(Math.random() * (b - a + 1)) + a; // inclusive
+                }
+                if (node.content === 'operation') {
+                    const xVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.op_x ?? 0) : (node.op_x ?? 0);
+                    const yVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.op_y ?? 0) : (node.op_y ?? 0);
+                    switch (node.val_a) {
+                        case '+': return xVal + yVal;
+                        case '-': return xVal - yVal;
+                        case '*': return xVal * yVal;
+                        case '/': return yVal === 0 ? 0 : xVal / yVal;
+                        case '^': return Math.pow(xVal, yVal);
+                        default: return xVal + yVal;
+                    }
+                }
+                if (node.content === 'not') {
+                    const v = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const num = Number(v) || 0;
+                    return num ? 0 : 1;
+                }
+                if (node.content === 'equals') {
+                    const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
+                    const A = (aVal == null) ? '' : aVal;
+                    const B = (bVal == null) ? '' : bVal;
+                    return A == B ? 1 : 0;
+                }
+                if (node.content === 'less_than') {
+                    const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
+                    let A = Number(aVal);
+                    let B = Number(bVal);
+                    if (Number.isNaN(A)) A = 0;
+                    if (Number.isNaN(B)) B = 0;
+                    return A < B ? 1 : 0;
+                }
+                if (node.content === 'variable') {
+                    const varName = node.var_name || '';
+                    if (node.var_instance_only) {
+                        const vars = runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId] = {});
+                        const v = vars[varName];
+                        return typeof v === 'number' ? v : 0;
+                    } else {
+                        const v = runtimeGlobalVariables[varName];
+                        return typeof v === 'number' ? v : 0;
+                    }
+                }
+                return null;
+            };
+
+            if (block.type === 'action') {
+                if (block.content === 'move_xy') {
+                    const dx = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const dy = Number(resolveInput(block, 'input_b') ?? block.val_b ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    runtimePositions[inst.instanceId].x += dx;
+                    runtimePositions[inst.instanceId].y += dy;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'rotate') {
+                    // Store rotation per object; create if absent
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    if (runtimePositions[inst.instanceId].rot === undefined) runtimePositions[inst.instanceId].rot = 0;
+                    runtimePositions[inst.instanceId].rot += Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'set_rotation') {
+                    // Set absolute rotation
+                    const absoluteDeg = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    runtimePositions[inst.instanceId].rot = absoluteDeg;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'set_size') {
+                    const s = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    if (runtimePositions[inst.instanceId].scale === undefined) runtimePositions[inst.instanceId].scale = 1;
+                    runtimePositions[inst.instanceId].scale = Math.max(0, s);
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'point_towards') {
+                    // Compute angle from current position to (x,y) and set rot
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    const pos = runtimePositions[inst.instanceId];
+                    const targetX = Number((block.input_a != null ? (resolveInput(block, 'input_a') ?? block.val_a) : block.val_a) ?? 0);
+                    const targetY = Number((block.input_b != null ? (resolveInput(block, 'input_b') ?? block.val_b) : block.val_b) ?? 0);
+                    const dx = (typeof pos.x === 'number' ? pos.x : 0) - targetX;
+                    const dy = targetY - (typeof pos.y === 'number' ? pos.y : 0);
+                    // In our world coord system, +x right, +y up; canvas y inverted elsewhere. Use atan2(dy, dx)
+                    const angleRad = Math.atan2(dy, dx);
+                    const angleDeg = angleRad * 180 / Math.PI;
+                    // Adjust so sprite's TOP points toward target (sprites face up at 0deg)
+                    pos.rot = angleDeg - 90;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'change_size') {
+                    const ds = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    if (runtimePositions[inst.instanceId].scale === undefined) runtimePositions[inst.instanceId].scale = 1;
+                    runtimePositions[inst.instanceId].scale = Math.max(0, (runtimePositions[inst.instanceId].scale || 1) + ds);
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'wait') {
+                    const seconds = Math.max(0, parseFloat(resolveInput(block, 'input_a') ?? block.val_a ?? 0));
+                    // Start waiting on first encounter for THIS instance only
+                    if (exec.waitMs <= 0 || exec.waitingBlockId !== block.id) {
+                        exec.waitMs = seconds * 1000; // supports fractional seconds
+                        exec.waitingBlockId = block.id;
+                    }
+                    // Stop executing further this frame
+                    break;
+                }
+                if (block.content === 'repeat') {
+                    const times = Math.max(0, Number(block.val_a || 0));
+                    if (times <= 0) {
+                        exec.pc = (typeof block.next_block_b === 'number') ? block.next_block_b : null;
+                        continue;
+                    }
+                    exec.repeatStack.push({ repeatBlockId: block.id, timesRemaining: times, afterId: (typeof block.next_block_b === 'number') ? block.next_block_b : null });
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'print') {
+                    const val = (block.input_a != null) ? (resolveInput(block, 'input_a') ?? block.val_a ?? '') : (block.val_a ?? '');
+                    try { __ORIG_CONSOLE__.log(val); } catch(_) {}
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'if') {
+                    const condVal = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const isTrue = condVal ? true : false;
+                    exec.pc = isTrue ? ((typeof block.next_block_b === 'number') ? block.next_block_b : null)
+                                     : ((typeof block.next_block_a === 'number') ? block.next_block_a : null);
+                    continue;
+                }
+                if (block.content === 'set_x') {
+                    const x = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    runtimePositions[inst.instanceId].x = x;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'set_y') {
+                    const y = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    runtimePositions[inst.instanceId].y = y;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'switch_image') {
+                    const imgs = getCurrentObjectImages();
+                    let found = null;
+                    if (block.input_a != null) {
+                        const sel = resolveInput(block, 'input_a');
+                        if (typeof sel === 'string') {
+                            found = imgs.find(img => img.name === sel);
+                        } else {
+                            found = imgs.find(img => String(img.id) === String(sel));
+                        }
+                    } else {
+                        found = imgs.find(img => String(img.id) === String(block.val_a));
+                    }
+                    if (found) {
+                        if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                        runtimePositions[inst.instanceId].spritePath = found.src;
+                    }
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    renderGameWindowSprite();
+                    continue;
+                }
+                if (block.content === 'instantiate') {
+                    const objId = parseInt(block.val_a, 10);
+                    const template = objects.find(obj => obj.id === objId);
+                    if (template) {
+                        const newId = nextInstanceId++;
+                        instancesPendingCreation.push({ instanceId: newId, templateId: template.id });
+                    }
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'delete_instance') {
+                    // Mark this runtime instance for removal (do not delete template/object)
+                    instancesPendingRemoval.add(inst.instanceId);
+                    exec.pc = null;
+                    continue;
+                }
+                if (block.content === 'set_variable') {
+                    const varName = block.var_name || '';
+                    const value = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (block.var_instance_only) {
+                        if (!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId] = {};
+                        runtimeVariables[inst.instanceId][varName] = value;
+                    } else {
+                        runtimeGlobalVariables[varName] = value;
+                    }
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'change_variable') {
+                    const varName = block.var_name || '';
+                    const delta = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (block.var_instance_only) {
+                        if (!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId] = {};
+                        const current = runtimeVariables[inst.instanceId][varName] || 0;
+                        runtimeVariables[inst.instanceId][varName] = current + delta;
+                    } else {
+                        const current = runtimeGlobalVariables[varName] || 0;
+                        runtimeGlobalVariables[varName] = current + delta;
+                    }
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'forever') {
+                    // Enter infinite loop over branch A
+                    exec.repeatStack.push({ repeatBlockId: block.id, timesRemaining: Infinity, afterId: (typeof block.next_block_b === 'number') ? block.next_block_b : null });
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+            }
+            // Unknown block or non-action: just follow next_block_a
+            exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+        }
+
+        // If we reached end of a chain, check repeat stack
+        if (exec.pc == null && exec.repeatStack.length > 0) {
+            const frame = exec.repeatStack[exec.repeatStack.length - 1];
+            frame.timesRemaining -= 1;
+            if (frame.timesRemaining > 0) {
+                // Repeat body again
+                const repeatBlock = code.find(b => b && b.id === frame.repeatBlockId);
+                exec.pc = repeatBlock && (typeof repeatBlock.next_block_a === 'number') ? repeatBlock.next_block_a : null;
+            } else {
+                // Done repeating. Continue after repeat
+                exec.repeatStack.pop();
+                exec.pc = frame.afterId != null ? frame.afterId : null;
+            }
+        }
+    }
+    // Commit any instances that were requested for creation this frame (after all logic)
+    if (instancesPendingCreation && instancesPendingCreation.length > 0) {
+        for (const pending of instancesPendingCreation) {
+            const template = objects.find(o => o.id === pending.templateId);
+            if (!template) continue;
+            runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId });
+            runtimePositions[pending.instanceId] = { x: 0, y: 0 };
+            runtimeVariables[pending.instanceId] = {};
+            const codeT = Array.isArray(template.code) ? template.code : [];
+            const startT = codeT.find(b => b.type === 'start');
+            const pcT = startT && typeof startT.next_block_a === 'number' ? startT.next_block_a : null;
+            runtimeExecState[pending.instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+        }
+        instancesPendingCreation.length = 0;
+    }
+    // Remove any instances that requested deletion this frame
+    if (instancesPendingRemoval && instancesPendingRemoval.size > 0) {
+        runtimeInstances = runtimeInstances.filter(inst => {
+            if (instancesPendingRemoval.has(inst.instanceId)) {
+                delete runtimePositions[inst.instanceId];
+                delete runtimeExecState[inst.instanceId];
+                delete runtimeVariables[inst.instanceId];
+                return false;
+            }
+            return true;
+        });
+        instancesPendingRemoval.clear();
+    }
 }
 function runWhenCreatedChains() {
-    objects.forEach(o => {
-        const code = Array.isArray(o.code) ? o.code : [];
-        // Find a start block (content either 'start' or 'When Created')
-        const start = code.find(b => b.type === 'start');
-        if (!start) return;
-        let currentId = start.next_block;
-        let safety = 0;
-        while (currentId !== null && safety++ < 1000) {
-            const block = code.find(b => b.id === currentId);
-            if (!block) break;
-            if (block.type === 'action' && block.content === 'move_xy') {
-                const dx = Number(block.val_a || 0);
-                const dy = Number(block.val_b || 0);
-                if (!runtimePositions[o.id]) {
-                    runtimePositions[o.id] = { x: 0, y: 0 };
-                }
-                runtimePositions[o.id].x += dx;
-                runtimePositions[o.id].y += dy;
-            }
-            currentId = block.next_block;
-        }
-    });
+    // No-op: interpreter now runs chains over time in stepInterpreter
 }
 function startPlay() {
     if (isPlaying) return;
     isPlaying = true;
+    // Initialize runtime world: only AppController exists at start
+    runtimeInstances = [];
+    runtimeExecState = {};
+    instancesPendingRemoval = new Set();
+    instancesPendingCreation = [];
+    runtimeVariables = {};
+    runtimeGlobalVariables = {};
+    const controller = objects.find(o => o.type === 'controller' || o.name === 'AppController');
+    if (controller) {
+        const instId = nextInstanceId++;
+        runtimeInstances.push({ instanceId: instId, templateId: controller.id });
+        runtimePositions[instId] = { x: 0, y: 0 };
+        runtimeVariables[instId] = {};
+        const code = Array.isArray(controller.code) ? controller.code : [];
+        const start = code.find(b => b.type === 'start');
+        const pc = start && typeof start.next_block_a === 'number' ? start.next_block_a : null;
+        runtimeExecState[instId] = { pc: pc, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+    } else {
+        console.warn('No AppController found to start.');
+    }
     resetRuntimePositions();
-    runWhenCreatedChains();
     playStartTime = performance.now();
     lastFrameTime = playStartTime;
     const loop = () => {
@@ -134,6 +565,7 @@ function stopPlay() {
 function createNodeBlock(codeData, x, y) {
     const block = document.createElement("div");
     block.className = "node-block";
+    if (codeData.type === 'start') block.classList.add('node-block-start');
     block.dataset.codeId = codeData.id;
     block.style.left = `${x}px`;
     block.style.top = `${y}px`;
@@ -144,18 +576,851 @@ function createNodeBlock(codeData, x, y) {
     // Label with dropdowns integrated
     const label = document.createElement("span");
     label.className = "node-label"
+    if (codeData.type === 'value') {
+        block.classList.add('node-block-value');
+    }
+
     if (codeData.content === "move_xy") {
         label.innerHTML = "Move By (";
         const xSelectSpan = document.createElement("span");
+        xSelectSpan.className = 'node-input-container';
         const ySelectSpan = document.createElement("span");
+        ySelectSpan.className = 'node-input-container';
         label.appendChild(xSelectSpan);
         label.innerHTML += ", ";
         label.appendChild(ySelectSpan);
         label.innerHTML += ")";
+    } else if (codeData.content === "wait") {
+        // Wait ( [seconds] )
+        label.textContent = "";
+        label.append("Wait (");
+        const waitSpan = document.createElement("span");
+        waitSpan.className = 'node-input-container';
+        const waitInput = document.createElement("input");
+        waitInput.type = "number";
+        waitInput.min = "0";
+        waitInput.step = "0.1";
+        waitInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 1);
+        waitInput.addEventListener("change", () => {
+            codeData.val_a = parseFloat(waitInput.value) || 0;
+        });
+        waitSpan.appendChild(waitInput);
+        label.appendChild(waitSpan);
+        label.append(")");
+        if (codeData.input_a != null) { waitInput.value = '^'; waitInput.readOnly = true; }
+    } else if (codeData.content === "repeat") {
+        // Repeat ( [times] ) times
+        label.textContent = "";
+        label.append("Repeat (");
+        const repeatSpan = document.createElement("span");
+        repeatSpan.className = 'node-input-container';
+        const repeatInput = document.createElement("input");
+        repeatInput.type = "number";
+        repeatInput.min = "1";
+        repeatInput.step = "1";
+        repeatInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 2);
+        repeatInput.addEventListener("change", () => {
+            codeData.val_a = parseInt(repeatInput.value) || 1;
+        });
+        repeatSpan.appendChild(repeatInput);
+        label.appendChild(repeatSpan);
+        label.append(") times");
+        if (codeData.input_a != null) { repeatInput.value = '^'; repeatInput.readOnly = true; }
+    } else if (codeData.content === 'if') {
+        // If ( [value] ) then -> A else -> B
+        label.textContent = '';
+        label.append('If (');
+        const condSpan = document.createElement('span');
+        condSpan.className = 'node-input-container';
+        const condInput = document.createElement('input');
+        condInput.type = 'number'; condInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
+        condInput.value = codeData.val_a;
+        condInput.addEventListener('change', () => { codeData.val_a = parseInt(condInput.value) || 0; });
+        condSpan.appendChild(condInput);
+        label.appendChild(condSpan);
+        label.append(')');
+        // input-plus for condition
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent starting a new drag if one is already in progress
+            if (isConnecting) {
+                console.log('Drag already in progress, ignoring mousedown');
+                return;
+            }
+            const r = document.getElementById('node-window').getBoundingClientRect();
+            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            // Ensure focus on node window and clear any lingering menu handlers
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        condSpan.appendChild(btn);
+        if (codeData.input_a != null) { condInput.value = '^'; condInput.readOnly = true; }
+    } else if (codeData.content === "forever") {
+        label.textContent = "Forever";
+    } else if (codeData.content === "rotate") {
+        // Rotate ( [degrees] )
+        label.textContent = "";
+        label.append("Rotate (");
+        const rotSpan = document.createElement("span");
+        rotSpan.className = 'node-input-container';
+        label.appendChild(rotSpan);
+        label.append(")");
+    } else if (codeData.content === 'set_rotation') {
+        // Set Rotation ( [degrees] )
+        label.textContent = '';
+        label.append('Set Rotation (');
+        const rotSpan = document.createElement('span');
+        rotSpan.className = 'node-input-container';
+        const rotInput = document.createElement('input');
+        rotInput.type = 'number'; rotInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        rotInput.value = codeData.val_a;
+        rotInput.addEventListener('change', () => { codeData.val_a = parseFloat(rotInput.value) || 0; });
+        rotSpan.appendChild(rotInput);
+        label.appendChild(rotSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        rotSpan.appendChild(btn);
+        if (codeData.input_a != null) { rotInput.value = '^'; rotInput.readOnly = true; }
+    } else if (codeData.content === 'set_size') {
+        label.textContent = '';
+        label.append('Set Size (');
+        const sizeSpan = document.createElement('span');
+        sizeSpan.className = 'node-input-container';
+        const sizeInput = document.createElement('input');
+        sizeInput.type = 'number'; sizeInput.step = '0.1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
+        sizeInput.value = codeData.val_a;
+        sizeInput.addEventListener('change', () => { codeData.val_a = parseFloat(sizeInput.value) || 1; });
+        sizeSpan.appendChild(sizeInput);
+        label.appendChild(sizeSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent starting a new drag if one is already in progress
+            if (isConnecting) {
+                console.log('Drag already in progress, ignoring mousedown');
+                return;
+            }
+            const r = document.getElementById('node-window').getBoundingClientRect();
+            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        sizeSpan.appendChild(btn);
+        if (codeData.input_a != null) { sizeInput.value = '^'; sizeInput.readOnly = true; }
+    } else if (codeData.content === 'change_size') {
+        label.textContent = '';
+        label.append('Change Size (');
+        const sizeSpan = document.createElement('span');
+        sizeSpan.className = 'node-input-container';
+        const sizeInput = document.createElement('input');
+        sizeInput.type = 'number'; sizeInput.step = '0.1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0.1;
+        sizeInput.value = codeData.val_a;
+        sizeInput.addEventListener('change', () => { codeData.val_a = parseFloat(sizeInput.value) || 0; });
+        sizeSpan.appendChild(sizeInput);
+        label.appendChild(sizeSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent starting a new drag if one is already in progress
+            if (isConnecting) {
+                console.log('Drag already in progress, ignoring mousedown');
+                return;
+            }
+            const r = document.getElementById('node-window').getBoundingClientRect();
+            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        sizeSpan.appendChild(btn);
+        if (codeData.input_a != null) { sizeInput.value = '^'; sizeInput.readOnly = true; }
+    } else if (codeData.content === 'operation') {
+        // Operation block: ( X [op] Y )
+        label.textContent = '';
+        const leftSpan = document.createElement('span');
+        leftSpan.className = 'node-input-container';
+        const leftInput = document.createElement('input');
+        leftInput.type = 'number';
+        leftInput.step = '1';
+        if (typeof codeData.op_x !== 'number') codeData.op_x = 0;
+        leftInput.value = codeData.op_x;
+        leftInput.addEventListener('change', () => { codeData.op_x = parseFloat(leftInput.value) || 0; });
+        leftSpan.appendChild(leftInput);
+
+        const opSelect = document.createElement('select');
+        opSelect.className = 'node-op-select';
+        const ops = ['+','-','*','/','^'];
+        ops.forEach(sym => {
+            const opt = document.createElement('option');
+            opt.value = sym; opt.textContent = sym;
+            opSelect.appendChild(opt);
+        });
+        if (!codeData.val_a) codeData.val_a = '+';
+        opSelect.value = codeData.val_a;
+        opSelect.addEventListener('change', () => { codeData.val_a = opSelect.value; });
+
+        const rightSpan = document.createElement('span');
+        rightSpan.className = 'node-input-container';
+        const rightInput = document.createElement('input');
+        rightInput.type = 'number';
+        rightInput.step = '1';
+        if (typeof codeData.op_y !== 'number') codeData.op_y = 0;
+        rightInput.value = codeData.op_y;
+        rightInput.addEventListener('change', () => { codeData.op_y = parseFloat(rightInput.value) || 0; });
+        rightSpan.appendChild(rightInput);
+
+        label.append('(');
+        label.appendChild(leftSpan);
+        label.append(' ');
+        label.appendChild(opSelect);
+        label.append(' ');
+        label.appendChild(rightSpan);
+        label.append(')');
+        
+        // per-input plus buttons for operation operands
+        const addOpInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+';
+            btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                showAddInputBlockMenu(block, codeData, which, btn);
+            });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                // Prevent multiple simultaneous drag operations
+                if (isConnecting) return;
+
+                const container = document.getElementById('node-window');
+                if (!container) return;
+
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left;
+                connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true;
+                connectStartTime = Date.now();
+                connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addOpInputPlus(leftSpan, 'a');
+        addOpInputPlus(rightSpan, 'b');
+        if (codeData.input_a != null) { leftInput.value = '^'; leftInput.readOnly = true; }
+        if (codeData.input_b != null) { rightInput.value = '^'; rightInput.readOnly = true; }
+
+    } else if (codeData.content === 'mouse_x') {
+        label.textContent = 'mouseX';
+        block.classList.add('node-block-narrow');
+    } else if (codeData.content === 'mouse_y') {
+        label.textContent = 'mouseY';
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'object_x') {
+        label.textContent = 'ObjectX';
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'object_y') {
+        label.textContent = 'ObjectY';
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'rotation') {
+        label.textContent = 'Rotation';
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'size') {
+        label.textContent = 'Size';
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'key_pressed') {
+        label.textContent = '';
+        label.append('key pressed (');
+        const keySpan = document.createElement('span');
+        const keySelect = document.createElement('select');
+        const keys = [];
+        // a-z
+        for (let i = 97; i <= 122; i++) keys.push(String.fromCharCode(i));
+        // 0-9
+        for (let i = 0; i <= 9; i++) keys.push(String(i));
+        // Common keys
+        keys.push('Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter','Shift','Control','Alt','Tab','Escape','Backspace','Delete','Home','End','PageUp','PageDown');
+        keys.forEach(k => { const opt = document.createElement('option'); opt.value = k; opt.textContent = k; keySelect.appendChild(opt); });
+        if (!codeData.key_name) codeData.key_name = 'Space';
+        keySelect.value = codeData.key_name;
+        keySelect.addEventListener('change', () => { codeData.key_name = keySelect.value; });
+        keySpan.appendChild(keySelect);
+        label.appendChild(keySpan);
+        label.append(')');
+    } else if (codeData.content === 'set_x') {
+        label.textContent = '';
+        label.append('Set X (');
+        const span = document.createElement('span');
+        span.className = 'node-input-container';
+        const input = document.createElement('input');
+        input.type = 'number'; input.step = '1';
+        input.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 0);
+        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        span.appendChild(input);
+        label.appendChild(span);
+        label.append(')');
+        // add input-plus and caret behavior
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent multiple simultaneous drag operations
+            if (isConnecting) return;
+
+            const r = document.getElementById('node-window');
+            if (!r) return;
+
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left;
+            connectMouse.y = e.clientY - rect.top;
+            // Ensure canvas focus and clear any lingering menu handlers
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true;
+            connectStartTime = Date.now();
+            connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        span.appendChild(btn);
+        if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
+    } else if (codeData.content === 'set_y') {
+        label.textContent = '';
+        label.append('Set Y (');
+        const span = document.createElement('span');
+        span.className = 'node-input-container';
+        const input = document.createElement('input');
+        input.type = 'number'; input.step = '1';
+        input.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 0);
+        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        span.appendChild(input);
+        label.appendChild(span);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent multiple simultaneous drag operations
+            if (isConnecting) return;
+
+            const r = document.getElementById('node-window');
+            if (!r) return;
+
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left;
+            connectMouse.y = e.clientY - rect.top;
+            // Ensure canvas focus and clear any lingering menu handlers
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true;
+            connectStartTime = Date.now();
+            connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        span.appendChild(btn);
+        if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
+    } else if (codeData.content === 'switch_image') {
+        label.textContent = '';
+        label.append('Switch Image (');
+        const span = document.createElement('span');
+        const select = document.createElement('select');
+        // Populate with images available to current object
+        const imgs = getCurrentObjectImages();
+        imgs.forEach(img => { const opt = document.createElement('option'); opt.value = String(img.id); opt.textContent = img.name; select.appendChild(opt); });
+        if (!codeData.val_a && imgs[0]) codeData.val_a = String(imgs[0].id);
+        select.value = codeData.val_a || '';
+        select.addEventListener('change', () => { codeData.val_a = select.value; });
+        span.appendChild(select);
+        label.appendChild(span);
+        label.append(')');
+    } else if (codeData.content === 'instantiate') {
+        label.textContent = '';
+        label.append('Instantiate (');
+        const span = document.createElement('span');
+        const select = document.createElement('select');
+        const instantiables = objects.filter(o => o.name !== 'AppController');
+        instantiables.forEach(o => { const opt = document.createElement('option'); opt.value = String(o.id); opt.textContent = o.name; select.appendChild(opt); });
+        if (!codeData.val_a && instantiables[0]) codeData.val_a = String(instantiables[0].id);
+        select.value = codeData.val_a || '';
+        select.addEventListener('change', () => { codeData.val_a = select.value; });
+        span.appendChild(select);
+        label.appendChild(span);
+        label.append(')');
+    } else if (codeData.content === 'delete_instance') {
+        label.textContent = 'Delete Instance';
+    } else if (codeData.content === 'distance_to') {
+        // Distance To ( [x] , [y] )
+        label.textContent = '';
+        label.append('Distance To (');
+        const aSpan = document.createElement('span');
+        aSpan.className = 'node-input-container';
+        const aInput = document.createElement('input');
+        aInput.type = 'number'; aInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        aInput.value = codeData.val_a;
+        aInput.addEventListener('change', () => { codeData.val_a = parseFloat(aInput.value) || 0; });
+        aSpan.appendChild(aInput);
+        label.appendChild(aSpan);
+        label.append(', ');
+        const bSpan = document.createElement('span');
+        bSpan.className = 'node-input-container';
+        const bInput = document.createElement('input');
+        bInput.type = 'number'; bInput.step = '1';
+        if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
+        bInput.value = codeData.val_b;
+        bInput.addEventListener('change', () => { codeData.val_b = parseFloat(bInput.value) || 0; });
+        bSpan.appendChild(bInput);
+        label.appendChild(bSpan);
+        label.append(')');
+
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+'; btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, which, btn); });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                if (isConnecting) return;
+                const container = document.getElementById('node-window'); if (!container) return;
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(aSpan, 'a');
+        addInputPlus(bSpan, 'b');
+        if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+        if (codeData.input_b != null) { bInput.value = '^'; bInput.readOnly = true; }
+    } else if (codeData.content === 'set_variable') {
+        label.textContent = '';
+        label.append('Set ');
+        const varSpan = document.createElement('span');
+        const varSelect = document.createElement('select');
+        populateVariableSelect(varSelect, codeData);
+        // Default UI selection to public 'i' if available and var not set
+        try {
+            if (!codeData.var_name) {
+                const key = 'pub:i';
+                varSelect.value = key;
+                if (varSelect.value === key) {
+                    codeData.var_name = 'i';
+                    codeData.var_instance_only = false;
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append(' to (');
+        const valSpan = document.createElement('span');
+        valSpan.className = 'node-input-container';
+        const input = document.createElement('input');
+        input.type = 'number'; input.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        input.value = codeData.val_a;
+        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        valSpan.appendChild(input);
+        label.appendChild(valSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        valSpan.appendChild(btn);
+        if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
+    } else if (codeData.content === 'change_variable') {
+        label.textContent = '';
+        label.append('Change ');
+        const varSpan = document.createElement('span');
+        const varSelect = document.createElement('select');
+        populateVariableSelect(varSelect, codeData);
+        // Default UI selection to public 'i' if available and var not set
+        try {
+            if (!codeData.var_name) {
+                const key = 'pub:i';
+                varSelect.value = key;
+                if (varSelect.value === key) {
+                    codeData.var_name = 'i';
+                    codeData.var_instance_only = false;
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append(' by (');
+        const valSpan = document.createElement('span');
+        valSpan.className = 'node-input-container';
+        const input = document.createElement('input');
+        input.type = 'number'; input.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
+        input.value = codeData.val_a;
+        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        valSpan.appendChild(input);
+        label.appendChild(valSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        valSpan.appendChild(btn);
+        if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
+    } else if (codeData.content === 'variable') {
+        label.textContent = '';
+        const varSpan = document.createElement('span');
+        const varSelect = document.createElement('select');
+        populateVariableSelect(varSelect, codeData);
+        // Default UI selection to public 'i' if available and var not set
+        try {
+            if (!codeData.var_name) {
+                const key = 'pub:i';
+                varSelect.value = key;
+                if (varSelect.value === key) {
+                    codeData.var_name = 'i';
+                    codeData.var_instance_only = false;
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'image_name') {
+        label.textContent = 'ImageName';
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'not') {
+        // not [A]
+        label.textContent = '';
+        label.append('not ');
+        const aSpan = document.createElement('span');
+        aSpan.className = 'node-input-container';
+        const aInput = document.createElement('input');
+        aInput.type = 'number'; aInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        aInput.value = codeData.val_a;
+        aInput.addEventListener('change', () => { codeData.val_a = parseFloat(aInput.value) || 0; });
+        aSpan.appendChild(aInput);
+        label.appendChild(aSpan);
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const container = document.getElementById('node-window'); if (!container) return;
+            const rect = container.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        aSpan.appendChild(btn);
+        if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'delete_instance') {
+        label.textContent = 'Delete Instance';
+    } else if (codeData.content === 'distance_to') {
+        // Distance To ( [x] , [y] )
+        label.textContent = '';
+        label.append('Distance To (');
+        const aSpan = document.createElement('span');
+        aSpan.className = 'node-input-container';
+        const aInput = document.createElement('input');
+        aInput.type = 'number'; aInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        aInput.value = codeData.val_a;
+        aInput.addEventListener('change', () => { codeData.val_a = parseFloat(aInput.value) || 0; });
+        aSpan.appendChild(aInput);
+        label.appendChild(aSpan);
+        label.append(', ');
+        const bSpan = document.createElement('span');
+        bSpan.className = 'node-input-container';
+        const bInput = document.createElement('input');
+        bInput.type = 'number'; bInput.step = '1';
+        if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
+        bInput.value = codeData.val_b;
+        bInput.addEventListener('change', () => { codeData.val_b = parseFloat(bInput.value) || 0; });
+        bSpan.appendChild(bInput);
+        label.appendChild(bSpan);
+        label.append(')');
+
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+'; btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, which, btn); });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                if (isConnecting) return;
+                const container = document.getElementById('node-window'); if (!container) return;
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(aSpan, 'a');
+        addInputPlus(bSpan, 'b');
+        if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+        if (codeData.input_b != null) { bInput.value = '^'; bInput.readOnly = true; }
+    } else if (codeData.content === 'print') {
+        // Print ( [value] )
+        label.textContent = '';
+        label.append('Print (');
+        const aSpan = document.createElement('span');
+        aSpan.className = 'node-input-container';
+        const aInput = document.createElement('input');
+        aInput.type = 'text';
+        if (typeof codeData.val_a !== 'string' && typeof codeData.val_a !== 'number') codeData.val_a = '';
+        aInput.value = codeData.val_a;
+        aInput.addEventListener('change', () => { codeData.val_a = aInput.value; });
+        aSpan.appendChild(aInput);
+        label.appendChild(aSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const container = document.getElementById('node-window'); if (!container) return;
+            const rect = container.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        aSpan.appendChild(btn);
+        if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+    } else if (codeData.content === 'equals' || codeData.content === 'less_than') {
+        // [A] = [B] -> number 0/1
+        label.textContent = '';
+        const aSpan = document.createElement('span');
+        aSpan.className = 'node-input-container';
+        const aInput = document.createElement('input');
+        aInput.type = 'text';
+        if (codeData.val_a === undefined) codeData.val_a = 0;
+        aInput.value = codeData.val_a;
+        aInput.addEventListener('change', () => { codeData.val_a = aInput.value; });
+        aSpan.appendChild(aInput);
+        label.appendChild(aSpan);
+        label.append(codeData.content === 'less_than' ? ' < ' : ' = ');
+        const bSpan = document.createElement('span');
+        bSpan.className = 'node-input-container';
+        const bInput = document.createElement('input');
+        bInput.type = 'text';
+        if (codeData.val_b === undefined) codeData.val_b = 0;
+        bInput.value = codeData.val_b;
+        bInput.addEventListener('change', () => { codeData.val_b = bInput.value; });
+        bSpan.appendChild(bInput);
+        label.appendChild(bSpan);
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+'; btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, which, btn); });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                if (isConnecting) return;
+                const container = document.getElementById('node-window'); if (!container) return;
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(aSpan, 'a');
+        addInputPlus(bSpan, 'b');
+        if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+        if (codeData.input_b != null) { bInput.value = '^'; bInput.readOnly = true; }
+        block.classList.add('node-block-compact');
     } else {
         label.textContent = codeData.content;
     }
+
+    // Point Towards (x,y) UI and inputs
+    if (codeData.content === 'point_towards') {
+        // Label skeleton: Point Towards ( [x] , [y] )
+        label.textContent = '';
+        label.append('Point Towards (');
+        const xSpan = document.createElement('span');
+        xSpan.className = 'node-input-container';
+        const xInput = document.createElement('input');
+        xInput.type = 'number'; xInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        xInput.value = codeData.val_a;
+        xInput.addEventListener('change', () => { codeData.val_a = parseFloat(xInput.value) || 0; });
+        xSpan.appendChild(xInput);
+        label.appendChild(xSpan);
+        label.append(', ');
+        const ySpan = document.createElement('span');
+        ySpan.className = 'node-input-container';
+        const yInput = document.createElement('input');
+        yInput.type = 'number'; yInput.step = '1';
+        if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
+        yInput.value = codeData.val_b;
+        yInput.addEventListener('change', () => { codeData.val_b = parseFloat(yInput.value) || 0; });
+        ySpan.appendChild(yInput);
+        label.appendChild(ySpan);
+        label.append(')');
+
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+'; btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, which, btn); });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                if (isConnecting) return;
+                const container = document.getElementById('node-window'); if (!container) return;
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true; connectStartTime = Date.now();
+                connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(xSpan, 'a');
+        addInputPlus(ySpan, 'b');
+        if (codeData.input_a != null) { xInput.value = '^'; xInput.readOnly = true; }
+        if (codeData.input_b != null) { yInput.value = '^'; yInput.readOnly = true; }
+    }
     block.appendChild(label);
+
+    // For value blocks, add a bottom output anchor for drawing connections
+    if (codeData.type === 'value') {
+        const out = document.createElement('div');
+        out.className = 'node-output-anchor';
+        block.appendChild(out);
+    }
 
     // Close (X) button for non-start blocks
     if (codeData.type !== 'start') {
@@ -169,55 +1434,459 @@ function createNodeBlock(codeData, x, y) {
             const selectedObj = objects.find(obj => obj.id == selected_object);
             if (!selectedObj) return;
             const codeIdNum = codeData.id;
-            // Re-link any predecessor to this block's successor
-            const predecessor = selectedObj.code.find(c => c.next_block === codeIdNum);
-            if (predecessor) {
-                predecessor.next_block = codeData.next_block ?? null;
-            }
+            // Re-link any predecessors on branch A or B to this block's respective successor
+            selectedObj.code.forEach(c => {
+                if (c.next_block_a === codeIdNum) {
+                    c.next_block_a = (typeof codeData.next_block_a === 'number') ? codeData.next_block_a : null;
+                }
+                if (c.next_block_b === codeIdNum) {
+                    c.next_block_b = (typeof codeData.next_block_b === 'number') ? codeData.next_block_b : null;
+                }
+                // Clear any input references targeting this block
+                if (c.input_a === codeIdNum) {
+                    c.input_a = null;
+                }
+                if (c.input_b === codeIdNum) {
+                    c.input_b = null;
+                }
+            });
             // Remove this block from the object's code list
             const idx = selectedObj.code.findIndex(c => c.id === codeIdNum);
             if (idx >= 0) {
                 selectedObj.code.splice(idx, 1);
             }
-            // Remove DOM element
-            block.remove();
-            // Redraw connections
-            drawConnections();
+            // Re-render workspace to refresh plus buttons and connections
+            updateWorkspace();
         });
         block.appendChild(closeBtn);
     }
 
-    // Dropdowns for move_xy
-    if (codeData.content === "move_xy") {
-        // X dropdown
-        const xSelect = document.createElement("select");
-        xSelect.name = "val_a";
-        for (let i = -10; i <= 10; i++) {
-            const option = document.createElement("option");
-            option.value = i;
-            option.textContent = i;
-            if (i === codeData.val_a) option.selected = true;
-            xSelect.appendChild(option);
-        }
-        xSelect.addEventListener("change", () => {
-            codeData.val_a = parseInt(xSelect.value);
+    // Plus buttons: only add B for repeat blocks; start and others only A
+    const addPlusA = () => {
+        const plusBtnA = document.createElement('button');
+        plusBtnA.className = 'node-plus-btn node-plus-btn-a';
+        plusBtnA.textContent = '+';
+        plusBtnA.title = 'Add block (A)';
+        plusBtnA.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            showAddBlockMenu(block, codeData, 'a');
         });
-        label.children[0].appendChild(xSelect);
+        // drag from A to connect to another block's top
+        plusBtnA.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent starting a new drag if one is already in progress
+            if (isConnecting) {
+                console.log('Drag already in progress, ignoring mousedown');
+                return;
+            }
+            // Ensure we have a valid selected object
+            const currentSelectedObj = objects.find(obj => obj.id == selected_object);
+            if (!currentSelectedObj) {
+                console.log('Cannot start drag - no valid selected object');
+                return;
+            }
+            startConnectFromNext(codeData.id, 'a');
+        });
+        block.appendChild(plusBtnA);
+    };
+    const addPlusB = () => {
+        const plusBtnB = document.createElement('button');
+        plusBtnB.className = 'node-plus-btn node-plus-btn-b';
+        plusBtnB.textContent = '+';
+        plusBtnB.title = 'Add block (B)';
+        plusBtnB.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            showAddBlockMenu(block, codeData, 'b');
+        });
+        plusBtnB.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            // Prevent starting a new drag if one is already in progress
+            if (isConnecting) {
+                console.log('Drag already in progress, ignoring mousedown');
+                return;
+            }
+            // Ensure we have a valid selected object
+            const currentSelectedObj = objects.find(obj => obj.id == selected_object);
+            if (!currentSelectedObj) {
+                console.log('Cannot start drag - no valid selected object');
+                return;
+            }
+            startConnectFromNext(codeData.id, 'b');
+        });
+        block.appendChild(plusBtnB);
+    };
 
-        // Y dropdown
-        const ySelect = document.createElement("select");
-        ySelect.name = "val_b";
-        for (let i = -10; i <= 10; i++) {
-            const option = document.createElement("option");
-            option.value = i;
-            option.textContent = i;
-            if (i === codeData.val_b) option.selected = true;
-            ySelect.appendChild(option);
-        }
-        ySelect.addEventListener("change", () => {
-            codeData.val_b = parseInt(ySelect.value);
+    // Start block: only A; value blocks do not have next-block plus by default
+    if (codeData.type === 'start') {
+        addPlusA();
+    } else if (codeData.type !== 'value') {
+        // Repeat block: A + B; If block: A + B; others: only A
+        addPlusA();
+        if (codeData.content === 'repeat' || codeData.content === 'if') addPlusB();
+    }
+
+    // Inputs for move_xy (with per-input plus anchored to container)
+    if (codeData.content === "move_xy") {
+        // X input
+        const xInput = document.createElement("input");
+        xInput.type = "number";
+        xInput.step = "1";
+        xInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 0);
+        xInput.addEventListener("change", () => {
+            codeData.val_a = parseInt(xInput.value) || 0;
         });
-        label.children[1].appendChild(ySelect);
+        label.children[0].appendChild(xInput);
+        // Y input
+        const yInput = document.createElement("input");
+        yInput.type = "number";
+        yInput.step = "1";
+        yInput.value = (typeof codeData.val_b === 'number' ? codeData.val_b : 0);
+        yInput.addEventListener("change", () => {
+            codeData.val_b = parseInt(yInput.value) || 0;
+        });
+        label.children[1].appendChild(yInput);
+
+        // plus buttons above each input
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+';
+            btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                showAddInputBlockMenu(block, codeData, which, btn);
+            });
+            // Drag from input-plus to connect to a provider
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                // Prevent starting a new drag if one is already in progress
+                if (isConnecting) {
+                    console.log('Drag already in progress, ignoring mousedown');
+                    return;
+                }
+
+                const container = document.getElementById('node-window');
+                if (!container) return;
+
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left;
+                connectMouse.y = e.clientY - rect.top;
+
+                // Ensure canvas has focus and no lingering menu handlers intercept events
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+
+                isConnecting = true;
+                connectStartTime = Date.now();
+                connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(label.children[0], 'a');
+        addInputPlus(label.children[1], 'b');
+        if (codeData.input_a != null) { xInput.value = '^'; xInput.readOnly = true; }
+        if (codeData.input_b != null) { yInput.value = '^'; yInput.readOnly = true; }
+    }
+
+    // Inputs for rotate (single input with plus)
+    if (codeData.content === "rotate") {
+        const rotInput = document.createElement("input");
+        rotInput.type = "number";
+        rotInput.step = "1";
+        rotInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 5);
+        rotInput.addEventListener("change", () => {
+            codeData.val_a = parseFloat(rotInput.value) || 0;
+        });
+        label.children[0].appendChild(rotInput);
+        if (codeData.input_a != null) { rotInput.value = '^'; rotInput.readOnly = true; }
+    }
+
+    // Single-input actions: add plus above the input container
+    if (codeData.content === 'wait') {
+        const container = label.querySelector('.node-input-container');
+        if (container) {
+            const btn = document.createElement('button');
+            btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+            btn.textContent = '+';
+            btn.title = 'Add input (A)';
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+            // Drag from input-plus to connect to a provider
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                // Prevent multiple simultaneous drag operations
+                if (isConnecting) return;
+
+                // Ensure we have a valid selected object
+                const currentSelectedObj = objects.find(obj => obj.id == selected_object);
+                if (!currentSelectedObj) {
+                    console.log('Cannot start drag - no valid selected object');
+                    return;
+                }
+
+                const containerEl = document.getElementById('node-window');
+                if (!containerEl) return;
+
+                const rect = containerEl.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left;
+                connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true;
+                connectStartTime = Date.now();
+                connectFromInput = { blockId: codeData.id, which: 'a' };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            container.appendChild(btn);
+        }
+    }
+    if (codeData.content === 'repeat') {
+        const container = label.querySelector('.node-input-container');
+        if (container) {
+            const btn = document.createElement('button');
+            btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+            btn.textContent = '+';
+            btn.title = 'Add input (A)';
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+            // Drag from input-plus to connect to a provider
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                // Prevent multiple simultaneous drag operations
+                if (isConnecting) return;
+
+                // Ensure we have a valid selected object
+                const currentSelectedObj = objects.find(obj => obj.id == selected_object);
+                if (!currentSelectedObj) {
+                    console.log('Cannot start drag - no valid selected object');
+                    return;
+                }
+
+                const containerEl = document.getElementById('node-window');
+                if (!containerEl) return;
+
+                const rect = containerEl.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left;
+                connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true;
+                connectStartTime = Date.now();
+                connectFromInput = { blockId: codeData.id, which: 'a' };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            container.appendChild(btn);
+        }
+    }
+    if (codeData.content === 'rotate') {
+        const container = label.querySelector('.node-input-container');
+        if (container) {
+            const btn = document.createElement('button');
+            btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+            btn.textContent = '+';
+            btn.title = 'Add input (A)';
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+            // Drag from input-plus to connect to a provider
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                // Prevent multiple simultaneous drag operations
+                if (isConnecting) return;
+
+                // Ensure we have a valid selected object
+                const currentSelectedObj = objects.find(obj => obj.id == selected_object);
+                if (!currentSelectedObj) {
+                    console.log('Cannot start drag - no valid selected object');
+                    return;
+                }
+
+                const containerEl = document.getElementById('node-window');
+                if (!containerEl) return;
+
+                const rect = containerEl.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left;
+                connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true;
+                connectStartTime = Date.now();
+                connectFromInput = { blockId: codeData.id, which: 'a' };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            container.appendChild(btn);
+        }
+    }
+
+    // (Input-plus buttons are added per-input container above)
+    // Helper: variable select population and creation flow
+    function getAppController() {
+        return objects.find(o => o.type === 'controller' || o.name === 'AppController');
+    }
+    function ensureVarArrays(obj) {
+        if (!obj.variables) obj.variables = [];
+    }
+    function populateVariableSelect(selectEl, codeDataRef) {
+        const currentObj = objects.find(obj => obj.id == selected_object);
+        const app = getAppController();
+        if (!currentObj) return;
+        ensureVarArrays(currentObj);
+        if (app) ensureVarArrays(app);
+        selectEl.innerHTML = '';
+        // Public (App) variables first
+        if (app && app.variables && app.variables.length) {
+            const groupPub = document.createElement('optgroup');
+            groupPub.label = 'Public';
+            app.variables.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = `pub:${name}`; opt.textContent = name; groupPub.appendChild(opt);
+            });
+            selectEl.appendChild(groupPub);
+        }
+        // Private (object) variables
+        if (currentObj.variables && currentObj.variables.length) {
+            const groupPriv = document.createElement('optgroup');
+            groupPriv.label = 'Private (this object)';
+            currentObj.variables.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = `priv:${name}`; opt.textContent = name; groupPriv.appendChild(opt);
+            });
+            selectEl.appendChild(groupPriv);
+        }
+        const createOpt = document.createElement('option');
+        createOpt.value = '__create__'; createOpt.textContent = 'New variable…';
+        selectEl.appendChild(createOpt);
+        // Initialize selection from codeDataRef
+        if (codeDataRef.var_name) {
+            const isPriv = !!codeDataRef.var_instance_only;
+            const key = `${isPriv ? 'priv' : 'pub'}:${codeDataRef.var_name}`;
+            selectEl.value = key;
+            if (selectEl.value !== key) selectEl.value = '__create__';
+        } else {
+            selectEl.value = '__create__';
+        }
+    }
+    function openCreateVariableModal(onCreate, hideInstanceToggle) {
+        // Remove any existing modal to avoid duplicates
+        const existing = document.getElementById('__var_modal');
+        if (existing) { try { document.body.removeChild(existing); } catch {} }
+
+        // Build lightweight modal
+        const overlay = document.createElement('div');
+        overlay.id = '__var_modal';
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center;';
+        const panel = document.createElement('div');
+        panel.style.cssText = 'background:#2a2a2a;border:1px solid #444;border-radius:8px;padding:16px;min-width:320px;color:#eee;';
+        const title = document.createElement('div');
+        title.textContent = 'Create Variable';
+        title.style.cssText = 'font-weight:700;margin-bottom:8px;';
+        const nameLabel = document.createElement('div');
+        nameLabel.textContent = 'Name';
+        nameLabel.style.cssText = 'font-size:12px;color:#bbb;margin-bottom:4px;';
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.placeholder = 'score';
+        nameInput.style.cssText = 'width:100%;padding:8px;border-radius:6px;border:1px solid #555;background:#1e1e1e;color:#eee;';
+        const scopeRow = document.createElement('label');
+        scopeRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:10px;';
+        const scopeCb = document.createElement('input');
+        scopeCb.type = 'checkbox';
+        const scopeText = document.createElement('span');
+        scopeText.textContent = 'For this instance only';
+        scopeRow.appendChild(scopeCb); scopeRow.appendChild(scopeText);
+        if (hideInstanceToggle) scopeRow.style.display = 'none';
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:12px;';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = 'padding:6px 10px;border:1px solid #555;background:#333;color:#eee;border-radius:6px;';
+        const createBtn = document.createElement('button');
+        createBtn.textContent = 'Create';
+        createBtn.style.cssText = 'padding:6px 10px;border:1px solid #0aa;background:#00ffcc;color:#1a1a1a;border-radius:6px;';
+        btnRow.appendChild(cancelBtn); btnRow.appendChild(createBtn);
+        panel.appendChild(title); panel.appendChild(nameLabel); panel.appendChild(nameInput); panel.appendChild(scopeRow); panel.appendChild(btnRow);
+        overlay.appendChild(panel);
+
+        function handleKey(e) {
+            if (e.key === 'Escape') { e.preventDefault(); close(); }
+            if (e.key === 'Enter') { e.preventDefault(); createBtn.click(); }
+        }
+        function close() {
+            try {
+                window.removeEventListener('keydown', handleKey, true);
+                document.body.removeChild(overlay);
+            } catch {}
+        }
+        cancelBtn.addEventListener('click', close);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+        createBtn.addEventListener('click', () => {
+            const raw = (nameInput.value || '').trim();
+            if (!raw) { nameInput.focus(); return; }
+            // Prevent double-submits
+            createBtn.disabled = true;
+            const instanceOnly = !!scopeCb.checked;
+            // Close first to guarantee overlay removal even if onCreate throws
+            close();
+            // Defer onCreate slightly so UI can tear down cleanly
+            setTimeout(() => {
+                try { onCreate(raw, instanceOnly); } catch (e) { console.warn('Variable create handler error', e); }
+            }, 0);
+        });
+        document.body.appendChild(overlay);
+        window.addEventListener('keydown', handleKey, true);
+        setTimeout(() => nameInput.focus(), 0);
+    }
+    function handleVariableSelectChange(selectEl, codeDataRef) {
+        const currentObj = objects.find(obj => obj.id == selected_object);
+        const app = getAppController();
+        if (!currentObj) return;
+        if (selectEl.value === '__create__') {
+            const isAppController = !!(currentObj && (currentObj.type === 'controller' || currentObj.name === 'AppController'));
+            openCreateVariableModal((name, instanceOnly) => {
+                if (isAppController) {
+                    // AppManager cannot create instance-only
+                    instanceOnly = false;
+                }
+                if (instanceOnly) {
+                    ensureVarArrays(currentObj);
+                    if (!currentObj.variables.includes(name)) currentObj.variables.push(name);
+                    codeDataRef.var_name = name;
+                    codeDataRef.var_instance_only = true;
+                    // Track last created private variable per object
+                    try { lastCreatedVariableByObject[currentObj.id] = { name, isPrivate: true }; } catch(_) {}
+                } else {
+                    const appObj = app || currentObj; // fallback to current if no app found
+                    ensureVarArrays(appObj);
+                    if (!appObj.variables.includes(name)) appObj.variables.push(name);
+                    codeDataRef.var_name = name;
+                    codeDataRef.var_instance_only = false;
+                    // Track last created public variable globally
+                    try { lastCreatedPublicVariable = { name, isPrivate: false }; } catch(_) {}
+                }
+                // Remember globally so newly created blocks also default to it
+                lastCreatedVariable = { name: codeDataRef.var_name, isPrivate: !!codeDataRef.var_instance_only };
+                populateVariableSelect(selectEl, codeDataRef);
+                const key = `${codeDataRef.var_instance_only ? 'priv' : 'pub'}:${codeDataRef.var_name}`;
+                selectEl.value = key;
+                updateWorkspace();
+            }, isAppController);
+        } else {
+            // Parse selection key
+            const [scope, name] = selectEl.value.split(':');
+            codeDataRef.var_name = name || '';
+            codeDataRef.var_instance_only = (scope === 'priv');
+        }
     }
 
     // Desktop mouse events
@@ -269,7 +1938,468 @@ function createNodeBlock(codeData, x, y) {
         document.addEventListener("touchend", handleTouchEnd);
     });
 
+    // Start drag-to-connect when mousedown on value block output anchor
+    if (codeData.type === 'value') {
+        const out = () => block.querySelector('.node-output-anchor');
+        block.addEventListener('mousedown', (e) => {
+            const a = out();
+            if (!a) return;
+            const r = a.getBoundingClientRect();
+            const within = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+            if (within) {
+                e.stopPropagation(); e.preventDefault();
+                // Prevent starting a new drag if one is already in progress
+                if (isConnecting) {
+                    console.log('Drag already in progress, ignoring mousedown');
+                    return;
+                }
+                // Ensure we have a valid selected object
+                const currentSelectedObj = objects.find(obj => obj.id == selected_object);
+                if (!currentSelectedObj) {
+                    console.log('Cannot start drag - no valid selected object');
+                    return;
+                }
+                startConnectFromBlock(codeData.id);
+            }
+        });
+        // Touch support
+        block.addEventListener('touchstart', (e) => {
+            const a = out();
+            if (!a) return;
+            const t = e.touches[0];
+            const r = a.getBoundingClientRect();
+            const within = t.clientX >= r.left && t.clientX <= r.right && t.clientY >= r.top && t.clientY <= r.bottom;
+            if (within) {
+                e.stopPropagation(); e.preventDefault();
+                startConnectFromBlock(codeData.id);
+            }
+        }, { passive: false });
+    }
+
     return block;
+}
+
+// Show add-block chooser menu anchored to a block
+function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = null) {
+    console.log('showAddBlockMenu called with:', { anchorBlock, anchorCodeData, branch, customPosition });
+    closeAnyAddMenus();
+    const menu = document.createElement('div');
+    menu.className = 'node-add-menu';
+    console.log('Created menu element:', menu);
+    // Build items
+    const addItem = (labelText, typeKey) => {
+        const btn = document.createElement('button');
+        btn.className = 'node-add-menu-item';
+        btn.textContent = labelText;
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            const selectedObj = objects.find(obj => obj.id == selected_object);
+            if (!selectedObj) return;
+            insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch === 'b' ? 'b' : 'a', customPosition);
+            closeAnyAddMenus();
+            // Reset and re-arm drag state so subsequent drags work immediately
+            cleanupDragState();
+            // Return focus to code canvas so drag-detect works without extra click
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) {
+                if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex', '0');
+                try { nodeWindow.focus(); } catch (_) {}
+            }
+            // Ensure there are no lingering menu handlers that could swallow the next mousedown
+            clearMenuDocHandlers();
+        });
+        menu.appendChild(btn);
+    };
+    addItem('Move By', 'move_xy');
+    addItem('Wait ()', 'wait');
+    addItem('Repeat () times', 'repeat');
+    addItem('If ()', 'if');
+    addItem('Forever', 'forever');
+    addItem('Print ()', 'print');
+    addItem('Rotate (x)', 'rotate');
+    addItem('Point Towards (x,y)', 'point_towards');
+    addItem('Set Rotation (x)', 'set_rotation');
+    addItem('Set Size (x)', 'set_size');
+    addItem('Change Size (x)', 'change_size');
+    addItem('Image Name', 'image_name');
+    addItem('Set X (x)', 'set_x');
+    addItem('Set Y (y)', 'set_y');
+    addItem('Set Variable', 'set_variable');
+    addItem('Change Variable By', 'change_variable');
+    addItem('Switch Image', 'switch_image');
+    addItem('Instantiate', 'instantiate');
+    addItem('Delete Instance', 'delete_instance');
+    console.log('Menu items added, menu children:', menu.children.length);
+    // Position: append within block so CSS absolute positioning can anchor it
+    if (customPosition) {
+        // For drag-opened: show near mouse using fixed positioning, without changing size
+        const nodeWindow = document.getElementById('node-window');
+        const nodeRect = nodeWindow.getBoundingClientRect();
+        const absoluteX = nodeRect.left + customPosition.x;
+        const absoluteY = nodeRect.top + customPosition.y;
+
+        menu.style.position = 'fixed';
+        menu.style.left = `${absoluteX}px`;
+        menu.style.top = `${absoluteY + 10}px`;
+        menu.style.bottom = 'auto';
+        menu.style.transform = 'translate(-50%, 0)';
+
+        nodeWindow.appendChild(menu);
+
+        // Clamp to viewport after mount
+        requestAnimationFrame(() => {
+            try {
+                const rect = menu.getBoundingClientRect();
+                const vw = window.innerWidth;
+                const vh = window.innerHeight;
+                let dx = 0;
+                let dy = 0;
+                if (rect.right > vw - 8) dx = (vw - 8) - rect.right;
+                if (rect.left < 8) dx = 8 - rect.left;
+                if (rect.bottom > vh - 8) dy = (vh - 8) - rect.bottom;
+                if (rect.top < 8) dy = 8 - rect.top;
+                if (dx !== 0 || dy !== 0) {
+                    const currentLeft = parseFloat(menu.style.left || '0');
+                    const currentTop = parseFloat(menu.style.top || '0');
+                    menu.style.left = `${currentLeft + dx}px`;
+                    menu.style.top = `${currentTop + dy}px`;
+                }
+            } catch (_) {}
+        });
+    } else {
+        console.log('Appending menu to anchorBlock:', anchorBlock);
+        anchorBlock.appendChild(menu);
+    }
+    // Close menu when clicking elsewhere
+    setTimeout(() => {
+        function onDocClick(ev) {
+            if (!menu.contains(ev.target)) {
+                closeAnyAddMenus();
+                document.removeEventListener('click', onDocClick, true);
+            }
+        }
+        // Store handler and register centrally so it can't leak
+        menu._onDocClick = onDocClick;
+        addMenuDocHandler(onDocClick);
+    }, 0);
+}
+
+// Show add-block chooser menu for input sources (below the button)
+function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn, customPosition = null) {
+    closeAnyAddMenus();
+    const menu = document.createElement('div');
+    menu.className = 'node-add-menu';
+    // Build items (input-source list)
+    const addItem = (labelText, typeKey) => {
+        const btn = document.createElement('button');
+        btn.className = 'node-add-menu-item';
+        btn.textContent = labelText;
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            const selectedObj = objects.find(obj => obj.id == selected_object);
+            if (!selectedObj) return;
+            insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey === 'b' ? 'b' : 'a', customPosition);
+            closeAnyAddMenus();
+            // Reset and re-arm drag state so subsequent drags work immediately
+            cleanupDragState();
+            // Return focus to code canvas so drag-detect works without extra click
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) {
+                if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex', '0');
+                try { nodeWindow.focus(); } catch (_) {}
+            }
+            // Ensure there are no lingering menu handlers that could swallow the next mousedown
+            clearMenuDocHandlers();
+        });
+        menu.appendChild(btn);
+    };
+    addItem('Operation', 'operation');
+    addItem('=', 'equals');
+    addItem('not', 'not');
+    addItem('<', 'less_than');
+    addItem('Mouse X', 'mouse_x');
+    addItem('Mouse Y', 'mouse_y');
+    addItem('ObjectX', 'object_x');
+    addItem('ObjectY', 'object_y');
+    addItem('Rotation', 'rotation');
+    addItem('Size', 'size');
+    addItem('Mouse Pressed?', 'mouse_pressed');
+    addItem('Key Pressed?', 'key_pressed');
+    addItem('Random Int', 'random_int');
+    addItem('Variable', 'variable');
+    addItem('Image Name', 'image_name');
+    addItem('Distance To (x,y)', 'distance_to');
+    // Position menu above the specific button if available; else above block
+    if (customPosition) {
+        // For drag-opened: we'll place via fixed positioning after creation below
+    } else if (anchorBtn) {
+        // place relative to block but horizontally aligned with button
+        const blockRect = anchorBlock.getBoundingClientRect();
+        const nodeWindow = document.getElementById('node-window');
+        const nodeRect = nodeWindow.getBoundingClientRect();
+        const btnRect = anchorBtn.getBoundingClientRect();
+        const localX = (btnRect.left - blockRect.left) + (btnRect.width / 2);
+        menu.style.left = `${localX}px`;
+        // Let CSS handle positioning for consistency
+    } else {
+        // Let CSS handle positioning for consistency
+    }
+
+    if (customPosition) {
+        // For drag-opened: show near mouse using fixed positioning, without changing size
+        const nodeWindow = document.getElementById('node-window');
+        const nodeRect = nodeWindow.getBoundingClientRect();
+        const absoluteX = nodeRect.left + customPosition.x;
+        const absoluteY = nodeRect.top + customPosition.y;
+
+        menu.style.position = 'fixed';
+        menu.style.left = `${absoluteX}px`;
+        menu.style.top = `${absoluteY + 10}px`;
+        menu.style.bottom = 'auto';
+        menu.style.transform = 'translate(-50%, 0)';
+
+        nodeWindow.appendChild(menu);
+
+        // Clamp to viewport after mount
+        requestAnimationFrame(() => {
+            try {
+                const rect = menu.getBoundingClientRect();
+                const vw = window.innerWidth;
+                const vh = window.innerHeight;
+                let dx = 0;
+                let dy = 0;
+                if (rect.right > vw - 8) dx = (vw - 8) - rect.right;
+                if (rect.left < 8) dx = 8 - rect.left;
+                if (rect.bottom > vh - 8) dy = (vh - 8) - rect.bottom;
+                if (rect.top < 8) dy = 8 - rect.top;
+                if (dx !== 0 || dy !== 0) {
+                    const currentLeft = parseFloat(menu.style.left || '0');
+                    const currentTop = parseFloat(menu.style.top || '0');
+                    menu.style.left = `${currentLeft + dx}px`;
+                    menu.style.top = `${currentTop + dy}px`;
+                }
+            } catch (_) {}
+        });
+    } else {
+        console.log('Appending menu to anchorBlock:', anchorBlock);
+        anchorBlock.appendChild(menu);
+    }
+    // Close menu when clicking elsewhere
+    setTimeout(() => {
+        function onDocClick(ev) {
+            if (!menu.contains(ev.target)) {
+                closeAnyAddMenus();
+                document.removeEventListener('click', onDocClick, true);
+            }
+        }
+        // Store handler and register centrally so it can't leak
+        menu._onDocClick = onDocClick;
+        addMenuDocHandler(onDocClick);
+    }, 0);
+}
+
+function closeAnyAddMenus() {
+    // Remove any lingering document click handlers attached by menus
+    clearMenuDocHandlers();
+    document.querySelectorAll('.node-add-menu').forEach(el => {
+        try { el._onDocClick = null; } catch (_) {}
+        if (el.parentNode) el.parentNode.removeChild(el);
+    });
+    // Also clean up any leftover temporary blocks
+    document.querySelectorAll('[data-temp-block="true"]').forEach(el => {
+        if (el.parentNode) el.parentNode.removeChild(el);
+    });
+}
+
+// Insert a new block after the given anchor block in branch 'a' or 'b'
+function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPosition = null) {
+    const existingIds = selectedObj.code.map(b => b.id);
+    const newId = (existingIds.length ? Math.max(...existingIds) : 0) + 1;
+    const branchKey = branch === 'b' ? 'next_block_b' : 'next_block_a';
+    const oldNext = (anchorCodeData && typeof anchorCodeData[branchKey] !== 'undefined') ? anchorCodeData[branchKey] : null;
+    const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
+
+    let newBlock = {
+        id: newId,
+        type: 'action',
+        location: { x: 0, y: 0 },
+        content: typeKey,
+        val_a: null,
+        val_b: null,
+        input_a: null,
+        input_b: null,
+        next_block_a: oldNext,
+        next_block_b: null,
+        position: customPosition ? { x: customPosition.x, y: customPosition.y } : { x: basePosition.x, y: basePosition.y + 60 }
+    };
+
+    if (typeKey === 'move_xy') {
+        newBlock.val_a = 0;
+        newBlock.val_b = 0;
+    } else if (typeKey === 'wait') {
+        // val_a holds seconds
+        newBlock.val_a = 1;
+    } else if (typeKey === 'repeat') {
+        // val_a holds times
+        newBlock.val_a = 2;
+    } else if (typeKey === 'if') {
+        // condition value (0/1)
+        newBlock.val_a = 1;
+    } else if (typeKey === 'forever') {
+        // forever has only next_block_a
+        newBlock.val_a = null;
+    } else if (typeKey === 'rotate') {
+        // val_a holds degrees
+        newBlock.val_a = 5;
+    } else if (typeKey === 'set_rotation') {
+        // val_a holds absolute degrees
+        newBlock.val_a = 0;
+    } else if (typeKey === 'point_towards') {
+        // val_a, val_b hold target X,Y
+        newBlock.val_a = 0;
+        newBlock.val_b = 0;
+    } else if (typeKey === 'set_size') {
+        newBlock.val_a = 1;
+    } else if (typeKey === 'change_size') {
+        newBlock.val_a = 0.1;
+    } else if (typeKey === 'set_x') {
+        newBlock.val_a = 0;
+    } else if (typeKey === 'set_y') {
+        newBlock.val_a = 0;
+    } else if (typeKey === 'switch_image') {
+        newBlock.val_a = '';
+        // Allow input to name/id provider
+        newBlock.input_a = null;
+    } else if (typeKey === 'instantiate') {
+        newBlock.val_a = '';
+    } else if (typeKey === 'delete_instance') {
+        // no payload needed
+        newBlock.val_a = null;
+    } else if (typeKey === 'random_int') {
+        newBlock.type = 'value';
+        newBlock.val_a = 0; // min
+        newBlock.val_b = 10; // max
+    } else if (typeKey === 'distance_to') {
+        newBlock.type = 'value';
+        newBlock.val_a = 0;
+        newBlock.val_b = 0;
+    } else if (typeKey === 'print') {
+        newBlock.val_a = '';
+    } else if (typeKey === 'not') {
+        newBlock.type = 'value';
+        newBlock.val_a = 0;
+    } else if (typeKey === 'less_than') {
+        newBlock.type = 'value';
+        newBlock.val_a = 0;
+        newBlock.val_b = 0;
+    } else if (typeKey === 'set_variable') {
+        newBlock.val_a = 0;
+        newBlock.var_name = 'i';
+        newBlock.var_instance_only = false; // public
+    } else if (typeKey === 'change_variable') {
+        newBlock.val_a = 1;
+        newBlock.var_name = 'i';
+        newBlock.var_instance_only = false; // public
+    }
+
+    // Link anchor -> new -> oldNext on selected branch
+    if (anchorCodeData) {
+        anchorCodeData[branchKey] = newId;
+    }
+    selectedObj.code.push(newBlock);
+
+    // For drag-to-create, adjust position to center the block on mouse coordinates
+    if (customPosition) {
+        // Create a temporary block to get its dimensions
+        const tempBlock = createNodeBlock(newBlock, 0, 0);
+        tempBlock.style.visibility = 'hidden';
+        tempBlock.style.position = 'absolute';
+        document.body.appendChild(tempBlock);
+
+        const blockWidth = tempBlock.offsetWidth;
+        const blockHeight = tempBlock.offsetHeight;
+
+        // Center the block on the mouse position
+        newBlock.position.x = customPosition.x - (blockWidth / 2);
+        newBlock.position.y = customPosition.y - (blockHeight / 2);
+
+        // Remove temporary block
+        document.body.removeChild(tempBlock);
+    }
+
+    // Render the new block and redraw connections
+    updateWorkspace();
+}
+
+// Insert a new input block above the given anchor block and connect via input_a/input_b
+function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, customPosition = null) {
+    const existingIds = selectedObj.code.map(b => b.id);
+    const newId = (existingIds.length ? Math.max(...existingIds) : 0) + 1;
+    const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
+
+    let newBlock = {
+        id: newId,
+        type: 'value',
+        location: { x: 0, y: 0 },
+        content: typeKey,
+        val_a: null,
+        val_b: null,
+        input_a: null,
+        input_b: null,
+        next_block_a: null,
+        next_block_b: null,
+        position: customPosition ? { x: customPosition.x, y: customPosition.y } : { x: basePosition.x, y: basePosition.y - 60 }
+    };
+
+    // Optional defaults for specific input blocks
+    if (typeKey === 'operation') {
+        newBlock.val_a = '+'; // operator placeholder
+    } else if (typeKey === 'variable') {
+        newBlock.var_name = 'i';
+        newBlock.var_instance_only = false; // public
+    }
+
+    // Connect anchor block's input
+    const key = inputKey === 'b' ? 'input_b' : 'input_a';
+    anchorCodeData[key] = newId;
+    // Null out the corresponding numeric field when connecting
+    if (anchorCodeData.content === 'move_xy') {
+        if (inputKey === 'a') anchorCodeData.val_a = '^';
+        if (inputKey === 'b') anchorCodeData.val_b = '^';
+    } else if (anchorCodeData.content === 'wait' || anchorCodeData.content === 'repeat' || anchorCodeData.content === 'rotate' || anchorCodeData.content === 'set_rotation') {
+        anchorCodeData.val_a = '^';
+    } else if (anchorCodeData.content === 'operation') {
+        if (inputKey === 'a') anchorCodeData.op_x = '^';
+        if (inputKey === 'b') anchorCodeData.op_y = '^';
+    } else if (anchorCodeData.content === 'set_variable' || anchorCodeData.content === 'change_variable') {
+        anchorCodeData.val_a = '^';
+    }
+
+    selectedObj.code.push(newBlock);
+
+    // For drag-to-create, adjust position to center the block on mouse coordinates
+    if (customPosition) {
+        // Create a temporary block to get its dimensions
+        const tempBlock = createNodeBlock(newBlock, 0, 0);
+        tempBlock.style.visibility = 'hidden';
+        tempBlock.style.position = 'absolute';
+        document.body.appendChild(tempBlock);
+
+        const blockWidth = tempBlock.offsetWidth;
+        const blockHeight = tempBlock.offsetHeight;
+
+        // Center the block on the mouse position
+        newBlock.position.x = customPosition.x - (blockWidth / 2);
+        newBlock.position.y = customPosition.y - (blockHeight / 2);
+
+        // Remove temporary block
+        document.body.removeChild(tempBlock);
+    }
+
+    // Re-render to reflect caret changes and redraw connections
+    updateWorkspace();
 }
 
 // Global drag handlers
@@ -378,45 +2508,494 @@ connectionCanvas.style.left = "0";
 connectionCanvas.style.pointerEvents = "none";
 const connectionCtx = connectionCanvas.getContext("2d");
 
+// Zoom state for code viewport
+// Zoom disabled
+
+// Drag-to-connect state
+let isConnecting = false;
+let connectFromBlockId = null;
+let connectMouse = { x: 0, y: 0 };
+let connectFromInput = null; // { blockId, which }
+let connectFromNext = null; // { blockId, which }
+let lastConnectEndedAt = 0;
+let connectStartTime = 0;
+
+// Track active document click handlers for node-add menus so we can remove them reliably
+let activeMenuDocHandlers = [];
+function addMenuDocHandler(handler) {
+    activeMenuDocHandlers.push(handler);
+    document.addEventListener('click', handler, true);
+}
+function clearMenuDocHandlers() {
+    if (activeMenuDocHandlers.length) {
+        try {
+            activeMenuDocHandlers.forEach(h => document.removeEventListener('click', h, true));
+        } catch (_) {}
+        activeMenuDocHandlers = [];
+    }
+}
+
+function startConnectFromBlock(blockId) {
+    isConnecting = true;
+    connectStartTime = Date.now();
+    connectFromBlockId = blockId;
+    document.addEventListener('mousemove', handleConnectMouseMove);
+    document.addEventListener('mouseup', handleConnectMouseUp, true);
+}
+
+function startConnectFromNext(blockId, which) {
+    console.log('startConnectFromNext called:', { blockId, which, isConnecting });
+    isConnecting = true;
+    connectStartTime = Date.now();
+    connectFromNext = { blockId, which: which === 'b' ? 'b' : 'a' };
+    console.log('connectFromNext set to:', connectFromNext);
+    document.addEventListener('mousemove', handleConnectMouseMove);
+    document.addEventListener('mouseup', handleConnectMouseUp, true);
+}
+
+function handleConnectMouseMove(e) {
+    const container = document.getElementById('node-window');
+    const rect = container.getBoundingClientRect();
+    connectMouse.x = e.clientX - rect.left;
+    connectMouse.y = e.clientY - rect.top;
+    drawConnections();
+}
+
+function handleConnectMouseUp(e) {
+    console.log('handleConnectMouseUp called, isConnecting:', isConnecting);
+    if (!isConnecting) {
+        console.log('Not connecting, returning early');
+        return;
+    }
+
+    try {
+        // Clean up any leftover temporary blocks from previous operations
+        document.querySelectorAll('[data-temp-block="true"]').forEach(el => {
+            try {
+                if (el.parentNode) el.parentNode.removeChild(el);
+            } catch (err) {
+                console.warn('Error cleaning up temp block:', err);
+            }
+        });
+
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        const selectedObj = objects.find(obj => obj.id == selected_object);
+
+        // Validate that we have a valid selected object
+        if (!selectedObj) {
+            console.log('No valid selected object found, canceling drag operation');
+            cleanupDragState();
+            return;
+        }
+
+        // Double-check that we still have valid connection state
+        if (!connectFromBlockId && !connectFromInput && !connectFromNext) {
+            console.log('No valid connection state found, canceling drag operation');
+            cleanupDragState();
+            return;
+        }
+
+        // Check for timeout (prevent stale drag operations)
+        const dragDuration = Date.now() - connectStartTime;
+        if (dragDuration > 30000) { // 30 second timeout
+            console.log('Drag operation timed out, canceling');
+            cleanupDragState();
+            return;
+        }
+
+        console.log('Mouse release detected:', {
+            connectFromNext: connectFromNext,
+            connectFromInput: connectFromInput,
+            connectFromBlockId: connectFromBlockId,
+            selectedObj: selectedObj,
+            el: el
+        });
+
+    if (connectFromBlockId != null) {
+        // Provider -> Input
+        const btn = el && (el.classList && el.classList.contains('node-input-plus-btn') ? el : el.closest && el.closest('.node-input-plus-btn'));
+        let foundValidTarget = false;
+
+        if (btn && selectedObj) {
+            const which = btn.classList.contains('node-input-plus-btn-b') ? 'b' : 'a';
+            const blockEl = btn.closest('.node-block');
+            if (blockEl) {
+                const targetId = parseInt(blockEl.dataset.codeId, 10);
+                const target = selectedObj.code.find(c => c.id === targetId);
+                if (target) {
+                    foundValidTarget = true;
+                    connectProviderToInput(selectedObj, target, which, connectFromBlockId);
+                }
+            }
+        }
+
+        if (!foundValidTarget && selectedObj) {
+            // No input button found - create new action block at mouse position
+            const source = selectedObj.code.find(c => c.id === connectFromBlockId);
+            if (source) {
+                try {
+                    // Create a temporary block element to show menu at mouse position
+                    const tempBlock = document.createElement('div');
+                    tempBlock.className = 'node-block';
+                    tempBlock.style.position = 'absolute';
+                    tempBlock.style.left = `${connectMouse.x}px`;
+                    tempBlock.style.top = `${connectMouse.y}px`;
+                    tempBlock.style.pointerEvents = 'none';
+                    tempBlock.style.opacity = '0';
+                    tempBlock.dataset.tempBlock = 'true'; // Mark as temporary for cleanup
+
+                    const nodeWindow = document.getElementById('node-window');
+                    if (nodeWindow) {
+                        nodeWindow.appendChild(tempBlock);
+
+                        // Show menu with position based on mouse
+                        showAddBlockMenu(tempBlock, source, 'a', { x: connectMouse.x, y: connectMouse.y });
+
+                        // Remove temp block after menu is shown
+                        setTimeout(() => {
+                            try {
+                                if (tempBlock.parentNode) {
+                                    tempBlock.parentNode.removeChild(tempBlock);
+                                }
+                            } catch (e) {
+                                // Ignore cleanup errors
+                            }
+                        }, 100);
+                    }
+                } catch (e) {
+                    console.warn('Error during drag-to-create action block from value:', e);
+                }
+            }
+        }
+    } else if (connectFromInput) {
+        // Input -> Provider
+        const anchor = el && (el.classList && el.classList.contains('node-output-anchor') ? el : el.closest && el.closest('.node-output-anchor'));
+        let providerBlockEl = null;
+        let foundValidTarget = false;
+
+        if (anchor) {
+            providerBlockEl = anchor.closest('.node-block');
+            if (providerBlockEl && selectedObj) {
+                const providerId = parseInt(providerBlockEl.dataset.codeId, 10);
+                const provider = selectedObj.code.find(c => c.id === providerId);
+                if (provider && provider.type === 'value') {
+                    foundValidTarget = true;
+                    const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
+                    if (target) connectProviderToInput(selectedObj, target, connectFromInput.which, providerId);
+                }
+            }
+        }
+
+        if (!foundValidTarget) {
+            const anyBlock = el && (el.classList && el.classList.contains('node-block') ? el : el.closest && el.closest('.node-block'));
+            if (anyBlock && selectedObj) {
+                const providerId = parseInt(anyBlock.dataset.codeId, 10);
+                const provider = selectedObj.code.find(c => c.id === providerId);
+                if (provider && provider.type === 'value') {
+                    foundValidTarget = true;
+                    const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
+                    if (target) connectProviderToInput(selectedObj, target, connectFromInput.which, providerId);
+                }
+            }
+        }
+
+        if (!foundValidTarget && selectedObj) {
+            // No provider block found - create new block at mouse position
+            const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
+            if (target) {
+                try {
+                    // Create a temporary block element to show menu at mouse position
+                    const tempBlock = document.createElement('div');
+                    tempBlock.className = 'node-block';
+                    tempBlock.style.position = 'absolute';
+                    tempBlock.style.left = `${connectMouse.x}px`;
+                    tempBlock.style.top = `${connectMouse.y}px`;
+                    tempBlock.style.pointerEvents = 'none';
+                    tempBlock.style.opacity = '0';
+                    tempBlock.dataset.tempBlock = 'true'; // Mark as temporary for cleanup
+
+                    const nodeWindow = document.getElementById('node-window');
+                    if (nodeWindow) {
+                        nodeWindow.appendChild(tempBlock);
+
+                        // Show menu with position based on mouse
+                        showAddInputBlockMenu(tempBlock, target, connectFromInput.which, null, { x: connectMouse.x, y: connectMouse.y });
+
+                        // Remove temp block after menu is shown
+                        setTimeout(() => {
+                            try {
+                                if (tempBlock.parentNode) {
+                                    tempBlock.parentNode.removeChild(tempBlock);
+                                }
+                            } catch (e) {
+                                // Ignore cleanup errors
+                            }
+                        }, 100);
+                    }
+                } catch (e) {
+                    console.warn('Error during drag-to-create:', e);
+                }
+            }
+        }
+    } else if (connectFromNext) {
+        // Next (A/B) -> Block top anchor
+        console.log('Processing connectFromNext:', connectFromNext);
+        const blockEl = el && (el.classList && el.classList.contains('node-block') ? el : el.closest && el.closest('.node-block'));
+        let foundValidTarget = false;
+        console.log('Block element found:', blockEl);
+
+        if (blockEl && selectedObj) {
+            const destId = parseInt(blockEl.dataset.codeId, 10);
+            const source = selectedObj.code.find(c => c.id === connectFromNext.blockId);
+            if (source && destId !== source.id) {
+                const dest = selectedObj.code.find(c => c.id === destId);
+                if (!dest || dest.type !== 'value') {
+                    foundValidTarget = true;
+                    // Prevent creating immediate loop to itself via same branch
+                    const key = connectFromNext.which === 'b' ? 'next_block_b' : 'next_block_a';
+                    source[key] = destId;
+                    // Also prevent the destination pointing back instantly to source on its A if it currently does
+                    if (dest && dest.next_block_a === source.id) dest.next_block_a = null;
+                    updateWorkspace();
+                }
+            }
+        }
+
+        if (!foundValidTarget && selectedObj) {
+            // No block found at mouse position - create new action block
+            console.log('No valid target found, triggering drag-to-create for action block');
+            const source = selectedObj.code.find(c => c.id === connectFromNext.blockId);
+            if (source) {
+                console.log('Source block found:', source);
+                try {
+                    // Create a temporary block element to show menu at mouse position
+                    const tempBlock = document.createElement('div');
+                    tempBlock.className = 'node-block';
+                    tempBlock.style.position = 'absolute';
+                    tempBlock.style.left = `${connectMouse.x}px`;
+                    tempBlock.style.top = `${connectMouse.y}px`;
+                    tempBlock.style.pointerEvents = 'none';
+                    tempBlock.style.opacity = '0';
+                    tempBlock.dataset.tempBlock = 'true'; // Mark as temporary for cleanup
+
+                    const nodeWindow = document.getElementById('node-window');
+                    if (nodeWindow) {
+                        nodeWindow.appendChild(tempBlock);
+
+                        // Show menu with position based on mouse
+                        console.log('Calling showAddBlockMenu with custom position:', { x: connectMouse.x, y: connectMouse.y });
+                        showAddBlockMenu(tempBlock, source, connectFromNext.which, { x: connectMouse.x, y: connectMouse.y });
+
+                        // Remove temp block after menu is shown
+                        setTimeout(() => {
+                            try {
+                                if (tempBlock.parentNode) {
+                                    tempBlock.parentNode.removeChild(tempBlock);
+                                }
+                            } catch (e) {
+                                // Ignore cleanup errors
+                            }
+                        }, 100);
+                    }
+                } catch (e) {
+                    console.warn('Error during drag-to-create action block:', e);
+                }
+            }
+        }
+    }
+    } catch (error) {
+        console.error('Error in handleConnectMouseUp:', error);
+        cleanupDragState();
+        return;
+    }
+
+    cleanupDragState();
+}
+
+function cleanupDragState() {
+    console.log('cleanupDragState called');
+    isConnecting = false;
+    connectStartTime = 0;
+    connectFromBlockId = null;
+    connectFromInput = null;
+    connectFromNext = null;
+    document.removeEventListener('mousemove', handleConnectMouseMove);
+    document.removeEventListener('mouseup', handleConnectMouseUp, true);
+    // Also clear any menu click handlers that might intercept the next drag start
+    clearMenuDocHandlers();
+    drawConnections();
+}
+
+function connectProviderToInput(selectedObj, targetBlock, which, providerId) {
+    const key = which === 'b' ? 'input_b' : 'input_a';
+    targetBlock[key] = providerId;
+    // Mark value fields as caret
+    if (targetBlock.content === 'move_xy') {
+        if (which === 'a') targetBlock.val_a = '^'; else targetBlock.val_b = '^';
+    } else if (targetBlock.content === 'wait' || targetBlock.content === 'repeat' || targetBlock.content === 'rotate' || targetBlock.content === 'set_rotation') {
+        targetBlock.val_a = '^';
+    } else if (targetBlock.content === 'operation') {
+        if (which === 'a') targetBlock.op_x = '^'; else targetBlock.op_y = '^';
+    } else if (targetBlock.content === 'set_variable' || targetBlock.content === 'change_variable') {
+        targetBlock.val_a = '^';
+    }
+    updateWorkspace();
+}
+
 // Resize canvas to match node window
 function resizeConnectionCanvas() {
-    const nodeWindow = document.getElementById('node-window');
-    connectionCanvas.width = nodeWindow.offsetWidth;
-    connectionCanvas.height = nodeWindow.offsetHeight;
+    const viewport = document.getElementById('code-viewport') || document.getElementById('node-window');
+    const r = viewport.getBoundingClientRect();
+    connectionCanvas.width = Math.max(1, Math.floor(r.width));
+    connectionCanvas.height = Math.max(1, Math.floor(r.height));
 }
 
 // Draw connections between blocks
 function drawConnections() {
-    resizeConnectionCanvas();
+    // Base off the unscaled node window to keep lines crisp
+    const nodeWindow = document.getElementById('node-window');
+    const vr = nodeWindow.getBoundingClientRect();
+    connectionCanvas.width = Math.max(1, Math.floor(vr.width));
+    connectionCanvas.height = Math.max(1, Math.floor(vr.height));
+    connectionCanvas.style.width = vr.width + 'px';
+    connectionCanvas.style.height = vr.height + 'px';
+    connectionCtx.setTransform(1, 0, 0, 1, 0, 0);
     connectionCtx.clearRect(0, 0, connectionCanvas.width, connectionCanvas.height);
     
     const selectedObj = objects.find(obj => obj.id == selected_object);
     if (!selectedObj) return;
 
     selectedObj.code.forEach(code => {
-        if (code.next_block !== null) {
-            const nodeWindow = document.getElementById('node-window');
-            const startBlock = nodeWindow.querySelector(`.node-block[data-code-id="${code.id}"]`);
-            const endBlock = nodeWindow.querySelector(`.node-block[data-code-id="${code.next_block}"]`);
+        const startBlock = nodeWindow.querySelector(`.node-block[data-code-id="${code.id}"]`);
+        if (!startBlock) return;
+        const startRect = startBlock.getBoundingClientRect();
+        const nodeWindowRect = vr;
+        const plusA = startBlock.querySelector('.node-plus-btn-a');
+        const plusB = startBlock.querySelector('.node-plus-btn-b');
+        const startX_A = plusA ? (plusA.getBoundingClientRect().left - nodeWindowRect.left + plusA.offsetWidth / 2) : (startRect.left - nodeWindowRect.left + startRect.width * 0.45);
+        const startX_B = plusB ? (plusB.getBoundingClientRect().left - nodeWindowRect.left + plusB.offsetWidth / 2) : (startRect.left - nodeWindowRect.left + startRect.width * 0.55);
+        const startY_A = plusA ? (plusA.getBoundingClientRect().bottom - nodeWindowRect.top) : (startRect.bottom - nodeWindowRect.top);
+        const startY_B = plusB ? (plusB.getBoundingClientRect().bottom - nodeWindowRect.top) : (startRect.bottom - nodeWindowRect.top);
 
-            if (startBlock && endBlock) {
-                const startRect = startBlock.getBoundingClientRect();
-                const endRect = endBlock.getBoundingClientRect();
-                const nodeWindowRect = nodeWindow.getBoundingClientRect();
+        const drawArrow = (targetId, color, useB) => {
+            if (targetId === null || typeof targetId === 'undefined') return;
+            const endBlock = nodeWindow.querySelector(`.node-block[data-code-id="${targetId}"]`);
+            if (!endBlock) return;
+            const endRect = endBlock.getBoundingClientRect();
+            // Aim to the block's top anchor circle (aligned with ::before)
+            const endX = endRect.left - nodeWindowRect.left + 18 + 5; // left + offset + radius
+            const endY = endRect.top - nodeWindowRect.top - 1; // just above top edge
+            connectionCtx.beginPath();
+            connectionCtx.moveTo(useB ? startX_B : startX_A, useB ? startY_B : startY_A);
+            connectionCtx.lineTo(endX, endY);
+            connectionCtx.strokeStyle = color;
+            connectionCtx.lineWidth = 2;
+            connectionCtx.stroke();
+        };
 
-                const startX = startRect.left - nodeWindowRect.left + startRect.width / 2;
-                const startY = startRect.bottom - nodeWindowRect.top;
-                const endX = endRect.left - nodeWindowRect.left + endRect.width / 2;
-                const endY = endRect.top - nodeWindowRect.top;
+        drawArrow(code.next_block_a, "#4da3ff", false); // blue-ish for A
+        drawArrow(code.next_block_b, "#ffb84d", true); // orange-ish for B
 
-                connectionCtx.beginPath();
-                connectionCtx.moveTo(startX, startY);
-                connectionCtx.lineTo(endX, endY);
-                connectionCtx.strokeStyle = "blue";
-                connectionCtx.lineWidth = 2;
-                connectionCtx.stroke();
+        // Input connections (from top input plus buttons to value blocks)
+        const inputPlusA = startBlock.querySelector('.node-input-plus-btn-a');
+        const inputPlusB = startBlock.querySelector('.node-input-plus-btn-b');
+        const getInputStart = (btnEl) => {
+            if (!btnEl) return null;
+            const r = btnEl.getBoundingClientRect();
+            // Project to canvas coordinates (nodeWindow space), not viewport
+            const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
+            return {
+                x: r.left - containerRect.left + r.width / 2,
+                y: r.top - containerRect.top
+            };
+        };
+        const drawInputArrow = (targetId, btnEl, color) => {
+            if (targetId === null || typeof targetId === 'undefined' || !btnEl) return;
+            const endBlock = nodeWindow.querySelector(`.node-block[data-code-id="${targetId}"]`);
+            if (!endBlock) return;
+            const outAnchor = endBlock.querySelector('.node-output-anchor');
+            const outRect = outAnchor ? outAnchor.getBoundingClientRect() : endBlock.getBoundingClientRect();
+            const start = getInputStart(btnEl);
+            if (!start) return;
+            // Start at consumer's input plus (top), end at provider's bottom-center output anchor
+            const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
+            const endX = outRect.left - containerRect.left + outRect.width / 2;
+            const endY = outRect.top - containerRect.top + outRect.height / 2;
+            connectionCtx.beginPath();
+            connectionCtx.moveTo(start.x, start.y);
+            connectionCtx.lineTo(endX, endY);
+            connectionCtx.strokeStyle = color;
+            connectionCtx.lineWidth = 2;
+            connectionCtx.stroke();
+        };
+
+        // While connecting, draw a provisional line
+        if (isConnecting && connectFromBlockId != null) {
+            const fromBlock = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromBlockId}"]`);
+            if (fromBlock) {
+                const anchor = fromBlock.querySelector('.node-output-anchor');
+                if (anchor) {
+                    const ar = anchor.getBoundingClientRect();
+                    const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
+                    const sx = ar.left - containerRect.left + ar.width / 2;
+                    const sy = ar.top - containerRect.top + ar.height / 2;
+                    connectionCtx.beginPath();
+                    connectionCtx.moveTo(sx, sy);
+                    connectionCtx.lineTo(connectMouse.x, connectMouse.y);
+                    connectionCtx.strokeStyle = '#66ff99';
+                    connectionCtx.lineWidth = 2;
+                    connectionCtx.setLineDash([6, 4]);
+                    connectionCtx.stroke();
+                    connectionCtx.setLineDash([]);
+                }
             }
         }
+
+        // While connecting from input, draw preview from input-plus to mouse
+        if (isConnecting && connectFromInput) {
+            const startBlock = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromInput.blockId}"]`);
+            if (startBlock) {
+                const btnEl = startBlock.querySelector(connectFromInput.which === 'b' ? '.node-input-plus-btn-b' : '.node-input-plus-btn-a');
+                if (btnEl) {
+                    const start = getInputStart(btnEl);
+                    if (start) {
+                        connectionCtx.beginPath();
+                        connectionCtx.moveTo(start.x, start.y);
+                        connectionCtx.lineTo(connectMouse.x, connectMouse.y);
+                        connectionCtx.strokeStyle = '#66ff99';
+                        connectionCtx.lineWidth = 2;
+                        connectionCtx.setLineDash([6, 4]);
+                        connectionCtx.stroke();
+                        connectionCtx.setLineDash([]);
+                    }
+                }
+            }
+        }
+
+        // While connecting from next (A/B), draw preview from bottom plus to mouse
+        if (isConnecting && connectFromNext) {
+            const startBlockEl = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromNext.blockId}"]`);
+            if (startBlockEl) {
+                const btnEl = startBlockEl.querySelector(connectFromNext.which === 'b' ? '.node-plus-btn-b' : '.node-plus-btn-a');
+                const r = btnEl && btnEl.getBoundingClientRect();
+                if (r) {
+                    const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
+                    const sx = r.left - containerRect.left + r.width / 2;
+                    const sy = r.bottom - containerRect.top;
+                    connectionCtx.beginPath();
+                    connectionCtx.moveTo(sx, sy);
+                    connectionCtx.lineTo(connectMouse.x, connectMouse.y);
+                    connectionCtx.strokeStyle = '#4da3ff';
+                    connectionCtx.lineWidth = 2;
+                    connectionCtx.setLineDash([6, 4]);
+                    connectionCtx.stroke();
+                    connectionCtx.setLineDash([]);
+                }
+            }
+        }
+
+        drawInputArrow(code.input_a, inputPlusA, "#66ff99"); // green for input A
+        drawInputArrow(code.input_b, inputPlusB, "#cc66ff"); // purple for input B
     });
 }
 
@@ -438,12 +3017,36 @@ function generateBlankImageDataUrl(width = 128, height = 128) {
     return c.toDataURL('image/png');
 }
 
+// Get the next available image number for the current object
+function getNextImageNumber() {
+    const currentObjectId = selected_object;
+    const key = String(currentObjectId);
+    if (!objectImages[key]) objectImages[key] = [];
+
+    // Find all existing image numbers
+    const existingNumbers = new Set();
+    objectImages[key].forEach(img => {
+        const match = img.name.match(/^image-(\d+)$/);
+        if (match) {
+            existingNumbers.add(parseInt(match[1]));
+        }
+    });
+
+    // Find the smallest available number starting from 1
+    let num = 1;
+    while (existingNumbers.has(num)) {
+        num++;
+    }
+    return num;
+}
+
 function ensureDefaultImageForObject(obj) {
     const key = String(obj.id);
     if (!objectImages[key]) objectImages[key] = [];
     if (objectImages[key].length === 0) {
         const blank = generateBlankImageDataUrl();
-        const imgInfo = { id: Date.now(), name: 'image-1', src: blank };
+        // Always start with image-1 for new objects
+        const imgInfo = { id: Date.now(), name: `image-1`, src: blank };
         objectImages[key].push(imgInfo);
         if (!obj.media) obj.media = [];
         if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: imgInfo.src });
@@ -465,6 +3068,27 @@ function getCurrentObjectImages() {
     }
     return objectImages[key];
 }
+
+// Reorder images by moving dragged image to position of target image
+function reorderImages(draggedImageName, targetImageName) {
+    const images = getCurrentObjectImages();
+    const draggedIndex = images.findIndex(img => img.name === draggedImageName);
+    const targetIndex = images.findIndex(img => img.name === targetImageName);
+
+    if (draggedIndex === -1 || targetIndex === -1) return;
+
+    // Remove dragged image from array
+    const [draggedImage] = images.splice(draggedIndex, 1);
+
+    // Insert dragged image at target position
+    images.splice(targetIndex, 0, draggedImage);
+
+    // Refresh the thumbnail display
+    const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+    if (thumbnailsContainer) {
+        loadImagesFromDirectory(thumbnailsContainer);
+    }
+}
 // No default preloaded images; objects start without images
 // Editor instance
 let imageEditor = null;
@@ -481,7 +3105,7 @@ function updateWorkspace() {
 
     // Only show code blocks and connections if code tab is active
     if (activeTab === 'code') {
-        // Re-add the connection canvas for code tab
+        // Overlay connection canvas on node window
         nodeWindow.appendChild(connectionCanvas);
 
         const selectedObj = objects.find(obj => obj.id == selected_object);
@@ -497,9 +3121,14 @@ function updateWorkspace() {
         });
 
         drawConnections();
+        // Zoom disabled for now
     } else if (activeTab === 'images') {
         // Create images tab interface
         createImagesInterface(nodeWindow);
+        // Draw crosshair when switching to images tab
+        if (imageEditor) {
+            setTimeout(() => imageEditor.drawCrosshair && imageEditor.drawCrosshair(), 100);
+        }
     } else {
         // Show a message for non-code tabs (no canvas, no connections)
         const message = document.createElement('div');
@@ -888,7 +3517,6 @@ function loadImagesFromDirectory(container) {
     container.innerHTML = '';
 
     images.forEach(imgInfo => {
-        if (!currentImageInfo) currentImageInfo = imgInfo; // track last referenced
         const imageItem = document.createElement('div');
         imageItem.className = 'image-thumbnail-item';
         imageItem.dataset.filename = imgInfo.name;
@@ -939,6 +3567,37 @@ function loadImagesFromDirectory(container) {
             deleteImage(imageItem, imgInfo.name, imgInfo);
         });
 
+        // Make thumbnail draggable for reordering
+        imageItem.draggable = true;
+        imageItem.addEventListener('dragstart', (e) => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/html', imgInfo.name);
+            imageItem.classList.add('dragging');
+        });
+
+        imageItem.addEventListener('dragend', () => {
+            imageItem.classList.remove('dragging');
+        });
+
+        imageItem.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            imageItem.classList.add('drag-over');
+        });
+
+        imageItem.addEventListener('dragleave', () => {
+            imageItem.classList.remove('drag-over');
+        });
+
+        imageItem.addEventListener('drop', (e) => {
+            e.preventDefault();
+            imageItem.classList.remove('drag-over');
+            const draggedImageName = e.dataTransfer.getData('text/html');
+            if (draggedImageName !== imgInfo.name) {
+                reorderImages(draggedImageName, imgInfo.name);
+            }
+        });
+
         imageItem.appendChild(thumbnail);
         imageItem.appendChild(label);
         imageItem.appendChild(deleteBtn);
@@ -984,7 +3643,11 @@ function loadImagesFromDirectory(container) {
     setTimeout(() => {
         if (images.length > 0) {
             const firstItem = container.children[0];
-            if (firstItem) selectImage(images[0].src, firstItem);
+            if (firstItem) {
+                currentImageFilename = images[0].name;
+                currentImageInfo = images[0];
+                selectImage(images[0].src, firstItem);
+            }
         } else {
             selectedImage = null;
             if (imageEditor) imageEditor.clear(true);
@@ -1010,6 +3673,13 @@ function selectImage(imagePath, thumbnailElement) {
     const busted = `${imagePath}${imagePath.includes('?') ? '&' : '?'}v=${imageRevision}`;
     selectedImage = busted;
     lastSelectedImage = imagePath;
+    // Keep current image metadata in sync for save naming
+    const list = getCurrentObjectImages();
+    const info = list.find(x => x.src.split('?')[0] === imagePath.split('?')[0]);
+    if (info) {
+        currentImageFilename = info.name;
+        currentImageInfo = info;
+    }
 
     // Save to localStorage
     localStorage.setItem('lastSelectedImage', imagePath);
@@ -1032,8 +3702,6 @@ function selectImage(imagePath, thumbnailElement) {
             let img = box.querySelector('img');
             if (!img) {
                 img = document.createElement('img');
-                img.style.width = '75px';
-                img.style.height = '75px';
                 box.insertBefore(img, box.firstChild);
             }
             img.src = busted;
@@ -1241,7 +3909,8 @@ function resetZoom() {
 // Create a new empty image
 function createNewImage() {
     const timestamp = Date.now();
-    const filename = `new_image_${timestamp}.png`;
+    const nextNum = getNextImageNumber();
+    const filename = `image-${nextNum}.png`;
 
     // Create a simple 256x256 transparent PNG
     const canvas = document.createElement('canvas');
@@ -1276,11 +3945,11 @@ function createNewImage() {
     img.onload = function() {
         // Add the new image to the images directory (simulated)
         // In a real app, this would be saved to the server
-        console.log(`New image created: ${filename}`);
+        console.log(`New image created: image-${nextNum}`);
 
         // Add to current object's images and refresh
         const list = getCurrentObjectImages();
-        list.unshift({ id: timestamp, name: filename, src: dataUrl });
+        list.unshift({ id: timestamp, name: `image-${nextNum}`, src: dataUrl });
         const thumbnailsContainer = document.querySelector('.images-left-panel > div');
         if (thumbnailsContainer) {
             loadImagesFromDirectory(thumbnailsContainer);
@@ -1376,22 +4045,72 @@ function createBox(boxData) {
     const box = document.createElement("div");
     box.className = "box";
     box.dataset.id = boxData.id;
+    box.draggable = true;
 
     // Create icon element
     const icon = document.createElement("img"); // Use <img> instead of <image>
     // Check if media exists and has a valid path
     if (boxData.media && boxData.media.length > 0 && boxData.media[0].path) {
         icon.src = boxData.media[0].path; // Set src to the media path
-        icon.alt = boxData.media[0].name; // Optional: set alt text
         icon.style.width = "75px"; // Optional: set a size for the icon
         icon.style.height = "75px";
         box.appendChild(icon);
     }
 
+    const nameContainer = document.createElement("div");
+    nameContainer.className = "object-name-container";
+
     const name = document.createElement("span");
     name.className = "object-name";
     name.textContent = boxData.name;
-    box.appendChild(name);
+    name.title = "Click to rename";
+    name.style.cursor = "pointer";
+
+    // Add double-click to rename
+    name.addEventListener("dblclick", (e) => {
+        e.stopPropagation();
+        startRenameObject(boxData.id, name);
+    });
+
+    nameContainer.appendChild(name);
+    box.appendChild(nameContainer);
+
+    // Create delete button (only for non-controller objects)
+    if (boxData.type !== 'controller') {
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'object-delete-btn';
+        deleteBtn.textContent = '×';
+        deleteBtn.title = 'Delete object';
+        deleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation(); // Prevent box selection when clicking delete
+            deleteObject(boxData.id);
+        });
+        box.appendChild(deleteBtn);
+    }
+
+    // Add drag and drop functionality
+    box.addEventListener('dragstart', (e) => {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/html', boxData.id.toString());
+        box.classList.add('dragging');
+    });
+
+    box.addEventListener('dragend', () => {
+        box.classList.remove('dragging');
+    });
+
+    box.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+    });
+
+    box.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const draggedObjectId = parseInt(e.dataTransfer.getData('text/html'));
+        if (draggedObjectId !== boxData.id) {
+            reorderObjects(draggedObjectId, boxData.id);
+        }
+    });
 
     box.addEventListener("click", () => {
         document.querySelectorAll('.box').forEach(otherBox => {
@@ -1399,6 +4118,9 @@ function createBox(boxData) {
         });
         box.classList.add("selected");
         selected_object = boxData.id;
+        // Reset editor state to avoid cross-object filename reuse
+        currentImageFilename = null;
+        currentImageInfo = null;
         updateWorkspace();
         renderGameWindowSprite();
     });
@@ -1406,15 +4128,236 @@ function createBox(boxData) {
     return box;
 }
 
-// Initialize grid
-objects.forEach((boxData, index) => {
-    const boxElement = createBox(boxData);
-    grid.appendChild(boxElement);
-    if (index === 0) {
-        boxElement.classList.add("selected");
-        selected_object = boxData.id;
+// Function to add a new game object
+function addNewObject() {
+    // Find the next available ID
+    const existingIds = objects.map(obj => obj.id);
+    let nextId = 0;
+    while (existingIds.includes(nextId)) {
+        nextId++;
     }
-});
+
+    // Find the next available object number for naming
+    const existingNames = objects.map(obj => {
+        const match = obj.name.match(/^Object(\d+)$/);
+        return match ? parseInt(match[1]) : 0;
+    });
+    let nextNum = 1;
+    while (existingNames.includes(nextNum)) {
+        nextNum++;
+    }
+
+    // Create new object with start block
+    const newObject = {
+        id: nextId,
+        name: `Object${nextNum}`,
+        type: "object",
+        media: [],
+        code: [
+            {
+                id: 0,
+                type: "start",
+                location: {x: 0, y: 0},
+                content: "When Created",
+                val_a: null,
+                val_b: null,
+                next_block_a: null,
+                next_block_b: null,
+                position: {x: 20, y: 20}
+            }
+        ]
+    };
+
+    // Add to objects array
+    objects.push(newObject);
+
+    // Initialize images for the new object BEFORE rendering
+    ensureDefaultImageForObject(newObject);
+
+    // Re-render the grid to include the new object with its default image
+    renderObjectGrid();
+
+    // Select the new object
+    document.querySelectorAll('.box').forEach(otherBox => {
+        otherBox.classList.remove("selected");
+    });
+    const newBoxElement = document.querySelector(`.box[data-id="${newObject.id}"]`);
+    if (newBoxElement) {
+        newBoxElement.classList.add("selected");
+    }
+    selected_object = newObject.id;
+
+    // Update workspace
+    updateWorkspace();
+    renderGameWindowSprite();
+
+    console.log(`New object created: ${newObject.name} (ID: ${newObject.id})`);
+}
+
+// Function to delete an object
+function deleteObject(objectId) {
+    // Don't allow deleting the controller
+    const obj = objects.find(o => o.id === objectId);
+    if (!obj || obj.type === 'controller') return;
+
+    // Confirm deletion
+    if (!confirm(`Are you sure you want to delete "${obj.name}"? This action cannot be undone.`)) {
+        return;
+    }
+
+    // Remove from objects array
+    const index = objects.findIndex(o => o.id === objectId);
+    if (index === -1) return;
+    objects.splice(index, 1);
+
+    // Re-render the grid
+    renderObjectGrid();
+
+    // If the deleted object was selected, select another object
+    if (selected_object === objectId) {
+        const remainingObjects = objects.filter(o => o.id !== objectId);
+        if (remainingObjects.length > 0) {
+            // Select the first remaining object
+            selected_object = remainingObjects[0].id;
+            const newSelectedBox = document.querySelector(`.box[data-id="${selected_object}"]`);
+            if (newSelectedBox) {
+                document.querySelectorAll('.box').forEach(otherBox => {
+                    otherBox.classList.remove("selected");
+                });
+                newSelectedBox.classList.add("selected");
+            }
+        } else {
+            selected_object = -1; // No objects left
+        }
+
+        // Update workspace
+        updateWorkspace();
+        renderGameWindowSprite();
+    }
+
+    // Remove object images
+    if (objectImages[String(objectId)]) {
+        delete objectImages[String(objectId)];
+    }
+
+    console.log(`Object deleted: ${obj.name} (ID: ${objectId})`);
+}
+
+// Function to reorder objects by moving dragged object to position of target object
+function reorderObjects(draggedObjectId, targetObjectId) {
+    const draggedIndex = objects.findIndex(obj => obj.id === draggedObjectId);
+    const targetIndex = objects.findIndex(obj => obj.id === targetObjectId);
+
+    if (draggedIndex === -1 || targetIndex === -1) return;
+
+    // Remove dragged object from array
+    const [draggedObject] = objects.splice(draggedIndex, 1);
+
+    // Insert dragged object at target position
+    objects.splice(targetIndex, 0, draggedObject);
+
+    // Refresh the grid display
+    renderObjectGrid();
+
+    console.log(`Reordered objects: ${draggedObject.name} moved to position of ${objects[targetIndex].name}`);
+}
+
+// Function to start renaming an object
+function startRenameObject(objectId, nameElement) {
+    const obj = objects.find(o => o.id === objectId);
+    if (!obj) return;
+
+    const container = nameElement.parentElement;
+    const currentName = nameElement.textContent;
+
+    // Create input field
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = currentName;
+    input.className = 'object-name-input';
+    input.style.cssText = `
+        width: 100%;
+        padding: 2px 4px;
+        border: 1px solid #00ffcc;
+        border-radius: 3px;
+        background: #333;
+        color: #fff;
+        font-size: 0.9rem;
+        text-align: center;
+        outline: none;
+    `;
+
+    // Replace span with input
+    container.replaceChild(input, nameElement);
+    input.focus();
+    input.select();
+
+    // Handle input events
+    const finishRename = () => {
+        const newName = input.value.trim();
+        if (newName && newName !== currentName) {
+            obj.name = newName;
+            nameElement.textContent = newName;
+        }
+        container.replaceChild(nameElement, input);
+    };
+
+    input.addEventListener('blur', finishRename);
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            finishRename();
+        } else if (e.key === 'Escape') {
+            // Cancel rename
+            container.replaceChild(nameElement, input);
+        }
+    });
+}
+
+// Initialize grid
+renderObjectGrid();
+
+// Function to create the plus button as a grid item
+function createPlusButton() {
+    const plusBox = document.createElement("div");
+    plusBox.className = "box plus-button";
+    plusBox.title = "Add new object";
+
+    const plusIcon = document.createElement("div");
+    plusIcon.className = "plus-icon";
+    plusIcon.textContent = "+";
+    plusBox.appendChild(plusIcon);
+
+    plusBox.addEventListener("click", addNewObject);
+
+    // Prevent dragging of the plus button
+    plusBox.draggable = false;
+
+    return plusBox;
+}
+
+// Function to render the grid with objects and plus button
+function renderObjectGrid() {
+    const grid = document.getElementById('grid');
+    if (!grid) return;
+
+    grid.innerHTML = '';
+
+    // Add all existing objects
+    objects.forEach((boxData, index) => {
+        const boxElement = createBox(boxData);
+        grid.appendChild(boxElement);
+        if (index === 0 && selected_object === -1) {
+            boxElement.classList.add("selected");
+            selected_object = boxData.id;
+        } else if (boxData.id === selected_object) {
+            boxElement.classList.add("selected");
+        }
+    });
+
+    // Add the plus button as a grid item
+    const plusButton = createPlusButton();
+    grid.appendChild(plusButton);
+}
 
 // Initialize tabs
 function initializeTabs() {
@@ -1533,15 +4476,30 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeEditMenu();
     setTimeout(() => refreshObjectGridIcons(), 50);
     console.log('✅ App initialization complete');
-    // Add Play/Stop overlay button on game window
+    // Wire top-bar play/stop buttons if present, else add overlay fallback
     try {
+        const topPlay = document.getElementById('topbar-play');
+        if (topPlay && !topPlay.__bound) {
+            topPlay.__bound = true;
+            topPlay.addEventListener('click', () => {
+                if (isPlaying) {
+                    stopPlay();
+                    topPlay.textContent = '▶';
+                    topPlay.classList.remove('active');
+                } else {
+                    startPlay();
+                    topPlay.textContent = '■';
+                    topPlay.classList.add('active');
+                }
+            });
+        }
         const canvas = document.getElementById('game-window');
         const wrapper = canvas.parentElement || document.body;
         let playBtn = document.getElementById('__play_btn');
-        if (!playBtn) {
+        if (!topPlay && !playBtn) {
             playBtn = document.createElement('button');
             playBtn.id = '__play_btn';
-            playBtn.textContent = 'Play';
+            playBtn.textContent = '▶';
             playBtn.style.position = 'absolute';
             playBtn.style.top = '12px';
             playBtn.style.right = '12px';
@@ -1555,10 +4513,8 @@ document.addEventListener('DOMContentLoaded', () => {
             playBtn.addEventListener('click', () => {
                 if (isPlaying) {
                     stopPlay();
-                    playBtn.textContent = 'Play';
                 } else {
                     startPlay();
-                    playBtn.textContent = 'Stop';
                 }
             });
             wrapper.style.position = 'relative';
@@ -1583,7 +4539,7 @@ window.addEventListener("resize", () => {
     drawConnections();
 });
 
-// Render all objects' first sprites, centered by default
+// Render runtime instances during play; otherwise show object previews
 function renderGameWindowSprite() {
     const canvas = document.getElementById('game-window');
     const gctx = canvas.getContext('2d');
@@ -1596,17 +4552,26 @@ function renderGameWindowSprite() {
     gctx.fillStyle = '#777';
     gctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Draw each object's image. In play mode, use runtimePositions (0,0 at center); otherwise center preview.
+    // Draw game content. In play, draw runtime instances; otherwise center object previews.
     const centerX = canvas.width / 2;
     const centerY = canvas.height / 2;
-    // only draw objects that actually have a sprite
-    const withSprites = objects
-        .filter(o => o.media && o.media[0] && o.media[0].path)
-        .map(o => ({ obj: o, path: o.media[0].path }));
-    // order: selected first, then others
-    const visibleObjects = withSprites.sort((a, b) => (a.obj.id == selected_object ? -1 : b.obj.id == selected_object ? 1 : 0));
-    visibleObjects.forEach((entry, index) => {
-        const mediaPath = entry.path; // already versioned by imageRevision if needed
+    let visibleEntries;
+    if (isPlaying) {
+        visibleEntries = runtimeInstances
+            .map(inst => {
+                const tmpl = objects.find(o => o.id === inst.templateId);
+                const perInst = runtimePositions[inst.instanceId] || {};
+                const path = perInst.spritePath
+                    || (tmpl && tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
+                return path ? { inst, tmpl, path } : null;
+            })
+            .filter(Boolean);
+    } else {
+        // Don't show object previews when not playing
+        visibleEntries = [];
+    }
+    visibleEntries.forEach((entry, index) => {
+        const mediaPath = entry.path;
         let img = imageCache[mediaPath];
         if (!img) {
             img = new Image();
@@ -1616,23 +4581,38 @@ function renderGameWindowSprite() {
 
         const drawIfReady = () => {
             if (!img.complete) return;
-            const scale = Math.min(canvas.width / img.width, canvas.height / img.height, 1);
+            gctx.imageSmoothingEnabled = true;
+            gctx.imageSmoothingQuality = 'high';
+            let scale = Math.min(canvas.width / img.width, canvas.height / img.height, 1);
+            if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale === 'number') {
+                scale *= Math.max(0, runtimePositions[entry.inst.instanceId].scale || 1);
+            }
             const dw = img.width * scale;
             const dh = img.height * scale;
             let drawX, drawY;
-            if (isPlaying && runtimePositions[entry.obj.id]) {
-                const p = worldToCanvas(runtimePositions[entry.obj.id].x, runtimePositions[entry.obj.id].y, canvas);
+            if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId]) {
+                const p = worldToCanvas(runtimePositions[entry.inst.instanceId].x, runtimePositions[entry.inst.instanceId].y, canvas);
                 drawX = Math.round(p.x - dw / 2);
                 drawY = Math.round(p.y - dh / 2);
             } else {
-                const angle = index === 0 ? 0 : (index / Math.max(1, visibleObjects.length)) * Math.PI * 2;
+                const angle = index === 0 ? 0 : (index / Math.max(1, visibleEntries.length)) * Math.PI * 2;
                 const radius = index === 0 ? 0 : Math.min(canvas.width, canvas.height) * 0.04 * index;
                 const offsetX = Math.cos(angle) * radius;
                 const offsetY = Math.sin(angle) * radius;
                 drawX = Math.round(centerX - dw / 2 + offsetX);
                 drawY = Math.round(centerY - dh / 2 + offsetY);
             }
-            gctx.drawImage(img, drawX, drawY, dw, dh);
+            // Apply rotation if in play mode
+            if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].rot === 'number') {
+                const angleRad = (runtimePositions[entry.inst.instanceId].rot || 0) * Math.PI / 180;
+                gctx.save();
+                gctx.translate(drawX + dw / 2, drawY + dh / 2);
+                gctx.rotate(angleRad);
+                gctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+                gctx.restore();
+            } else {
+                gctx.drawImage(img, drawX, drawY, dw, dh);
+            }
         };
 
         if (img.complete) {
@@ -1664,8 +4644,6 @@ function refreshObjectGridIcons() {
                 let img = box.querySelector('img');
                 if (!img) {
                     img = document.createElement('img');
-                    img.style.width = '75px';
-                    img.style.height = '75px';
                     box.insertBefore(img, box.firstChild);
                 }
                 img.src = list[0].src;
@@ -1714,6 +4692,32 @@ function initializeImageEditor(params) {
         return `rgba(${c.r}, ${c.g}, ${c.b}, ${c.a})`;
     }
 
+    function updateGameObjectIcon() {
+        // Update the selected object's icon in the grid immediately
+        const obj = objects.find(o => o.id == selected_object);
+        if (obj && obj.media && obj.media.length > 0) {
+            // Get the current canvas data URL
+            const dataUrl = canvas.toDataURL('image/png');
+
+            // Update the object's media path
+            obj.media[0].path = dataUrl;
+
+            // Update the grid icon immediately
+            const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+            if (box) {
+                let img = box.querySelector('img');
+                if (!img) {
+                    img = document.createElement('img');
+                    box.insertBefore(img, box.firstChild);
+                }
+                img.src = dataUrl;
+                img.alt = obj.name;
+                img.style.width = "75px";
+                img.style.height = "75px";
+            }
+        }
+    }
+
     function pushUndo() {
         try {
             const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -1728,6 +4732,7 @@ function initializeImageEditor(params) {
     function restore(imageData) {
         if (!imageData) return;
         ctx.putImageData(imageData, 0, 0);
+        // Crosshair is now on overlay, no need to redraw
     }
 
     function setTool(t) { state.tool = t; }
@@ -1744,11 +4749,15 @@ function initializeImageEditor(params) {
         state.zoom = Math.max(0.1, Math.min(8, z));
         canvas.style.transform = `scale(${state.zoom})`;
         const overlay = wrapper.querySelector('canvas.__overlay');
-        if (overlay) overlay.style.transform = `translate(-50%, -50%) scale(${state.zoom})`;
+        if (overlay) {
+            overlay.style.setProperty('--zoom', state.zoom);
+        }
+        // Crosshair is automatically scaled with overlay
     }
 
     async function saveToDisk(forceNewName) {
         try {
+            // Crosshair is now on overlay, so main canvas is clean
             const dataUrl = canvas.toDataURL('image/png');
             let filename = currentImageFilename;
             if (!filename || forceNewName) {
@@ -1811,6 +4820,7 @@ function initializeImageEditor(params) {
     function clear(silent) {
         pushUndo();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
+        updateGameObjectIcon();
         if (!silent) saveToDisk();
     }
 
@@ -1818,14 +4828,16 @@ function initializeImageEditor(params) {
         const img = new Image();
         img.crossOrigin = 'anonymous';
         img.onload = () => {
-            pushUndo();
+            // Clear canvas first, then push to undo stack to avoid preserving previous content
             ctx.clearRect(0, 0, canvas.width, canvas.height);
+            pushUndo();
             const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
             const dw = Math.round(img.width * scale);
             const dh = Math.round(img.height * scale);
             const dx = Math.floor((canvas.width - dw) / 2);
             const dy = Math.floor((canvas.height - dh) / 2);
             ctx.drawImage(img, dx, dy, dw, dh);
+            // Crosshair is on overlay, no need to redraw
             // Do not auto-save on image load to avoid save-load loops
         };
         img.src = src;
@@ -1844,6 +4856,8 @@ function initializeImageEditor(params) {
         ctx.lineTo(x1, y1);
         ctx.stroke();
         ctx.restore();
+        // Crosshair is on overlay, no need to redraw
+        updateGameObjectIcon();
     }
 
     function ensureOverlay() {
@@ -1857,7 +4871,7 @@ function initializeImageEditor(params) {
             overlay.style.pointerEvents = 'none';
             overlay.style.top = '50%';
             overlay.style.left = '50%';
-            overlay.style.transform = `translate(-50%, -50%) scale(${state.zoom})`;
+            overlay.style.setProperty('--zoom', state.zoom);
             overlay.style.transformOrigin = 'center';
             wrapper.appendChild(overlay);
         }
@@ -1866,7 +4880,45 @@ function initializeImageEditor(params) {
 
     function clearOverlay() {
         const overlay = wrapper.querySelector('canvas.__overlay');
-        if (overlay) overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+        if (overlay) {
+            overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+            // Redraw crosshair after clearing overlay
+            drawCrosshair();
+        }
+    }
+
+    function drawCrosshair() {
+        // Draw crosshair on a separate overlay that doesn't affect main canvas
+        const overlay = ensureOverlay();
+        const octx = overlay.getContext('2d');
+
+        // Clear any previous crosshair
+        octx.clearRect(0, 0, overlay.width, overlay.height);
+
+        const centerX = overlay.width / 2;
+        const centerY = overlay.height / 2;
+        const size = 12; // Smaller size of crosshair arms
+
+        octx.save();
+        octx.strokeStyle = '#ffffff';
+        octx.lineWidth = 1;
+        octx.globalAlpha = 0.7;
+        octx.shadowColor = '#000000';
+        octx.shadowBlur = 1;
+
+        // Draw horizontal line
+        octx.beginPath();
+        octx.moveTo(centerX - size, centerY);
+        octx.lineTo(centerX + size, centerY);
+        octx.stroke();
+
+        // Draw vertical line
+        octx.beginPath();
+        octx.moveTo(centerX, centerY - size);
+        octx.lineTo(centerX, centerY + size);
+        octx.stroke();
+
+        octx.restore();
     }
 
     function previewRect(x0, y0, x1, y1) {
@@ -1910,6 +4962,7 @@ function initializeImageEditor(params) {
         }
         if (isErase && state.fill) ctx.clearRect(x0, y0, w, h);
         ctx.restore();
+        // Crosshair is on overlay, no need to redraw
     }
 
     function commitCircle(x0, y0, x1, y1) {
@@ -1935,6 +4988,7 @@ function initializeImageEditor(params) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
         }
         ctx.restore();
+        // Crosshair is on overlay, no need to redraw
     }
 
     function bucketFillAt(x, y) {
@@ -1959,6 +5013,8 @@ function initializeImageEditor(params) {
             stack.push([px, py-1]);
         }
         ctx.putImageData(target, 0, 0);
+        // Crosshair is on overlay, no need to redraw
+        updateGameObjectIcon();
     }
 
     function beginSelection(x, y) {
@@ -1996,12 +5052,12 @@ function initializeImageEditor(params) {
             overlay.style.pointerEvents = 'none';
             overlay.style.top = '50%';
             overlay.style.left = '50%';
-            overlay.style.transform = `translate(-50%, -50%) scale(${state.zoom})`;
+            overlay.style.setProperty('--zoom', state.zoom);
             overlay.style.transformOrigin = 'center';
             wrapper.appendChild(overlay);
         } else {
             overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
-            overlay.style.transform = `translate(-50%, -50%) scale(${state.zoom})`;
+            overlay.style.setProperty('--zoom', state.zoom);
         }
         const octx = overlay.getContext('2d');
         octx.clearRect(0, 0, overlay.width, overlay.height);
@@ -2032,9 +5088,12 @@ function initializeImageEditor(params) {
         // draw scaled to current width/height
         ctx.drawImage(state.selection.layerCanvas, state.selection.x, state.selection.y, state.selection.w, state.selection.h);
         state.selection = null;
+        // Crosshair is on overlay, no need to redraw
         const overlay = wrapper.querySelector('canvas.__overlay');
         if (overlay) overlay.remove();
+        updateGameObjectIcon();
         saveToDisk();
+        // Crosshair will be redrawn when overlay is recreated
     }
     function getSelectionHandles(handleSize) {
         const s = state.selection;
@@ -2271,6 +5330,7 @@ function initializeImageEditor(params) {
         } else if (state.tool === 'brush') {
             // Persist brush stroke when mouse is released
             saveToDisk();
+            // Crosshair remains on overlay
         } else if (state.tool === 'select') {
             if (state.selection && !state.selection.layerCanvas) {
                 finalizeSelectionRect(p.x, p.y);
@@ -2334,10 +5394,12 @@ function initializeImageEditor(params) {
     params.zoomResetBtn.addEventListener('click', () => setZoom(1));
 
     // Public API
-    const api = { setTool, setColor, setBrushSize, setFill, setZoom, clear, loadImage, undo, redo };
+    const api = { setTool, setColor, setBrushSize, setFill, setZoom, clear, loadImage, undo, redo, drawCrosshair };
     // Defaults
     setColor('#ff0000', 1);
     setBrushSize(16);
     setZoom(imageZoom);
+    // Draw initial crosshair
+    drawCrosshair();
     return api;
 }
