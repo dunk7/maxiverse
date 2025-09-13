@@ -1064,6 +1064,7 @@ function createNodeBlock(codeData, x, y) {
         label.textContent = '';
         label.append('Set ');
         const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
         const varSelect = document.createElement('select');
         populateVariableSelect(varSelect, codeData);
         // Default UI selection to public 'i' if available and var not set
@@ -1079,6 +1080,9 @@ function createNodeBlock(codeData, x, y) {
         } catch(_) {}
         varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
         varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
+        // Ensure reasonable size and alignment
+        varSelect.style.minWidth = '120px';
+        varSelect.style.height = '22px';
         varSpan.appendChild(varSelect);
         label.appendChild(varSpan);
         label.append(' to (');
@@ -1116,6 +1120,7 @@ function createNodeBlock(codeData, x, y) {
         label.textContent = '';
         label.append('Change ');
         const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
         const varSelect = document.createElement('select');
         populateVariableSelect(varSelect, codeData);
         // Default UI selection to public 'i' if available and var not set
@@ -1131,6 +1136,8 @@ function createNodeBlock(codeData, x, y) {
         } catch(_) {}
         varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
         varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.height = '22px';
         varSpan.appendChild(varSelect);
         label.appendChild(varSpan);
         label.append(' by (');
@@ -1167,6 +1174,7 @@ function createNodeBlock(codeData, x, y) {
     } else if (codeData.content === 'variable') {
         label.textContent = '';
         const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
         const varSelect = document.createElement('select');
         populateVariableSelect(varSelect, codeData);
         // Default UI selection to public 'i' if available and var not set
@@ -1182,6 +1190,8 @@ function createNodeBlock(codeData, x, y) {
         } catch(_) {}
         varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
         varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.height = '22px';
         varSpan.appendChild(varSelect);
         label.appendChild(varSpan);
         block.classList.add('node-block-compact');
@@ -2036,8 +2046,8 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
         // For drag-opened: show near mouse using fixed positioning, without changing size
         const nodeWindow = document.getElementById('node-window');
         const nodeRect = nodeWindow.getBoundingClientRect();
-        const absoluteX = nodeRect.left + customPosition.x;
-        const absoluteY = nodeRect.top + customPosition.y;
+        const absoluteX = nodeRect.left + (customPosition.x - (nodeWindow.scrollLeft || 0));
+        const absoluteY = nodeRect.top + (customPosition.y - (nodeWindow.scrollTop || 0));
 
         menu.style.position = 'fixed';
         menu.style.left = `${absoluteX}px`;
@@ -2151,8 +2161,8 @@ function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn,
         // For drag-opened: show near mouse using fixed positioning, without changing size
         const nodeWindow = document.getElementById('node-window');
         const nodeRect = nodeWindow.getBoundingClientRect();
-        const absoluteX = nodeRect.left + customPosition.x;
-        const absoluteY = nodeRect.top + customPosition.y;
+        const absoluteX = nodeRect.left + (customPosition.x - (nodeWindow.scrollLeft || 0));
+        const absoluteY = nodeRect.top + (customPosition.y - (nodeWindow.scrollTop || 0));
 
         menu.style.position = 'fixed';
         menu.style.left = `${absoluteX}px`;
@@ -2220,6 +2230,7 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
     const branchKey = branch === 'b' ? 'next_block_b' : 'next_block_a';
     const oldNext = (anchorCodeData && typeof anchorCodeData[branchKey] !== 'undefined') ? anchorCodeData[branchKey] : null;
     const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
+    // customPosition is already in node-window content coordinates when provided
 
     let newBlock = {
         id: newId,
@@ -2338,6 +2349,7 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     const existingIds = selectedObj.code.map(b => b.id);
     const newId = (existingIds.length ? Math.max(...existingIds) : 0) + 1;
     const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
+    // customPosition is already in node-window content coordinates when provided
 
     let newBlock = {
         id: newId,
@@ -2414,6 +2426,7 @@ function handleMouseMove(e) {
 
     draggedBlock.style.left = `${newX}px`;
     draggedBlock.style.top = `${newY}px`;
+    autoScrollIfNearEdge(e.clientX, e.clientY);
     drawConnections();
 }
 
@@ -2446,6 +2459,7 @@ function handleMouseUp(e) {
     document.removeEventListener("mouseup", handleMouseUp);
 
     drawConnections();
+    updateSpacerFromBlocks();
 }
 
 function handleTouchMove(e) {
@@ -2461,6 +2475,7 @@ function handleTouchMove(e) {
 
     draggedBlock.style.left = `${newX}px`;
     draggedBlock.style.top = `${newY}px`;
+    autoScrollIfNearEdge(touch.clientX, touch.clientY);
     drawConnections();
 }
 
@@ -2498,15 +2513,113 @@ function handleTouchEnd(e) {
     document.removeEventListener("touchend", handleTouchEnd);
 
     drawConnections();
+    updateSpacerFromBlocks();
 }
 
 // Canvas for drawing connections
 const connectionCanvas = document.createElement("canvas");
-connectionCanvas.style.position = "absolute";
+connectionCanvas.style.position = "sticky";
 connectionCanvas.style.top = "0";
 connectionCanvas.style.left = "0";
 connectionCanvas.style.pointerEvents = "none";
+connectionCanvas.style.zIndex = "0";
 const connectionCtx = connectionCanvas.getContext("2d");
+
+// ---- Scrollable code workspace helpers ----
+const SCROLL_EDGE_THRESHOLD_PX = 48;
+const SCROLL_STEP_H_PX = 10; // faster horizontal
+const SCROLL_STEP_V_PX = 4;  // smoother vertical
+let autoScrollRAF = null;
+let autoScrollTarget = { dx: 0, dy: 0 };
+const BASE_SPACER_SIZE_PX = 2000;
+const EXTRA_SPACER_PADDING_PX = 400;
+let nodeWindowListenersAttached = false;
+
+function autoScrollIfNearEdge(clientX, clientY) {
+    const nodeWindow = document.getElementById('node-window');
+    if (!nodeWindow) return;
+    const r = nodeWindow.getBoundingClientRect();
+    let dx = 0, dy = 0;
+    if ((clientX - r.left) < SCROLL_EDGE_THRESHOLD_PX) dx = -SCROLL_STEP_H_PX;
+    else if ((r.right - clientX) < SCROLL_EDGE_THRESHOLD_PX) dx = SCROLL_STEP_H_PX;
+    if ((clientY - r.top) < SCROLL_EDGE_THRESHOLD_PX) dy = -SCROLL_STEP_V_PX;
+    else if ((r.bottom - clientY) < SCROLL_EDGE_THRESHOLD_PX) dy = SCROLL_STEP_V_PX;
+    autoScrollTarget.dx = dx;
+    autoScrollTarget.dy = dy;
+    if (autoScrollRAF == null && (dx !== 0 || dy !== 0)) {
+        const step = () => {
+            autoScrollRAF = null;
+            if (!nodeWindow) return;
+            if (autoScrollTarget.dx === 0 && autoScrollTarget.dy === 0) return;
+            nodeWindow.scrollLeft += autoScrollTarget.dx;
+            nodeWindow.scrollTop += autoScrollTarget.dy;
+            drawConnections();
+            autoScrollRAF = requestAnimationFrame(step);
+        };
+        autoScrollRAF = requestAnimationFrame(step);
+    }
+    if (dx === 0 && dy === 0 && autoScrollRAF != null) {
+        cancelAnimationFrame(autoScrollRAF);
+        autoScrollRAF = null;
+    }
+}
+
+function updateSpacerFromBlocks() {
+    const nodeWindow = document.getElementById('node-window');
+    if (!nodeWindow || activeTab !== 'code') return;
+    let spacer = nodeWindow.querySelector('#node-spacer');
+    if (!spacer) {
+        spacer = document.createElement('div');
+        spacer.id = 'node-spacer';
+        spacer.style.position = 'relative';
+        spacer.style.pointerEvents = 'none';
+        spacer.style.border = 'none';
+        nodeWindow.appendChild(spacer);
+    }
+    const nodeRect = nodeWindow.getBoundingClientRect();
+    let maxRight = nodeRect.width;
+    let maxBottom = nodeRect.height;
+    const blocks = nodeWindow.querySelectorAll('.node-block');
+    blocks.forEach(el => {
+        const br = el.getBoundingClientRect();
+        const right = br.right - nodeRect.left;
+        const bottom = br.bottom - nodeRect.top;
+        if (right > maxRight) maxRight = right;
+        if (bottom > maxBottom) maxBottom = bottom;
+    });
+    const w = Math.max(BASE_SPACER_SIZE_PX, Math.ceil(maxRight + EXTRA_SPACER_PADDING_PX));
+    const h = Math.max(BASE_SPACER_SIZE_PX, Math.ceil(maxBottom + EXTRA_SPACER_PADDING_PX));
+    spacer.style.width = w + 'px';
+    spacer.style.height = h + 'px';
+}
+
+function ensureScrollableWorkspace() {
+    const nodeWindow = document.getElementById('node-window');
+    if (!nodeWindow || activeTab !== 'code') return;
+    // Enable both-axis scrolling and layering
+    nodeWindow.style.overflow = 'auto';
+    if (!nodeWindow.style.position) nodeWindow.style.position = 'relative';
+    // Subtle grid background for polish
+    nodeWindow.style.backgroundImage = `
+        linear-gradient(to right, rgba(255,255,255,0.05) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255,255,255,0.05) 1px, transparent 1px)`;
+    nodeWindow.style.backgroundSize = '24px 24px';
+    nodeWindow.style.backgroundColor = nodeWindow.style.backgroundColor || '#1e1e1e';
+
+    // Ensure spacer exists and is sized after layout
+    requestAnimationFrame(updateSpacerFromBlocks);
+
+    if (!nodeWindowListenersAttached) {
+        nodeWindow.addEventListener('scroll', () => {
+            drawConnections();
+        });
+        window.addEventListener('resize', () => {
+            drawConnections();
+            requestAnimationFrame(updateSpacerFromBlocks);
+        });
+        nodeWindowListenersAttached = true;
+    }
+}
 
 // Zoom state for code viewport
 // Zoom disabled
@@ -2519,6 +2632,13 @@ let connectFromInput = null; // { blockId, which }
 let connectFromNext = null; // { blockId, which }
 let lastConnectEndedAt = 0;
 let connectStartTime = 0;
+
+// Convert content-space point to viewport-space (node-window visible area)
+function contentToViewport(nodeWindow, point) {
+    const sl = nodeWindow ? (nodeWindow.scrollLeft || 0) : 0;
+    const st = nodeWindow ? (nodeWindow.scrollTop || 0) : 0;
+    return { x: point.x - sl, y: point.y - st };
+}
 
 // Track active document click handlers for node-add menus so we can remove them reliably
 let activeMenuDocHandlers = [];
@@ -2556,8 +2676,11 @@ function startConnectFromNext(blockId, which) {
 function handleConnectMouseMove(e) {
     const container = document.getElementById('node-window');
     const rect = container.getBoundingClientRect();
-    connectMouse.x = e.clientX - rect.left;
-    connectMouse.y = e.clientY - rect.top;
+    const sl = container.scrollLeft || 0;
+    const st = container.scrollTop || 0;
+    connectMouse.x = (e.clientX - rect.left) + sl;
+    connectMouse.y = (e.clientY - rect.top) + st;
+    autoScrollIfNearEdge(e.clientX, e.clientY);
     drawConnections();
 }
 
@@ -2569,6 +2692,17 @@ function handleConnectMouseUp(e) {
     }
 
     try {
+        // Normalize mouse position to content coordinates at release time
+        try {
+            const container = document.getElementById('node-window');
+            if (container) {
+                const rect = container.getBoundingClientRect();
+                const sl = container.scrollLeft || 0;
+                const st = container.scrollTop || 0;
+                connectMouse.x = (e.clientX - rect.left) + sl;
+                connectMouse.y = (e.clientY - rect.top) + st;
+            }
+        } catch(_) {}
         // Clean up any leftover temporary blocks from previous operations
         document.querySelectorAll('[data-temp-block="true"]').forEach(el => {
             try {
@@ -2648,7 +2782,7 @@ function handleConnectMouseUp(e) {
                     if (nodeWindow) {
                         nodeWindow.appendChild(tempBlock);
 
-                        // Show menu with position based on mouse
+                        // Show menu with position based on mouse in content coordinates
                         showAddBlockMenu(tempBlock, source, 'a', { x: connectMouse.x, y: connectMouse.y });
 
                         // Remove temp block after menu is shown
@@ -2718,7 +2852,7 @@ function handleConnectMouseUp(e) {
                     if (nodeWindow) {
                         nodeWindow.appendChild(tempBlock);
 
-                        // Show menu with position based on mouse
+                        // Show menu with position based on mouse in content coordinates
                         showAddInputBlockMenu(tempBlock, target, connectFromInput.which, null, { x: connectMouse.x, y: connectMouse.y });
 
                         // Remove temp block after menu is shown
@@ -2782,9 +2916,10 @@ function handleConnectMouseUp(e) {
                     if (nodeWindow) {
                         nodeWindow.appendChild(tempBlock);
 
-                        // Show menu with position based on mouse
-                        console.log('Calling showAddBlockMenu with custom position:', { x: connectMouse.x, y: connectMouse.y });
-                        showAddBlockMenu(tempBlock, source, connectFromNext.which, { x: connectMouse.x, y: connectMouse.y });
+                        // Show menu with position based on mouse in content coordinates
+                        const pos = { x: connectMouse.x, y: connectMouse.y };
+                        console.log('Calling showAddBlockMenu with custom position:', pos);
+                        showAddBlockMenu(tempBlock, source, connectFromNext.which, pos);
 
                         // Remove temp block after menu is shown
                         setTimeout(() => {
@@ -2855,6 +2990,7 @@ function drawConnections() {
     // Base off the unscaled node window to keep lines crisp
     const nodeWindow = document.getElementById('node-window');
     const vr = nodeWindow.getBoundingClientRect();
+    // Keep the overlay canvas sized to the visible viewport for crisp lines
     connectionCanvas.width = Math.max(1, Math.floor(vr.width));
     connectionCanvas.height = Math.max(1, Math.floor(vr.height));
     connectionCanvas.style.width = vr.width + 'px';
@@ -2870,6 +3006,7 @@ function drawConnections() {
         if (!startBlock) return;
         const startRect = startBlock.getBoundingClientRect();
         const nodeWindowRect = vr;
+        const containerEl0 = document.getElementById('node-window');
         const plusA = startBlock.querySelector('.node-plus-btn-a');
         const plusB = startBlock.querySelector('.node-plus-btn-b');
         const startX_A = plusA ? (plusA.getBoundingClientRect().left - nodeWindowRect.left + plusA.offsetWidth / 2) : (startRect.left - nodeWindowRect.left + startRect.width * 0.45);
@@ -2886,8 +3023,11 @@ function drawConnections() {
             const endX = endRect.left - nodeWindowRect.left + 18 + 5; // left + offset + radius
             const endY = endRect.top - nodeWindowRect.top - 1; // just above top edge
             connectionCtx.beginPath();
-            connectionCtx.moveTo(useB ? startX_B : startX_A, useB ? startY_B : startY_A);
-            connectionCtx.lineTo(endX, endY);
+            const pStart = { x: (useB ? startX_B : startX_A), y: (useB ? startY_B : startY_A) };
+            const pEnd = { x: endX, y: endY };
+            // These are already in node-window viewport space
+            connectionCtx.moveTo(pStart.x, pStart.y);
+            connectionCtx.lineTo(pEnd.x, pEnd.y);
             connectionCtx.strokeStyle = color;
             connectionCtx.lineWidth = 2;
             connectionCtx.stroke();
@@ -2902,11 +3042,12 @@ function drawConnections() {
         const getInputStart = (btnEl) => {
             if (!btnEl) return null;
             const r = btnEl.getBoundingClientRect();
-            // Project to canvas coordinates (nodeWindow space), not viewport
-            const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
+            // Project to viewport space of node-window (canvas coords)
+            const containerEl = document.getElementById('node-window');
+            const containerRect = containerEl.getBoundingClientRect();
             return {
-                x: r.left - containerRect.left + r.width / 2,
-                y: r.top - containerRect.top
+                x: (r.left - containerRect.left) + r.width / 2,
+                y: (r.top - containerRect.top)
             };
         };
         const drawInputArrow = (targetId, btnEl, color) => {
@@ -2918,9 +3059,10 @@ function drawConnections() {
             const start = getInputStart(btnEl);
             if (!start) return;
             // Start at consumer's input plus (top), end at provider's bottom-center output anchor
-            const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
-            const endX = outRect.left - containerRect.left + outRect.width / 2;
-            const endY = outRect.top - containerRect.top + outRect.height / 2;
+            const containerEl2 = document.getElementById('node-window');
+            const containerRect2 = containerEl2.getBoundingClientRect();
+            const endX = (outRect.left - containerRect2.left) + outRect.width / 2;
+            const endY = (outRect.top - containerRect2.top) + outRect.height / 2;
             connectionCtx.beginPath();
             connectionCtx.moveTo(start.x, start.y);
             connectionCtx.lineTo(endX, endY);
@@ -2936,12 +3078,14 @@ function drawConnections() {
                 const anchor = fromBlock.querySelector('.node-output-anchor');
                 if (anchor) {
                     const ar = anchor.getBoundingClientRect();
-                    const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
-                    const sx = ar.left - containerRect.left + ar.width / 2;
-                    const sy = ar.top - containerRect.top + ar.height / 2;
+                    const containerEl3 = document.getElementById('node-window');
+                    const containerRect3 = containerEl3.getBoundingClientRect();
+                    const sx = (ar.left - containerRect3.left) + ar.width / 2;
+                    const sy = (ar.top - containerRect3.top) + ar.height / 2;
                     connectionCtx.beginPath();
                     connectionCtx.moveTo(sx, sy);
-                    connectionCtx.lineTo(connectMouse.x, connectMouse.y);
+                    const p2 = contentToViewport(containerEl3, connectMouse);
+                    connectionCtx.lineTo(p2.x, p2.y);
                     connectionCtx.strokeStyle = '#66ff99';
                     connectionCtx.lineWidth = 2;
                     connectionCtx.setLineDash([6, 4]);
@@ -2979,12 +3123,15 @@ function drawConnections() {
                 const btnEl = startBlockEl.querySelector(connectFromNext.which === 'b' ? '.node-plus-btn-b' : '.node-plus-btn-a');
                 const r = btnEl && btnEl.getBoundingClientRect();
                 if (r) {
-                    const containerRect = (document.getElementById('node-window')).getBoundingClientRect();
-                    const sx = r.left - containerRect.left + r.width / 2;
-                    const sy = r.bottom - containerRect.top;
+                    const containerEl4 = document.getElementById('node-window');
+                    const containerRect4 = containerEl4.getBoundingClientRect();
+                    const sx = (r.left - containerRect4.left) + r.width / 2;
+                    const sy = (r.bottom - containerRect4.top);
                     connectionCtx.beginPath();
                     connectionCtx.moveTo(sx, sy);
-                    connectionCtx.lineTo(connectMouse.x, connectMouse.y);
+                    // connectMouse is in content space; convert to viewport for drawing
+                    const p = contentToViewport(containerEl4, connectMouse);
+                    connectionCtx.lineTo(p.x, p.y);
                     connectionCtx.strokeStyle = '#4da3ff';
                     connectionCtx.lineWidth = 2;
                     connectionCtx.setLineDash([6, 4]);
@@ -3100,6 +3247,10 @@ let imageRevision = 0; // increment to bust caches when saving
 function updateWorkspace() {
     const nodeWindow = document.getElementById('node-window');
 
+    // Preserve scroll position across re-render
+    const prevScrollLeft = nodeWindow ? nodeWindow.scrollLeft : 0;
+    const prevScrollTop = nodeWindow ? nodeWindow.scrollTop : 0;
+
     // Clear existing content
     nodeWindow.innerHTML = '';
 
@@ -3120,7 +3271,23 @@ function updateWorkspace() {
             nodeWindow.appendChild(block);
         });
 
-        drawConnections();
+        ensureScrollableWorkspace();
+        updateSpacerFromBlocks();
+        // Restore scroll after layout so it doesn't jump to top
+        requestAnimationFrame(() => {
+            try {
+                nodeWindow.scrollLeft = prevScrollLeft;
+                nodeWindow.scrollTop = prevScrollTop;
+            } catch(_) {}
+            // One more frame to ensure spacer and layout have settled
+            requestAnimationFrame(() => {
+                try {
+                    nodeWindow.scrollLeft = prevScrollLeft;
+                    nodeWindow.scrollTop = prevScrollTop;
+                } catch(_) {}
+                drawConnections();
+            });
+        });
         // Zoom disabled for now
     } else if (activeTab === 'images') {
         // Create images tab interface
