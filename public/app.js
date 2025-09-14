@@ -2213,7 +2213,6 @@ function createNodeBlock(codeData, x, y) {
 
     return block;
 }
-
 // Show add-block chooser menu anchored to a block
 function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = null) {
     console.log('showAddBlockMenu called with:', { anchorBlock, anchorCodeData, branch, customPosition });
@@ -2463,7 +2462,6 @@ function closeAnyAddMenus() {
         if (el.parentNode) el.parentNode.removeChild(el);
     });
 }
-
 // Insert a new block after the given anchor block in branch 'a' or 'b'
 function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPosition = null) {
     const existingIds = selectedObj.code.map(b => b.id);
@@ -3531,7 +3529,6 @@ let imageEditor = null;
 let currentImageFilename = null;
 let currentImageInfo = null;
 let imageRevision = 0; // increment to bust caches when saving
-
 // Update workspace with node blocks or images interface
 function updateWorkspace() {
     const nodeWindow = document.getElementById('node-window');
@@ -4110,14 +4107,30 @@ function loadImagesFromDirectory(container) {
         container.appendChild(imageItem);
     });
 
-    // Auto-select first image for the object if exists
+    // Auto-select logic: if something is already selected, do nothing.
+    // Otherwise, prefer current selectedImage; else select first.
     setTimeout(() => {
+        const existingSelection = container.querySelector('.image-thumbnail-item.selected');
+        if (existingSelection) return;
         if (images.length > 0) {
-            const firstItem = container.children[0];
-            if (firstItem) {
-                currentImageFilename = images[0].name;
-                currentImageInfo = images[0];
-                selectImage(images[0].src, firstItem);
+            const selectedBase = (selectedImage || '').split('?')[0];
+            const matchIndex = selectedBase ? images.findIndex(img => (img.src || '').split('?')[0] === selectedBase) : -1;
+            if (matchIndex >= 0) {
+                const el = container.children[matchIndex];
+                if (el) {
+                    currentImageFilename = images[matchIndex].name;
+                    currentImageInfo = images[matchIndex];
+                    selectImage(images[matchIndex].src, el);
+                    return;
+                }
+            }
+            if (!selectedImage) {
+                const firstItem = container.children[0];
+                if (firstItem) {
+                    currentImageFilename = images[0].name;
+                    currentImageInfo = images[0];
+                    selectImage(images[0].src, firstItem);
+                }
             }
         } else {
             selectedImage = null;
@@ -4141,7 +4154,8 @@ function selectImage(imagePath, thumbnailElement) {
     thumbnailElement.style.borderColor = '#00ffcc';
 
     imageRevision += 1;
-    const busted = `${imagePath}${imagePath.includes('?') ? '&' : '?'}v=${imageRevision}`;
+    const isDataUrl = typeof imagePath === 'string' && imagePath.startsWith('data:');
+    const busted = isDataUrl ? imagePath : `${imagePath}${imagePath.includes('?') ? '&' : '?'}v=${imageRevision}`;
     selectedImage = busted;
     lastSelectedImage = imagePath;
     // Keep current image metadata in sync for save naming
@@ -4182,7 +4196,6 @@ function selectImage(imagePath, thumbnailElement) {
         renderGameWindowSprite();
     }
 }
-
 // Zoom image in preview
 function zoomImage(factor) {
     imageZoom *= factor;
@@ -4386,49 +4399,63 @@ function createNewImage() {
     canvas.width = 256;
     canvas.height = 256;
     const ctx = canvas.getContext('2d');
-
-    // Fill with transparent background (you could add a checkerboard pattern)
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
-    ctx.fillRect(0, 0, 256, 256);
-
-    // Add a subtle grid pattern
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 256; i += 32) {
-        ctx.beginPath();
-        ctx.moveTo(i, 0);
-        ctx.lineTo(i, 256);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(0, i);
-        ctx.lineTo(256, i);
-        ctx.stroke();
-    }
+    // Leave fully transparent; no grid or background
+    ctx.clearRect(0, 0, 256, 256);
 
     // In a real implementation, you would save this to the server
     // For now, we'll create a data URL and add it to our list
     const dataUrl = canvas.toDataURL('image/png');
 
-    // Create a temporary image element to display the new image
-    const img = new Image();
-    img.onload = function() {
-        // Add the new image to the images directory (simulated)
-        // In a real app, this would be saved to the server
-        console.log(`New image created: image-${nextNum}`);
+    // Add and immediately select the new image in editor and UI
+    console.log(`New image created: image-${nextNum}`);
+    const list = getCurrentObjectImages();
+    const newInfo = { id: timestamp, name: `image-${nextNum}`, src: dataUrl };
+    list.push(newInfo);
 
-        // Add to current object's images and refresh
-        const list = getCurrentObjectImages();
-        list.unshift({ id: timestamp, name: `image-${nextNum}`, src: dataUrl });
-        const thumbnailsContainer = document.querySelector('.images-left-panel > div');
-        if (thumbnailsContainer) {
-            loadImagesFromDirectory(thumbnailsContainer);
-            setTimeout(() => {
-                const firstItem = thumbnailsContainer.children[0];
-                if (firstItem) selectImage(dataUrl, firstItem);
-            }, 30);
+    // Immediately show new image in editor; also keep state for later visual selection
+    currentImageFilename = newInfo.name;
+    currentImageInfo = newInfo;
+    localStorage.setItem('lastSelectedImage', dataUrl);
+    selectedImage = dataUrl;
+    if (imageEditor) imageEditor.loadImage(dataUrl);
+
+    // Update selected object's media and grid icon
+    const obj = objects.find(o => o.id == selected_object);
+    if (obj) {
+        if (!obj.media) obj.media = [];
+        if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: dataUrl });
+        else obj.media[0].path = dataUrl;
+        const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+        if (box) {
+            let img = box.querySelector('img');
+            if (!img) { img = document.createElement('img'); box.insertBefore(img, box.firstChild); }
+            img.src = dataUrl;
+            img.alt = obj.name;
+            img.style.width = "75px";
+            img.style.height = "75px";
         }
-    };
-    img.src = dataUrl;
+        renderGameWindowSprite();
+    }
+
+    // Refresh thumbnails and visually select the new image
+    const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+    if (thumbnailsContainer) {
+        loadImagesFromDirectory(thumbnailsContainer);
+        setTimeout(() => {
+            // Prefer a direct attribute lookup for the new item
+            let targetEl = thumbnailsContainer.querySelector(`.image-thumbnail-item[data-filename="${newInfo.name}"]`);
+            if (!targetEl) {
+                const items = Array.from(thumbnailsContainer.children);
+                targetEl = items[items.length - 1] || null;
+            }
+            if (targetEl) {
+                thumbnailsContainer.scrollTop = thumbnailsContainer.scrollHeight;
+                const imgEl = targetEl.querySelector('img');
+                const path = imgEl ? imgEl.src : dataUrl;
+                selectImage(path, targetEl);
+            }
+        }, 30);
+    }
 }
 
 // Start renaming an image
@@ -4830,7 +4857,6 @@ function renderObjectGrid() {
     const plusButton = createPlusButton();
     grid.appendChild(plusButton);
 }
-
 // Initialize tabs
 function initializeTabs() {
     // Add event listeners to tabs
@@ -5401,7 +5427,6 @@ if (document.readyState === 'loading') {
 window.addEventListener("resize", () => {
     drawConnections();
 });
-
 // Render runtime instances during play; otherwise show object previews
 function renderGameWindowSprite() {
     const canvas = document.getElementById('game-window');
@@ -5648,24 +5673,42 @@ function initializeImageEditor(params) {
             if (contentType.includes('application/json')) {
                 json = await res.json();
             } else {
-                const text = await res.text();
-                throw new Error(`Unexpected response (status ${res.status}): ${text.slice(0,200)}`);
+                // If endpoint is missing (e.g., static hosting), fall back to local dataUrl
+                json = null;
             }
-            if (!res.ok || !json || !json.ok) {
-                const message = (json && json.error) ? json.error : `HTTP ${res.status}`;
-                throw new Error(message);
+            // Success path or graceful fallback to local dataUrl
+            const persistedPath = (res.ok && json && json.ok && json.path) ? json.path : dataUrl;
+            currentImageFilename = filename;
+            // Update current image info and thumbnail src
+            const list = getCurrentObjectImages();
+            imageRevision += 1;
+            const isDataPersist = typeof persistedPath === 'string' && persistedPath.startsWith('data:');
+            const bust = isDataPersist ? persistedPath : `${persistedPath}?v=${imageRevision}`;
+            if (currentImageInfo) currentImageInfo.src = bust;
+            // Update only the selected thumbnail image to avoid re-render loops
+            const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
+            if (selectedThumb) selectedThumb.src = bust;
+            // Update selected and object media path
+            selectedImage = bust;
+            const obj = objects.find(o => o.id == selected_object);
+            if (obj) {
+                if (!obj.media) obj.media = [];
+                if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
+                else obj.media[0].path = bust;
             }
-            if (json && json.ok && json.path) {
+            // Update game window preview
+            renderGameWindowSprite();
+        } catch (e) {
+            // On network or 404, gracefully save locally via dataUrl (static hosting fallback)
+            try {
+                const dataUrl = canvas.toDataURL('image/png');
+                let filename = currentImageFilename || `sprite_${Date.now()}.png`;
                 currentImageFilename = filename;
-                // Update current image info and thumbnail src
-                const list = getCurrentObjectImages();
                 imageRevision += 1;
-                const bust = `${json.path}?v=${imageRevision}`;
+                const bust = dataUrl;
                 if (currentImageInfo) currentImageInfo.src = bust;
-                // Update only the selected thumbnail image to avoid re-render loops
                 const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
                 if (selectedThumb) selectedThumb.src = bust;
-                // Update selected and object media path
                 selectedImage = bust;
                 const obj = objects.find(o => o.id == selected_object);
                 if (obj) {
@@ -5673,22 +5716,21 @@ function initializeImageEditor(params) {
                     if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
                     else obj.media[0].path = bust;
                 }
-                // Update game window preview
                 renderGameWindowSprite();
+                // Optional: small toast indicating local save
+                try {
+                    const old = document.getElementById('__img_save_err');
+                    if (old) old.remove();
+                    const toast = document.createElement('div');
+                    toast.id = '__img_save_err';
+                    toast.textContent = 'Saved locally (no server).';
+                    toast.style.cssText = 'position:fixed;bottom:16px;left:16px;background:#2e7d32;color:#fff;padding:8px 12px;border-radius:6px;font-size:12px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.3)';
+                    document.body.appendChild(toast);
+                    setTimeout(() => { if (toast && toast.parentNode) toast.parentNode.removeChild(toast); }, 2000);
+                } catch {}
+            } catch (inner) {
+                console.warn('Failed to save image locally', inner);
             }
-        } catch (e) {
-            console.warn('Failed to save image', e);
-            // Optionally surface a small toast
-            try {
-                const old = document.getElementById('__img_save_err');
-                if (old) old.remove();
-                const toast = document.createElement('div');
-                toast.id = '__img_save_err';
-                toast.textContent = `Save failed: ${e && e.message ? e.message : e}`;
-                toast.style.cssText = 'position:fixed;bottom:16px;left:16px;background:#b00020;color:#fff;padding:8px 12px;border-radius:6px;font-size:12px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.3)';
-                document.body.appendChild(toast);
-                setTimeout(() => { if (toast && toast.parentNode) toast.parentNode.removeChild(toast); }, 3000);
-            } catch {}
         }
     }
 
@@ -6007,7 +6049,6 @@ function initializeImageEditor(params) {
         const y = Math.round(canvas.height/2 + cy / state.zoom);
         return { x: Math.max(0, Math.min(canvas.width-1, x)), y: Math.max(0, Math.min(canvas.height-1, y)) };
     }
-
     function onMouseDown(e) {
         if (e.button !== 0) return;
         const p = canvasToLocal(e);
