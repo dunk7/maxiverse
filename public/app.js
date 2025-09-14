@@ -3790,10 +3790,12 @@ function createImagesInterface(container) {
         width: 140px;
         background: #222;
         border-right: 1px solid #444;
-        overflow-y: auto;
+        overflow-y: hidden;
+        overflow-x: hidden;
         padding: 10px;
         display: flex;
         flex-direction: column;
+        position: relative;
     `;
 
     // Create thumbnails container
@@ -3801,38 +3803,79 @@ function createImagesInterface(container) {
     thumbnailsContainer.style.cssText = `
         flex: 1;
         overflow-y: auto;
+        overflow-x: hidden;
+        padding-bottom: 48px;
+        margin-right: 0;
+        padding-right: 0;
+        width: 100%;
+        box-sizing: border-box;
     `;
 
     // Load and display images from ./images/0/
     loadImagesFromDirectory(thumbnailsContainer);
 
-    // Add plus button at bottom
-    const plusButton = document.createElement('button');
-    plusButton.className = 'add-image-btn';
-    plusButton.innerHTML = '+';
-    plusButton.style.cssText = `
-        width: 100%;
-        height: 40px;
+    // Add action buttons row at bottom (Add + Upload)
+    const actionsRow = document.createElement('div');
+    actionsRow.style.cssText = `
+        display: flex;
+        gap: 8px;
+        position: absolute;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+    `;
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-image-btn';
+    addBtn.innerHTML = '+';
+    addBtn.style.cssText = `
+        flex: 1 1 0;
+        height: 32px;
         background: #00ffcc;
         border: none;
         color: #1a1a1a;
         border-radius: 6px;
         cursor: pointer;
-        font-size: 24px;
+        font-size: 18px;
         font-weight: bold;
-        margin-top: 10px;
         transition: background 0.2s;
         display: flex;
         align-items: center;
         justify-content: center;
     `;
-    plusButton.title = 'Add new image';
-    plusButton.addEventListener('mouseover', () => plusButton.style.background = '#00cccc');
-    plusButton.addEventListener('mouseout', () => plusButton.style.background = '#00ffcc');
-    plusButton.addEventListener('click', () => createNewImage());
+    addBtn.title = 'Add new image';
+    addBtn.addEventListener('mouseover', () => addBtn.style.background = '#00cccc');
+    addBtn.addEventListener('mouseout', () => addBtn.style.background = '#00ffcc');
+    addBtn.addEventListener('click', () => createNewImage());
+
+    const uploadBtn = document.createElement('button');
+    uploadBtn.className = 'add-image-btn';
+    uploadBtn.innerHTML = 'Upload';
+    uploadBtn.style.cssText = `
+        flex: 1 1 0;
+        height: 32px;
+        background: #00ffcc;
+        border: none;
+        color: #1a1a1a;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 600;
+        transition: background 0.2s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    `;
+    uploadBtn.title = 'Upload image file';
+    uploadBtn.addEventListener('mouseover', () => uploadBtn.style.background = '#00cccc');
+    uploadBtn.addEventListener('mouseout', () => uploadBtn.style.background = '#00ffcc');
+    uploadBtn.addEventListener('click', () => triggerUploadImage());
+
+    actionsRow.appendChild(addBtn);
+    actionsRow.appendChild(uploadBtn);
 
     leftPanel.appendChild(thumbnailsContainer);
-    leftPanel.appendChild(plusButton);
+    leftPanel.appendChild(actionsRow);
 
     // Right preview area
     const rightPanel = document.createElement('div');
@@ -4455,6 +4498,87 @@ function createNewImage() {
                 selectImage(path, targetEl);
             }
         }, 30);
+    }
+}
+
+// Upload a new image from disk and add to current object's images
+function triggerUploadImage() {
+    try {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.style.display = 'none';
+        document.body.appendChild(input);
+        input.addEventListener('change', async () => {
+            const file = input.files && input.files[0];
+            if (!file) { document.body.removeChild(input); return; }
+            try {
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onerror = (e) => reject(e);
+                    reader.onload = () => resolve(String(reader.result || ''));
+                    reader.readAsDataURL(file);
+                });
+
+                const timestamp = Date.now();
+                const nextNum = getNextImageNumber();
+                const name = `image-${nextNum}`;
+                const list = getCurrentObjectImages();
+                const newInfo = { id: timestamp, name, src: dataUrl };
+                list.push(newInfo);
+
+                // Update state and select in editor
+                currentImageFilename = name;
+                currentImageInfo = newInfo;
+                localStorage.setItem('lastSelectedImage', dataUrl);
+                selectedImage = dataUrl;
+                if (imageEditor) imageEditor.loadImage(dataUrl);
+
+                // Update selected object's media and grid icon
+                const obj = objects.find(o => o.id == selected_object);
+                if (obj) {
+                    if (!obj.media) obj.media = [];
+                    if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: dataUrl });
+                    else obj.media[0].path = dataUrl;
+                    const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+                    if (box) {
+                        let img = box.querySelector('img');
+                        if (!img) { img = document.createElement('img'); box.insertBefore(img, box.firstChild); }
+                        img.src = dataUrl;
+                        img.alt = obj.name;
+                        img.style.width = "75px";
+                        img.style.height = "75px";
+                    }
+                    renderGameWindowSprite();
+                }
+
+                // Refresh thumbnails and select the uploaded one
+                const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+                if (thumbnailsContainer) {
+                    loadImagesFromDirectory(thumbnailsContainer);
+                    setTimeout(() => {
+                        let targetEl = thumbnailsContainer.querySelector(`.image-thumbnail-item[data-filename="${name}"]`);
+                        if (!targetEl) {
+                            const items = Array.from(thumbnailsContainer.children);
+                            targetEl = items[items.length - 1] || null;
+                        }
+                        if (targetEl) {
+                            thumbnailsContainer.scrollTop = thumbnailsContainer.scrollHeight;
+                            const imgEl = targetEl.querySelector('img');
+                            const path = imgEl ? imgEl.src : dataUrl;
+                            selectImage(path, targetEl);
+                        }
+                    }, 30);
+                }
+            } catch (e) {
+                console.warn('Image upload failed', e);
+            } finally {
+                document.body.removeChild(input);
+            }
+        });
+        input.click();
+    } catch (e) {
+        console.warn('Unable to open file dialog', e);
     }
 }
 
