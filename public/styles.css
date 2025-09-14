@@ -88,6 +88,24 @@ body {
   background: #444;
 }
 
+/* File menu: dropdown arrow and positioning */
+.file-menu-container { position: relative; }
+.file-menu-btn { position: relative; }
+.file-menu-btn::after {
+  content: '▼';
+  font-size: 8px;
+  margin-left: 4px;
+  opacity: 0.7;
+}
+.file-menu-btn.active::after { content: '▲'; }
+.file-menu-btn.active { background: #444; }
+
+/* Position File dropdown neatly under the File button */
+.file-menu-container > #file-dropdown {
+  top: calc(100% + 4px);
+  left: 0;
+}
+
 .undo-menu {
   position: absolute;
   top: 100%;
@@ -361,7 +379,7 @@ button {
   border: 2px solid #333;
   border-radius: 5px;
   padding: 10px;
-  min-width: 150px;
+  min-width: 10px;
   cursor: move; /* Indicate draggable */
   user-select: none;
   transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
@@ -371,8 +389,9 @@ button {
   font-size: 0.9rem;
 }
 
-.node-block.node-block-compact { min-width: 110px; }
-.node-block.node-block-narrow { min-width: 0 !important; width: fit-content; padding: 2px 4px; display: inline-flex; align-items: center; box-sizing: content-box; }
+.node-block.node-block-compact { min-width: 10px; }
+.node-block.node-block-slim { min-width: 10px; }
+.node-block.node-block-narrow { min-width: 10px !important; width: fit-content; padding: 2px 4px; display: inline-flex; align-items: center; box-sizing: content-box; }
 .node-block.node-block-narrow .node-label { gap: 0; }
 .node-block.node-block-narrow::before { left: 8px; }
 .node-block.node-block-narrow input[type="number"] { width: 16px; }
@@ -672,7 +691,7 @@ button {
     /*padding: 0px;*/
   }
   .node-block {
-    min-width: 100px;
+    min-width: 10px;
     font-size: 0.8rem;
   }
 }

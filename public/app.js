@@ -76,6 +76,33 @@ function ensureStartBlocks() {
 
 migrateCodeModel();
 ensureStartBlocks();
+// Fast lookup for objects by id to avoid repeated Array.find in hot paths
+let objectById = {};
+function rebuildObjectIndex() {
+    objectById = {};
+    objects.forEach(obj => { if (obj) objectById[obj.id] = obj; });
+}
+rebuildObjectIndex();
+// Fast lookup for code blocks by id per template, plus precomputed start-next pc
+let codeMapByTemplateId = {};
+let startNextPcByTemplateId = {};
+function rebuildCodeMaps() {
+    codeMapByTemplateId = {};
+    startNextPcByTemplateId = {};
+    objects.forEach(obj => {
+        if (!obj) return;
+        const code = Array.isArray(obj.code) ? obj.code : [];
+        const map = {};
+        for (let i = 0; i < code.length; i++) {
+            const b = code[i];
+            if (b && typeof b.id !== 'undefined') map[b.id] = b;
+        }
+        codeMapByTemplateId[obj.id] = map;
+        const start = code.find(b => b && b.type === 'start');
+        startNextPcByTemplateId[obj.id] = start && typeof start.next_block_a === 'number' ? start.next_block_a : null;
+    });
+}
+rebuildCodeMaps();
 // Ensure a default public variable 'i' exists on the AppController
 function ensureDefaultPublicVariableI() {
     try {
@@ -119,7 +146,16 @@ let lastCreatedPublicVariable = null; // { name: string, isPrivate: false }
 let playLoopHandle = null;
 let playStartTime = 0;
 let lastFrameTime = 0;
+// Cooperative scheduler controls to prevent any single instance from stalling the frame
+const MAX_STEPS_PER_OBJECT = 16;        // quantum per instance per frame
+const MAX_TOTAL_STEPS_PER_FRAME = 5000; // hard cap across all instances per frame
+const TIME_BUDGET_MS = 6;               // soft time budget for interpreter per frame
+let rrInstanceStartIndex = 0;           // round-robin start index for fairness
+// Default delay between loop iterations (approx 60 FPS)
+const LOOP_FRAME_WAIT_MS = 1000 / 60;
 // Mouse and keyboard state for input blocks
+// Optional filter: when set to an array of instanceIds, interpreter will only step those instances
+let __stepOnlyInstanceIds = null;
 const runtimeMouse = { x: 0, y: 0 };
 let runtimeMousePressed = false;
 const runtimeKeys = {};
@@ -129,6 +165,10 @@ let runtimeInstances = []; // { instanceId, templateId }
 let nextInstanceId = 1;
 let instancesPendingRemoval = new Set();
 let instancesPendingCreation = [];
+// Pool freed instance ids per template to reduce GC/alloc churn when cloning/deleting many instances
+let freeInstancesByTemplate = {};
+// Safety cap for how many instances are fully created per frame; excess are queued to subsequent frames
+const MAX_CREATES_PER_FRAME = 200;
 
 // Track mouse relative to game window center
 const gameCanvas = document.getElementById('game-window');
@@ -140,6 +180,16 @@ if (gameCanvas) {
         runtimeMouse.x = Math.round(localX - rect.width / 2);
         runtimeMouse.y = Math.round(rect.height / 2 - localY);
     });
+    // Also use Pointer Events to ensure pointer updates are received during keyboard input
+    gameCanvas.addEventListener('pointermove', (e) => {
+        const rect = gameCanvas.getBoundingClientRect();
+        const localX = e.clientX - rect.left;
+        const localY = e.clientY - rect.top;
+        runtimeMouse.x = Math.round(localX - rect.width / 2);
+        runtimeMouse.y = Math.round(rect.height / 2 - localY);
+    }, { passive: true });
+    gameCanvas.addEventListener('pointerdown', () => { runtimeMousePressed = true; });
+    gameCanvas.addEventListener('pointerup', () => { runtimeMousePressed = false; });
     gameCanvas.addEventListener('mousedown', () => { runtimeMousePressed = true; });
     gameCanvas.addEventListener('mouseup', () => { runtimeMousePressed = false; });
     gameCanvas.addEventListener('mouseleave', () => { runtimeMousePressed = false; });
@@ -173,13 +223,20 @@ function resetRuntimePositions() {
 }
 function stepInterpreter(dtMs) {
     if (!isPlaying) return;
-    // Fair scheduling: limit per-instance steps to avoid one instance starving others
-    const maxStepsPerObject = 50;
-    for (const inst of runtimeInstances) {
-        const o = objects.find(obj => obj.id === inst.templateId);
+    // Fair scheduling with round-robin and budgets
+    const startTime = performance.now();
+    let totalStepsThisFrame = 0;
+    const instanceCount = runtimeInstances.length;
+    for (let offset = 0; offset < instanceCount; offset++) {
+        const inst = runtimeInstances[(rrInstanceStartIndex + offset) % instanceCount];
+        if (__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0) {
+            if (!__stepOnlyInstanceIds.includes(inst.instanceId)) continue;
+        }
+        const o = objectById[inst.templateId];
         const exec = runtimeExecState[inst.instanceId];
         if (!o || !exec) continue;
         const code = o.code || [];
+        const codeMap = codeMapByTemplateId[o.id] || null;
 
         // Handle active wait first
         if (exec.waitMs > 0) {
@@ -187,7 +244,7 @@ function stepInterpreter(dtMs) {
             if (exec.waitMs > 0) continue; // still waiting
             exec.waitMs = 0;
             if (exec.waitingBlockId != null) {
-                const waitingBlock = code.find(b => b && b.id === exec.waitingBlockId);
+                const waitingBlock = codeMap ? codeMap[exec.waitingBlockId] : code.find(b => b && b.id === exec.waitingBlockId);
                 exec.waitingBlockId = null;
                 if (waitingBlock) {
                     exec.pc = (typeof waitingBlock.next_block_a === 'number') ? waitingBlock.next_block_a : null;
@@ -196,17 +253,19 @@ function stepInterpreter(dtMs) {
         }
 
         let steps = 0;
-        while (isPlaying && exec.pc != null && steps++ < maxStepsPerObject) {
-            const block = code.find(b => b && b.id === exec.pc);
+        while (isPlaying && exec.pc != null && steps < MAX_STEPS_PER_OBJECT) {
+            const block = codeMap ? codeMap[exec.pc] : code.find(b => b && b.id === exec.pc);
             if (!block) { exec.pc = null; break; }
             // Resolve inputs for numeric fields if connected
             const resolveInput = (blockRef, key) => {
                 const inputId = blockRef[key];
                 if (inputId == null) return null;
-                const node = code.find(b => b && b.id === inputId);
+                const node = codeMap ? codeMap[inputId] : code.find(b => b && b.id === inputId);
                 if (!node) return null;
                 if (node.content === 'mouse_x') return runtimeMouse.x;
                 if (node.content === 'mouse_y') return runtimeMouse.y;
+                if (node.content === 'window_width') { const c = document.getElementById('game-window'); return c ? c.width : window.innerWidth; }
+                if (node.content === 'window_height') { const c = document.getElementById('game-window'); return c ? c.height : window.innerHeight; }
                 if (node.content === 'object_x') { const pos = runtimePositions[inst.instanceId] || { x: 0, y: 0 }; return (typeof pos.x === 'number') ? pos.x : 0; }
                 if (node.content === 'object_y') { const pos = runtimePositions[inst.instanceId] || { x: 0, y: 0 }; return (typeof pos.y === 'number') ? pos.y : 0; }
                 if (node.content === 'rotation') { const pos = runtimePositions[inst.instanceId] || { rot: 0 }; return (typeof pos.rot === 'number') ? pos.rot : 0; }
@@ -216,7 +275,7 @@ function stepInterpreter(dtMs) {
                 if (node.content === 'image_name') {
                     try {
                         // Determine current image name for this instance
-                        const tmpl = objects.find(o => o.id === inst.templateId);
+                        const tmpl = objectById[inst.templateId];
                         const path = (runtimePositions[inst.instanceId] && runtimePositions[inst.instanceId].spritePath)
                             || (tmpl && tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
                         if (!tmpl || !path) return '';
@@ -277,6 +336,20 @@ function stepInterpreter(dtMs) {
                     if (Number.isNaN(B)) B = 0;
                     return A < B ? 1 : 0;
                 }
+                if (node.content === 'and') {
+                    const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
+                    const A = Number(aVal) || 0;
+                    const B = Number(bVal) || 0;
+                    return (A !== 0 && B !== 0) ? 1 : 0;
+                }
+                if (node.content === 'or') {
+                    const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
+                    const A = Number(aVal) || 0;
+                    const B = Number(bVal) || 0;
+                    return (A !== 0 || B !== 0) ? 1 : 0;
+                }
                 if (node.content === 'variable') {
                     const varName = node.var_name || '';
                     if (node.var_instance_only) {
@@ -301,6 +374,19 @@ function stepInterpreter(dtMs) {
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
+                if (block.content === 'move_forward') {
+                    // Move forward by distance in the direction the instance is facing (0° is up)
+                    const distance = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    const pos = runtimePositions[inst.instanceId];
+                    if (pos.rot === undefined) pos.rot = 0;
+                    const rotRad = (pos.rot || 0) * Math.PI / 180;
+                    // 0° moves up (+y), x uses sin, y uses cos in our coordinate system
+                    pos.x += Math.sin(rotRad) * distance;
+                    pos.y += Math.cos(rotRad) * distance;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
                 if (block.content === 'rotate') {
                     // Store rotation per object; create if absent
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
@@ -322,6 +408,15 @@ function stepInterpreter(dtMs) {
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     if (runtimePositions[inst.instanceId].scale === undefined) runtimePositions[inst.instanceId].scale = 1;
                     runtimePositions[inst.instanceId].scale = Math.max(0, s);
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'set_opacity') {
+                    let a = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
+                    if (Number.isNaN(a)) a = 1;
+                    a = Math.max(0, Math.min(1, a));
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    runtimePositions[inst.instanceId].alpha = a;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
@@ -367,6 +462,9 @@ function stepInterpreter(dtMs) {
                     }
                     exec.repeatStack.push({ repeatBlockId: block.id, timesRemaining: times, afterId: (typeof block.next_block_b === 'number') ? block.next_block_b : null });
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    // Default 60fps pacing for loop iterations
+                    exec.waitMs = LOOP_FRAME_WAIT_MS;
+                    exec.waitingBlockId = block.id;
                     continue;
                 }
                 if (block.content === 'print') {
@@ -419,10 +517,16 @@ function stepInterpreter(dtMs) {
                 }
                 if (block.content === 'instantiate') {
                     const objId = parseInt(block.val_a, 10);
-                    const template = objects.find(obj => obj.id === objId);
+                    const template = objectById[objId];
                     if (template) {
-                        const newId = nextInstanceId++;
-                        instancesPendingCreation.push({ instanceId: newId, templateId: template.id });
+                        let instanceIdToUse;
+                        const pool = freeInstancesByTemplate[template.id];
+                        if (pool && pool.length > 0) {
+                            instanceIdToUse = pool.pop();
+                        } else {
+                            instanceIdToUse = nextInstanceId++;
+                        }
+                        instancesPendingCreation.push({ instanceId: instanceIdToUse, templateId: template.id });
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
@@ -463,11 +567,18 @@ function stepInterpreter(dtMs) {
                     // Enter infinite loop over branch A
                     exec.repeatStack.push({ repeatBlockId: block.id, timesRemaining: Infinity, afterId: (typeof block.next_block_b === 'number') ? block.next_block_b : null });
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    // Default 60fps pacing for loop iterations
+                    exec.waitMs = LOOP_FRAME_WAIT_MS;
+                    exec.waitingBlockId = block.id;
                     continue;
                 }
             }
             // Unknown block or non-action: just follow next_block_a
             exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+            steps += 1;
+            totalStepsThisFrame += 1;
+            if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
+            if ((performance.now() - startTime) >= TIME_BUDGET_MS) break;
         }
 
         // If we reached end of a chain, check repeat stack
@@ -476,19 +587,34 @@ function stepInterpreter(dtMs) {
             frame.timesRemaining -= 1;
             if (frame.timesRemaining > 0) {
                 // Repeat body again
-                const repeatBlock = code.find(b => b && b.id === frame.repeatBlockId);
+                const repeatBlock = codeMap ? codeMap[frame.repeatBlockId] : code.find(b => b && b.id === frame.repeatBlockId);
                 exec.pc = repeatBlock && (typeof repeatBlock.next_block_a === 'number') ? repeatBlock.next_block_a : null;
+                // Add default frame delay between loop iterations
+                exec.waitMs = LOOP_FRAME_WAIT_MS;
+                exec.waitingBlockId = repeatBlock ? repeatBlock.id : null;
             } else {
                 // Done repeating. Continue after repeat
                 exec.repeatStack.pop();
                 exec.pc = frame.afterId != null ? frame.afterId : null;
             }
         }
+
+        if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) { break; }
+        if ((performance.now() - startTime) >= TIME_BUDGET_MS) { break; }
+    }
+    // Advance the round-robin start for next frame to ensure fairness
+    if (!(__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0)) {
+        if (runtimeInstances.length > 0) {
+            rrInstanceStartIndex = (rrInstanceStartIndex + 1) % runtimeInstances.length;
+        }
     }
     // Commit any instances that were requested for creation this frame (after all logic)
     if (instancesPendingCreation && instancesPendingCreation.length > 0) {
-        for (const pending of instancesPendingCreation) {
-            const template = objects.find(o => o.id === pending.templateId);
+        const createCount = Math.min(MAX_CREATES_PER_FRAME, instancesPendingCreation.length);
+        const createdIds = [];
+        for (let i = 0; i < createCount; i++) {
+            const pending = instancesPendingCreation[i];
+            const template = objectById[pending.templateId];
             if (!template) continue;
             runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId });
             runtimePositions[pending.instanceId] = { x: 0, y: 0 };
@@ -497,13 +623,30 @@ function stepInterpreter(dtMs) {
             const startT = codeT.find(b => b.type === 'start');
             const pcT = startT && typeof startT.next_block_a === 'number' ? startT.next_block_a : null;
             runtimeExecState[pending.instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+            createdIds.push(pending.instanceId);
         }
-        instancesPendingCreation.length = 0;
+        // Remove processed items; leave remainder for next frame
+        instancesPendingCreation.splice(0, createCount);
+        // Immediately step newly created instances so their code runs before render
+        if (createdIds.length > 0) {
+            const savedFilter = __stepOnlyInstanceIds;
+            __stepOnlyInstanceIds = createdIds.slice();
+            try {
+                // Run one mini-step without advancing rr pointer
+                const now = performance.now();
+                stepInterpreter(0);
+            } finally {
+                __stepOnlyInstanceIds = savedFilter;
+            }
+        }
     }
     // Remove any instances that requested deletion this frame
     if (instancesPendingRemoval && instancesPendingRemoval.size > 0) {
         runtimeInstances = runtimeInstances.filter(inst => {
             if (instancesPendingRemoval.has(inst.instanceId)) {
+                // Return this instance id to the pool for its template
+                const pool = freeInstancesByTemplate[inst.templateId] || (freeInstancesByTemplate[inst.templateId] = []);
+                pool.push(inst.instanceId);
                 delete runtimePositions[inst.instanceId];
                 delete runtimeExecState[inst.instanceId];
                 delete runtimeVariables[inst.instanceId];
@@ -520,11 +663,16 @@ function runWhenCreatedChains() {
 function startPlay() {
     if (isPlaying) return;
     isPlaying = true;
+    // Ensure object index is in sync before runtime starts
+    rebuildObjectIndex();
+    rebuildCodeMaps();
+    rrInstanceStartIndex = 0;
     // Initialize runtime world: only AppController exists at start
     runtimeInstances = [];
     runtimeExecState = {};
     instancesPendingRemoval = new Set();
     instancesPendingCreation = [];
+    freeInstancesByTemplate = {};
     runtimeVariables = {};
     runtimeGlobalVariables = {};
     const controller = objects.find(o => o.type === 'controller' || o.name === 'AppController');
@@ -560,7 +708,6 @@ function stopPlay() {
     playLoopHandle = null;
     renderGameWindowSprite();
 }
-
 // Create a node block
 function createNodeBlock(codeData, x, y) {
     const block = document.createElement("div");
@@ -576,10 +723,6 @@ function createNodeBlock(codeData, x, y) {
     // Label with dropdowns integrated
     const label = document.createElement("span");
     label.className = "node-label"
-    if (codeData.type === 'value') {
-        block.classList.add('node-block-value');
-    }
-
     if (codeData.content === "move_xy") {
         label.innerHTML = "Move By (";
         const xSelectSpan = document.createElement("span");
@@ -590,6 +733,41 @@ function createNodeBlock(codeData, x, y) {
         label.innerHTML += ", ";
         label.appendChild(ySelectSpan);
         label.innerHTML += ")";
+    } else if (codeData.content === "move_forward") {
+        // Move Forward ( [pixels] )
+        label.textContent = "";
+        label.append("Move Forward (");
+        const span = document.createElement("span");
+        span.className = 'node-input-container';
+        const input = document.createElement("input");
+        input.type = "number";
+        input.step = "1";
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 10;
+        input.value = codeData.val_a;
+        input.addEventListener("change", () => { codeData.val_a = parseFloat(input.value) || 0; });
+        span.appendChild(input);
+        label.appendChild(span);
+        label.append(")");
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        span.appendChild(btn);
+        if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
     } else if (codeData.content === "wait") {
         // Wait ( [seconds] )
         label.textContent = "";
@@ -781,6 +959,39 @@ function createNodeBlock(codeData, x, y) {
         });
         sizeSpan.appendChild(btn);
         if (codeData.input_a != null) { sizeInput.value = '^'; sizeInput.readOnly = true; }
+    } else if (codeData.content === 'set_opacity') {
+        label.textContent = '';
+        label.append('Set Opacity (');
+        const opSpan = document.createElement('span');
+        opSpan.className = 'node-input-container';
+        const opInput = document.createElement('input');
+        opInput.type = 'number'; opInput.step = '0.01';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
+        opInput.value = codeData.val_a;
+        opInput.min = '0'; opInput.max = '1';
+        opInput.addEventListener('change', () => { let v = parseFloat(opInput.value); if (isNaN(v)) v = 1; codeData.val_a = Math.max(0, Math.min(1, v)); });
+        opSpan.appendChild(opInput);
+        label.appendChild(opSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window').getBoundingClientRect();
+            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        opSpan.appendChild(btn);
+        if (codeData.input_a != null) { opInput.value = '^'; opInput.readOnly = true; }
     } else if (codeData.content === 'operation') {
         // Operation block: ( X [op] Y )
         label.textContent = '';
@@ -865,22 +1076,28 @@ function createNodeBlock(codeData, x, y) {
 
     } else if (codeData.content === 'mouse_x') {
         label.textContent = 'mouseX';
-        block.classList.add('node-block-narrow');
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'mouse_y') {
         label.textContent = 'mouseY';
-        block.classList.add('node-block-compact');
+        block.classList.add('node-block-slim');
+    } else if (codeData.content === 'window_width') {
+        label.textContent = 'WindowWidth';
+        block.classList.add('node-block-slim');
+    } else if (codeData.content === 'window_height') {
+        label.textContent = 'WindowHeight';
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'object_x') {
         label.textContent = 'ObjectX';
-        block.classList.add('node-block-compact');
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'object_y') {
         label.textContent = 'ObjectY';
-        block.classList.add('node-block-compact');
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'rotation') {
         label.textContent = 'Rotation';
-        block.classList.add('node-block-compact');
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'size') {
         label.textContent = 'Size';
-        block.classList.add('node-block-compact');
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'key_pressed') {
         label.textContent = '';
         label.append('key pressed (');
@@ -900,6 +1117,9 @@ function createNodeBlock(codeData, x, y) {
         keySpan.appendChild(keySelect);
         label.appendChild(keySpan);
         label.append(')');
+    } else if (codeData.content === 'mouse_pressed') {
+        label.textContent = 'Mouse Down';
+        block.classList.add('node-block-slim');
     } else if (codeData.content === 'set_x') {
         label.textContent = '';
         label.append('Set X (');
@@ -1231,6 +1451,7 @@ function createNodeBlock(codeData, x, y) {
         });
         aSpan.appendChild(btn);
         if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+        block.classList.add('node-block-slim');
         block.classList.add('node-block-compact');
     } else if (codeData.content === 'delete_instance') {
         label.textContent = 'Delete Instance';
@@ -1318,7 +1539,7 @@ function createNodeBlock(codeData, x, y) {
         });
         aSpan.appendChild(btn);
         if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
-    } else if (codeData.content === 'equals' || codeData.content === 'less_than') {
+    } else if (codeData.content === 'equals' || codeData.content === 'less_than' || codeData.content === 'and' || codeData.content === 'or') {
         // [A] = [B] -> number 0/1
         label.textContent = '';
         const aSpan = document.createElement('span');
@@ -1330,7 +1551,11 @@ function createNodeBlock(codeData, x, y) {
         aInput.addEventListener('change', () => { codeData.val_a = aInput.value; });
         aSpan.appendChild(aInput);
         label.appendChild(aSpan);
-        label.append(codeData.content === 'less_than' ? ' < ' : ' = ');
+        label.append(
+            codeData.content === 'less_than'
+                ? ' < '
+                : (codeData.content === 'equals' ? ' = ' : (codeData.content === 'and' ? ' AND ' : ' OR '))
+        );
         const bSpan = document.createElement('span');
         bSpan.className = 'node-input-container';
         const bInput = document.createElement('input');
@@ -2021,25 +2246,33 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
         });
         menu.appendChild(btn);
     };
-    addItem('Move By', 'move_xy');
-    addItem('Wait ()', 'wait');
-    addItem('Repeat () times', 'repeat');
-    addItem('If ()', 'if');
+    // Organized, consistently named action blocks
+    // Flow control
+    addItem('Repeat', 'repeat');
+    addItem('If', 'if');
     addItem('Forever', 'forever');
-    addItem('Print ()', 'print');
-    addItem('Rotate (x)', 'rotate');
-    addItem('Point Towards (x,y)', 'point_towards');
-    addItem('Set Rotation (x)', 'set_rotation');
-    addItem('Set Size (x)', 'set_size');
-    addItem('Change Size (x)', 'change_size');
-    addItem('Image Name', 'image_name');
-    addItem('Set X (x)', 'set_x');
-    addItem('Set Y (y)', 'set_y');
+    addItem('Wait', 'wait');
+    // Motion
+    addItem('Move By (dx, dy)', 'move_xy');
+    addItem('Move Forward', 'move_forward');
+    addItem('Set X', 'set_x');
+    addItem('Set Y', 'set_y');
+    addItem('Rotate Degrees', 'rotate');
+    addItem('Set Rotation', 'set_rotation');
+    addItem('Point Towards (x, y)', 'point_towards');
+    // Looks / appearance
+    addItem('Switch Image', 'switch_image');
+    addItem('Set Size', 'set_size');
+    addItem('Change Size By', 'change_size');
+    addItem('Set Opacity', 'set_opacity');
+    // Variables
     addItem('Set Variable', 'set_variable');
     addItem('Change Variable By', 'change_variable');
-    addItem('Switch Image', 'switch_image');
-    addItem('Instantiate', 'instantiate');
+    // Instances
+    addItem('Create Instance', 'instantiate');
     addItem('Delete Instance', 'delete_instance');
+    // Debug
+    addItem('Print', 'print');
     console.log('Menu items added, menu children:', menu.children.length);
     // Position: append within block so CSS absolute positioning can anchor it
     if (customPosition) {
@@ -2094,7 +2327,6 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
         addMenuDocHandler(onDocClick);
     }, 0);
 }
-
 // Show add-block chooser menu for input sources (below the button)
 function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn, customPosition = null) {
     closeAnyAddMenus();
@@ -2125,22 +2357,31 @@ function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn,
         });
         menu.appendChild(btn);
     };
-    addItem('Operation', 'operation');
-    addItem('=', 'equals');
-    addItem('not', 'not');
-    addItem('<', 'less_than');
+    // Organized, consistently named inputs
+    // Operators
+    addItem('Operation (+, -, *, /)', 'operation');
+    addItem('Equals', 'equals');
+    addItem('Less Than', 'less_than');
+    addItem('And', 'and');
+    addItem('Or', 'or');
+    addItem('Not', 'not');
+    // Mouse and keyboard
     addItem('Mouse X', 'mouse_x');
     addItem('Mouse Y', 'mouse_y');
-    addItem('ObjectX', 'object_x');
-    addItem('ObjectY', 'object_y');
+    addItem('Window Width', 'window_width');
+    addItem('Window Height', 'window_height');
+    addItem('Mouse Down?', 'mouse_pressed');
+    addItem('Key Pressed?', 'key_pressed');
+    // Object properties
+    addItem('Object X', 'object_x');
+    addItem('Object Y', 'object_y');
     addItem('Rotation', 'rotation');
     addItem('Size', 'size');
-    addItem('Mouse Pressed?', 'mouse_pressed');
-    addItem('Key Pressed?', 'key_pressed');
-    addItem('Random Int', 'random_int');
+    // Values
     addItem('Variable', 'variable');
+    addItem('Random Integer', 'random_int');
     addItem('Image Name', 'image_name');
-    addItem('Distance To (x,y)', 'distance_to');
+    addItem('Distance To (x, y)', 'distance_to');
     // Position menu above the specific button if available; else above block
     if (customPosition) {
         // For drag-opened: we'll place via fixed positioning after creation below
@@ -2271,10 +2512,16 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
         // val_a, val_b hold target X,Y
         newBlock.val_a = 0;
         newBlock.val_b = 0;
+    } else if (typeKey === 'move_forward') {
+        // val_a holds distance in pixels
+        newBlock.val_a = 10;
     } else if (typeKey === 'set_size') {
         newBlock.val_a = 1;
     } else if (typeKey === 'change_size') {
         newBlock.val_a = 0.1;
+    } else if (typeKey === 'set_opacity') {
+        // val_a holds opacity in [0,1]
+        newBlock.val_a = 1;
     } else if (typeKey === 'set_x') {
         newBlock.val_a = 0;
     } else if (typeKey === 'set_y') {
@@ -2371,6 +2618,14 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     } else if (typeKey === 'variable') {
         newBlock.var_name = 'i';
         newBlock.var_instance_only = false; // public
+    } else if (typeKey === 'and') {
+        // two-operand logical AND input block; default 0, 0
+        newBlock.val_a = 0;
+        newBlock.val_b = 0;
+    } else if (typeKey === 'or') {
+        // two-operand logical OR input block; default 0, 0
+        newBlock.val_a = 0;
+        newBlock.val_b = 0;
     }
 
     // Connect anchor block's input
@@ -2380,7 +2635,7 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     if (anchorCodeData.content === 'move_xy') {
         if (inputKey === 'a') anchorCodeData.val_a = '^';
         if (inputKey === 'b') anchorCodeData.val_b = '^';
-    } else if (anchorCodeData.content === 'wait' || anchorCodeData.content === 'repeat' || anchorCodeData.content === 'rotate' || anchorCodeData.content === 'set_rotation') {
+    } else if (anchorCodeData.content === 'wait' || anchorCodeData.content === 'repeat' || anchorCodeData.content === 'rotate' || anchorCodeData.content === 'set_rotation' || anchorCodeData.content === 'move_forward') {
         anchorCodeData.val_a = '^';
     } else if (anchorCodeData.content === 'operation') {
         if (inputKey === 'a') anchorCodeData.op_x = '^';
@@ -2413,7 +2668,6 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     // Re-render to reflect caret changes and redraw connections
     updateWorkspace();
 }
-
 // Global drag handlers
 function handleMouseMove(e) {
     if (!isDragging || !draggedBlock) return;
@@ -2683,7 +2937,6 @@ function handleConnectMouseMove(e) {
     autoScrollIfNearEdge(e.clientX, e.clientY);
     drawConnections();
 }
-
 function handleConnectMouseUp(e) {
     console.log('handleConnectMouseUp called, isConnecting:', isConnecting);
     if (!isConnecting) {
@@ -2833,6 +3086,23 @@ function handleConnectMouseUp(e) {
             }
         }
 
+        // If dropped on blank space and this input already had a connection, disconnect instead of creating
+        if (!foundValidTarget && selectedObj) {
+            const isBlankDrop = !el || !(
+                (el.classList && (el.classList.contains('node-block') || el.classList.contains('node-output-anchor') || el.classList.contains('node-input-plus-btn')))
+                || (el.closest && (el.closest('.node-block') || el.closest('.node-output-anchor') || el.closest('.node-input-plus-btn')))
+            );
+            const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
+            if (isBlankDrop && target) {
+                const key = connectFromInput.which === 'b' ? 'input_b' : 'input_a';
+                if (target[key]) {
+                    target[key] = null;
+                    updateWorkspace();
+                    foundValidTarget = true;
+                }
+            }
+        }
+
         if (!foundValidTarget && selectedObj) {
             // No provider block found - create new block at mouse position
             const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
@@ -2891,6 +3161,23 @@ function handleConnectMouseUp(e) {
                     // Also prevent the destination pointing back instantly to source on its A if it currently does
                     if (dest && dest.next_block_a === source.id) dest.next_block_a = null;
                     updateWorkspace();
+                }
+            }
+        }
+
+        // If dropped on blank space and a next connection existed, disconnect instead of creating
+        if (!foundValidTarget && selectedObj) {
+            const isBlankDrop = !el || !(
+                (el.classList && (el.classList.contains('node-block') || el.classList.contains('node-output-anchor') || el.classList.contains('node-input-plus-btn')))
+                || (el.closest && (el.closest('.node-block') || el.closest('.node-output-anchor') || el.closest('.node-input-plus-btn')))
+            );
+            const source = selectedObj.code.find(c => c.id === connectFromNext.blockId);
+            if (isBlankDrop && source) {
+                const key = connectFromNext.which === 'b' ? 'next_block_b' : 'next_block_a';
+                if (source[key]) {
+                    source[key] = null;
+                    updateWorkspace();
+                    foundValidTarget = true;
                 }
             }
         }
@@ -2984,7 +3271,6 @@ function resizeConnectionCanvas() {
     connectionCanvas.width = Math.max(1, Math.floor(r.width));
     connectionCanvas.height = Math.max(1, Math.floor(r.height));
 }
-
 // Draw connections between blocks
 function drawConnections() {
     // Base off the unscaled node window to keep lines crisp
@@ -3105,7 +3391,10 @@ function drawConnections() {
                     if (start) {
                         connectionCtx.beginPath();
                         connectionCtx.moveTo(start.x, start.y);
-                        connectionCtx.lineTo(connectMouse.x, connectMouse.y);
+                        // connectMouse is in content coordinates; convert to viewport for drawing
+                        const containerElPreview = document.getElementById('node-window');
+                        const p = contentToViewport(containerElPreview, connectMouse);
+                        connectionCtx.lineTo(p.x, p.y);
                         connectionCtx.strokeStyle = '#66ff99';
                         connectionCtx.lineWidth = 2;
                         connectionCtx.setLineDash([6, 4]);
@@ -3314,7 +3603,6 @@ function updateWorkspace() {
         nodeWindow.appendChild(message);
     }
 }
-
 // Create the images interface
 function createImagesInterface(container) {
     // Create main container
@@ -3676,6 +3964,22 @@ function createImagesInterface(container) {
         zoomResetBtn,
         setDefaultUI: () => {},
     });
+
+    // After initializing the editor, ensure an image is shown immediately
+    setTimeout(() => {
+        if (!imageEditor) return;
+        if (imageEditor.drawCrosshair) imageEditor.drawCrosshair();
+        if (selectedImage) {
+            imageEditor.loadImage(selectedImage);
+        } else {
+            const containerEl = document.querySelector('.images-left-panel > div');
+            if (containerEl && containerEl.firstElementChild) {
+                const firstItem = containerEl.firstElementChild;
+                const firstImg = firstItem.querySelector('img');
+                if (firstImg) selectImage(firstImg.src, firstItem);
+            }
+        }
+    }, 50);
 }
 
 // Load images from ./images/0/ directory
@@ -3953,7 +4257,6 @@ function showDeleteConfirmation(imageItem, filename) {
         }
     });
 }
-
 // Delete an image
 function deleteImage(imageItem, filename, imgInfo) {
     const objectId = String(selected_object);
@@ -4072,7 +4375,6 @@ function resetZoom() {
     imageZoom = 1.0;
     if (imageEditor) imageEditor.setZoom(imageZoom);
 }
-
 // Create a new empty image
 function createNewImage() {
     const timestamp = Date.now();
@@ -4337,6 +4639,7 @@ function addNewObject() {
 
     // Add to objects array
     objects.push(newObject);
+    rebuildObjectIndex();
 
     // Initialize images for the new object BEFORE rendering
     ensureDefaultImageForObject(newObject);
@@ -4376,6 +4679,7 @@ function deleteObject(objectId) {
     const index = objects.findIndex(o => o.id === objectId);
     if (index === -1) return;
     objects.splice(index, 1);
+    rebuildObjectIndex();
 
     // Re-render the grid
     renderObjectGrid();
@@ -4422,6 +4726,7 @@ function reorderObjects(draggedObjectId, targetObjectId) {
 
     // Insert dragged object at target position
     objects.splice(targetIndex, 0, draggedObject);
+    rebuildObjectIndex();
 
     // Refresh the grid display
     renderObjectGrid();
@@ -4576,7 +4881,6 @@ function toggleEditMenu() {
         console.log('Elements not found:', { editBtn: !!editBtn, undoMenu: !!undoMenu });
     }
 }
-
 // Initialize Edit menu dropdown
 function initializeEditMenu() {
     if (window.__editMenuSetupDone) {
@@ -4634,6 +4938,396 @@ function initializeEditMenu() {
     }
 }
 
+// =========================
+// File Menu (Save / Load)
+// =========================
+function toggleFileMenu() {
+	const fileBtn = document.querySelector('.file-menu-btn');
+	const fileMenu = document.getElementById('file-dropdown');
+	if (!fileBtn || !fileMenu) return;
+	const isActive = fileBtn.classList.contains('active');
+	if (isActive) {
+		fileBtn.classList.remove('active');
+		fileMenu.style.display = 'none';
+	} else {
+		fileBtn.classList.add('active');
+		fileMenu.style.display = 'block';
+	}
+}
+
+function initializeFileMenu() {
+	if (window.__fileMenuSetupDone) return;
+	window.__fileMenuSetupDone = true;
+	const container = document.querySelector('.file-menu-container');
+	const btn = document.querySelector('.file-menu-btn');
+	const menu = document.getElementById('file-dropdown');
+	const input = document.getElementById('file-input');
+	if (!container || !btn || !menu || !input) return;
+	menu.style.display = 'none';
+	document.addEventListener('click', (e) => {
+		if (!container.contains(e.target)) {
+			btn.classList.remove('active');
+			menu.style.display = 'none';
+		}
+	});
+	// Wire file input change
+	if (!input.__bound) {
+		input.__bound = true;
+		input.addEventListener('change', async (e) => {
+			const file = e.target.files && e.target.files[0];
+			if (file) {
+				try {
+					await loadProjectFromFile(file);
+				} catch (err) {
+					console.warn('Failed to load project', err);
+				}
+			}
+		});
+	}
+}
+
+function serializeProject() {
+	// Ensure model is migrated and has start blocks prior to save
+	migrateCodeModel();
+	ensureStartBlocks();
+	const project = {
+		version: 1,
+		selected_object,
+		objects: JSON.parse(JSON.stringify(objects)),
+		images: {}
+	};
+	Object.keys(objectImages).forEach((key) => {
+		project.images[key] = (objectImages[key] || []).map(img => ({ id: img.id, name: img.name, src: img.src }));
+	});
+	return project;
+}
+
+function saveProjectToFile() {
+	try {
+		const data = serializeProject();
+		const json = JSON.stringify(data, null, 2);
+		const blob = new Blob([json], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = 'maxiverse-project.app';
+		document.body.appendChild(a);
+		a.click();
+		setTimeout(() => {
+			URL.revokeObjectURL(url);
+			document.body.removeChild(a);
+		}, 0);
+	} catch (e) {
+		console.warn('Save failed', e);
+	}
+}
+
+function triggerLoadProjectFromFile() {
+	const input = document.getElementById('file-input');
+	if (input) {
+		input.value = '';
+		input.click();
+	}
+}
+
+async function loadProjectFromFile(file) {
+	return new Promise((resolve, reject) => {
+		try {
+			const reader = new FileReader();
+			reader.onerror = (err) => reject(err);
+			reader.onload = () => {
+				try {
+					const text = String(reader.result || '');
+					const data = JSON.parse(text);
+					if (!data || typeof data !== 'object') throw new Error('Invalid file');
+					if (!Array.isArray(data.objects)) throw new Error('Missing objects');
+					// Stop play if running
+					try { if (isPlaying) stopPlay(); } catch {}
+					// Replace objects in-place to preserve const reference
+					objects.length = 0;
+					for (const obj of data.objects) objects.push(obj);
+					// Replace objectImages in-place
+					Object.keys(objectImages).forEach(k => { delete objectImages[k]; });
+					if (data.images && typeof data.images === 'object') {
+						Object.keys(data.images).forEach(k => {
+							const list = Array.isArray(data.images[k]) ? data.images[k] : [];
+							objectImages[k] = list.map(img => ({ id: img.id, name: img.name, src: img.src }));
+						});
+					}
+					// Migrate and ensure start blocks after load
+					migrateCodeModel();
+					ensureStartBlocks();
+					// Ensure each object has at least a default image
+					initializeDefaultImages();
+					// Restore selection if present
+					if (typeof data.selected_object === 'number') {
+						selected_object = data.selected_object;
+					} else if (objects[0]) {
+						selected_object = objects[0].id;
+					}
+					// Refresh UI
+					try { renderObjectGrid(); } catch {}
+					try { refreshObjectGridIcons(); } catch {}
+					// Rebuild current workspace (code or images)
+					try { updateWorkspace(); } catch {}
+					try {
+						const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+						if (thumbnailsContainer) loadImagesFromDirectory(thumbnailsContainer);
+					} catch {}
+					try { setTimeout(renderGameWindowSprite, 30); } catch {}
+					resolve(true);
+				} catch (e) {
+					reject(e);
+				}
+			};
+			reader.readAsText(file);
+		} catch (e) {
+			reject(e);
+		}
+	});
+}
+
+// =========================
+// Export as standalone HTML
+// =========================
+async function exportProjectAsHtml() {
+	try {
+		const data = serializeProject();
+		await ensureProjectImagesEmbedded(data);
+		const html = generateStandaloneHtml(data);
+		const blob = new Blob([html], { type: 'text/html' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = 'index.html';
+		document.body.appendChild(a);
+		a.click();
+		setTimeout(() => {
+			URL.revokeObjectURL(url);
+			document.body.removeChild(a);
+		}, 0);
+	} catch (e) {
+		console.warn('Export HTML failed', e);
+	}
+}
+
+async function ensureProjectImagesEmbedded(project) {
+	async function toEmbedded(src) {
+		try {
+			if (!src) return generateBlankImageDataUrl();
+			if (src.startsWith('data:')) return src;
+			const clean = src.split('?')[0];
+			const res = await fetch(clean, { credentials: 'same-origin' });
+			if (!res.ok) throw new Error('fetch failed: ' + res.status);
+			const blob = await res.blob();
+			return await new Promise((resolve) => {
+				const fr = new FileReader();
+				fr.onload = () => resolve(String(fr.result || ''));
+				fr.readAsDataURL(blob);
+			});
+		} catch (_) {
+			try { return generateBlankImageDataUrl(); } catch { return 'data:image/png;base64,'; }
+		}
+	}
+
+	if (!project.images) project.images = {};
+	for (const obj of project.objects || []) {
+		const key = String(obj.id);
+		if (!project.images[key] || project.images[key].length === 0) {
+			const path = obj && obj.media && obj.media[0] && obj.media[0].path ? obj.media[0].path : null;
+			if (path) {
+				const src = await toEmbedded(path);
+				project.images[key] = [{ id: Date.now(), name: 'image-1', src }];
+			}
+		}
+	}
+	const tasks = [];
+	Object.keys(project.images).forEach((key) => {
+		(project.images[key] || []).forEach((img) => {
+			tasks.push((async () => { img.src = await toEmbedded(img.src); })());
+		});
+	});
+	await Promise.all(tasks);
+}
+function generateStandaloneHtml(project) {
+	const safeJson = JSON.stringify(project);
+	// Minimal runner uses same semantics as in-editor runtime
+	return `<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Maxiverse Export</title>
+	<style>
+	  html,body{margin:0;height:100%;background:#777;color:#fff}
+	  body{display:flex;align-items:center;justify-content:center}
+	  canvas{display:block;width:100vw;height:100vh;background:#777}
+	</style>
+	</head><body>
+	<canvas id="game" tabindex="0"></canvas>
+	<script>
+	const project = ${safeJson};
+	let objects = project.objects || [];
+	const objectImages = project.images || {};
+	// Match editor default pacing (approx 60 FPS)
+	const LOOP_FRAME_WAIT_MS = 1000 / 60;
+	// Match editor fairness/time budget
+	const TIME_BUDGET_MS = 6;
+	const MAX_TOTAL_STEPS_PER_FRAME = 2000;
+	let rrInstanceStartIndex = 0;
+	let __stepOnlyInstanceIds = null;
+	let isPlaying = true;
+	let runtimeInstances = [];
+	let runtimeExecState = {};
+	let runtimePositions = {};
+	let runtimeVariables = {};
+	let runtimeGlobalVariables = {};
+	let nextInstanceId = 1;
+	let instancesPendingRemoval = new Set();
+	let instancesPendingCreation = [];
+	const runtimeMouse = { x: 0, y: 0 };
+	let runtimeMousePressed = false;
+	const runtimeKeys = {};
+
+	function getFirstImagePathForTemplateId(tid){
+	  const list = objectImages[String(tid)]||[];
+	  if (!list[0]) return null;
+	  const src = list[0].src || '';
+	  return src.split('?')[0];
+	}
+
+	function startPlay(){
+	  runtimeInstances = [];
+	  runtimeExecState = {};
+	  instancesPendingRemoval = new Set();
+	  instancesPendingCreation = [];
+	  runtimeVariables = {};
+	  runtimeGlobalVariables = {};
+	  const controller = objects.find(o=>o.type==='controller' || o.name==='AppController');
+	  if (controller){
+	    const instId = nextInstanceId++;
+	    runtimeInstances.push({ instanceId: instId, templateId: controller.id });
+	    runtimePositions[instId] = { x:0, y:0 };
+	    runtimeVariables[instId] = {};
+	    const start = (controller.code||[]).find(b=>b && b.type==='start');
+	    runtimeExecState[instId] = { pc: start ? start.next_block_a : null, waitMs:0, waitingBlockId:null, repeatStack: [] };
+	  }
+	  // Match editor semantics: do not auto-instantiate non-controller objects.
+	  // AppController is responsible for spawning gameplay objects in exported build.
+	}
+
+	function worldToCanvas(x,y,canvas){
+	  const cx = canvas.width/2 + x;
+	  const cy = canvas.height/2 - y;
+	  return { x: cx, y: cy };
+	}
+
+	function stepInterpreter(dt){
+	  const startTime = performance.now();
+	  let totalStepsThisFrame = 0;
+	  const maxStepsPerObject = 50;
+	  const count = runtimeInstances.length;
+	  for (let i=0; i<count; i++){
+	    const inst = runtimeInstances[(rrInstanceStartIndex + i) % Math.max(1, count)];
+	    if (!inst) continue;
+	    if (__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length>0){ if (!__stepOnlyInstanceIds.includes(inst.instanceId)) continue; }
+	    const o = objects.find(obj=>obj.id===inst.templateId);
+	    const exec = runtimeExecState[inst.instanceId];
+	    if (!o || !exec) continue;
+	    const code = o.code || [];
+	    if (exec.waitMs>0){ exec.waitMs-=dt; if (exec.waitMs>0) continue; exec.waitMs=0; if(exec.waitingBlockId!=null){ const waitingBlock=code.find(b=>b&&b.id===exec.waitingBlockId); exec.waitingBlockId=null; if(waitingBlock){ exec.pc = (typeof waitingBlock.next_block_a==='number') ? waitingBlock.next_block_a : null; } } }
+	    let steps=0;
+	    while (exec.pc!=null && steps++<maxStepsPerObject){
+	      const block = code.find(b=>b&&b.id===exec.pc); if(!block){ exec.pc=null; break; }
+	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='random_int'){ let a=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const xVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const yVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); switch(node.val_a){ case '+': return xVal + yVal; case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=Number(v)||0; return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=Number(aVal); let B=Number(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const v=runtimeGlobalVariables[varName]; return (typeof v==='number')?v:0; } } return null; };
+	      if (block.type==='action'){
+	        if (block.content==='move_xy'){ const dx=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const dy=Number(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].x += dx; runtimePositions[inst.instanceId].y += dy; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='move_forward'){ const distance=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const rotDeg=runtimePositions[inst.instanceId].rot || 0; const rotRad=(rotDeg)*Math.PI/180; runtimePositions[inst.instanceId].x += Math.sin(rotRad)*distance; runtimePositions[inst.instanceId].y += Math.cos(rotRad)*distance; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='rotate'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = (runtimePositions[inst.instanceId].rot||0) + Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_rotation'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_size'){ const s=Number(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; runtimePositions[inst.instanceId].scale = Math.max(0,s); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='point_towards'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const pos=runtimePositions[inst.instanceId]; const tx=Number((block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0)); const ty=Number((block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0)); const dx=tx-(typeof pos.x==='number'?pos.x:0); const dy=ty-(typeof pos.y==='number'?pos.y:0); const ang=90 - (Math.atan2(dy,dx)*180/Math.PI); pos.rot = ang; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='change_size'){ const ds=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; const cur=runtimePositions[inst.instanceId].scale||1; runtimePositions[inst.instanceId].scale=Math.max(0,cur+ds); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='wait'){ const seconds=Math.max(0, parseFloat(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds>0){ exec.waitMs = seconds*1000; exec.waitingBlockId = block.id; exec.pc = null; } else { exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; } break; }
+	        if (block.content==='repeat'){ const times=Math.max(0, Number(block.val_a||0)); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = block.id; continue; }
+	        if (block.content==='print'){ const val=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); try{ console.log(val);}catch(_){} exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='if'){ const condVal=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const isTrue = !!condVal; exec.pc = isTrue ? ((typeof block.next_block_b==='number')?block.next_block_b:null) : ((typeof block.next_block_a==='number')?block.next_block_a:null); continue; }
+	        if (block.content==='set_x'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_y'){ const y=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].y=y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='switch_image'){ const imgs=(objectImages[String(o.id)]||[]); let found=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(typeof sel==='string'){ found=imgs.find(img=>img.name===sel);} else { found=imgs.find(img=>String(img.id)===String(sel)); } } else { found=imgs.find(img=>String(img.id)===String(block.val_a)); } if(found){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].spritePath = (found.src||'').split('?')[0]; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='instantiate'){ const objId=parseInt(block.val_a,10); const template=objects.find(obj=>obj.id===objId); if(template){ const newId=nextInstanceId++; instancesPendingCreation.push({ instanceId:newId, templateId:template.id }); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='delete_instance'){ instancesPendingRemoval.add(inst.instanceId); exec.pc=null; continue; }
+	        if (block.content==='set_variable'){ const varName=block.var_name||''; const value=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; runtimeVariables[inst.instanceId][varName]=value; } else { runtimeGlobalVariables[varName]=value; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='change_variable'){ const varName=block.var_name||''; const delta=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; const current=runtimeVariables[inst.instanceId][varName]||0; runtimeVariables[inst.instanceId][varName]=current+delta; } else { const current=runtimeGlobalVariables[varName]||0; runtimeGlobalVariables[varName]=current+delta; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='forever'){ exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:Infinity, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = block.id; continue; }
+	      }
+	      exec.pc = (typeof block.next_block_a==='number') ? block.next_block_a : null;
+	      totalStepsThisFrame += 1;
+	      if (typeof MAX_TOTAL_STEPS_PER_FRAME === 'number' && totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
+	      if (typeof TIME_BUDGET_MS === 'number' && (performance.now() - startTime) >= TIME_BUDGET_MS) break;
+	    }
+	    if (exec.pc==null && exec.repeatStack.length>0){ const frame=exec.repeatStack[exec.repeatStack.length-1]; frame.timesRemaining-=1; if(frame.timesRemaining>0){ const repeatBlock=code.find(b=>b&&b.id===frame.repeatBlockId); exec.pc = repeatBlock && (typeof repeatBlock.next_block_a==='number') ? repeatBlock.next_block_a : null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = repeatBlock ? repeatBlock.id : null; } else { exec.repeatStack.pop(); exec.pc = frame.afterId != null ? frame.afterId : null; } }
+	  }
+	  if (instancesPendingCreation && instancesPendingCreation.length>0){
+	    const createdIds = [];
+	    for (const pending of instancesPendingCreation){ const template=objects.find(o=>o.id===pending.templateId); if(!template) continue; runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId }); runtimePositions[pending.instanceId] = { x:0, y:0 }; runtimeVariables[pending.instanceId] = {}; const start=(template.code||[]).find(b=>b&&b.type==='start'); const pcT = start ? start.next_block_a : null; runtimeExecState[pending.instanceId] = { pc: pcT, waitMs:0, waitingBlockId:null, repeatStack: [] }; createdIds.push(pending.instanceId); }
+	    instancesPendingCreation.length=0;
+	    if (createdIds.length>0){ const savedFilter = __stepOnlyInstanceIds; __stepOnlyInstanceIds = createdIds.slice(); try { stepInterpreter(0); } finally { __stepOnlyInstanceIds = savedFilter; } }
+	  }
+	  // Advance RR pointer when not filtering
+	  if (!(__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length>0)){
+	    if (runtimeInstances.length>0){ rrInstanceStartIndex = (rrInstanceStartIndex + 1) % runtimeInstances.length; }
+	  }
+	  if (instancesPendingRemoval && instancesPendingRemoval.size>0){
+	    runtimeInstances = runtimeInstances.filter(inst=>{ if(instancesPendingRemoval.has(inst.instanceId)){ delete runtimePositions[inst.instanceId]; delete runtimeVariables[inst.instanceId]; delete runtimeExecState[inst.instanceId]; return false; } return true; });
+	    instancesPendingRemoval.clear();
+	  }
+	}
+
+	const canvas = document.getElementById('game');
+	const gctx = canvas.getContext('2d');
+	function fit(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
+	window.addEventListener('resize', fit);
+	fit();
+
+	canvas.addEventListener('mousemove',(e)=>{ const rect=canvas.getBoundingClientRect(); const localX=e.clientX-rect.left; const localY=e.clientY-rect.top; const cx = canvas.width/2; const cy = canvas.height/2; runtimeMouse.x = Math.round(localX - cx); runtimeMouse.y = Math.round(cy - localY); });
+	canvas.addEventListener('mousedown',()=>{ runtimeMousePressed=true; });
+	canvas.addEventListener('mouseup',()=>{ runtimeMousePressed=false; });
+	canvas.addEventListener('mouseleave',()=>{ runtimeMousePressed=false; });
+	window.addEventListener('mouseup',()=>{ runtimeMousePressed=false; });
+	function normalizeKeyName(k){ if(k===' '||k==='Spacebar') return 'Space'; return k; }
+	document.addEventListener('keydown',(e)=>{ const k=normalizeKeyName(e.key); runtimeKeys[k]=true;});
+	document.addEventListener('keyup',(e)=>{ const k=normalizeKeyName(e.key); runtimeKeys[k]=false;});
+
+	const imageCache = {};
+	function render(){
+	  gctx.clearRect(0,0,canvas.width,canvas.height);
+	  gctx.fillStyle='#777';
+	  gctx.fillRect(0,0,canvas.width,canvas.height);
+	  const centerX=canvas.width/2, centerY=canvas.height/2;
+	  const visibleEntries = runtimeInstances.map(inst=>{ const tmpl=objects.find(o=>o.id===inst.templateId); const perInst=runtimePositions[inst.instanceId]||{}; const pth = perInst.spritePath || getFirstImagePathForTemplateId(tmpl.id); const path = pth ? String(pth).split('?')[0] : null; return path ? { inst, tmpl, path } : null; }).filter(Boolean);
+	  visibleEntries.forEach((entry,index)=>{
+	    const mediaPath=entry.path;
+	    let img=imageCache[mediaPath];
+	    if(!img){ img=new Image(); imageCache[mediaPath]=img; img.src=mediaPath; img.onerror=()=>{ console.warn('Image failed to load', mediaPath); }; }
+	    const drawIfReady=()=>{
+	      if(!img.complete || !(img.naturalWidth>0 && img.naturalHeight>0)) return;
+	      gctx.imageSmoothingEnabled=true; gctx.imageSmoothingQuality='medium';
+	      let scale = 1;
+	      if (runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale==='number') { scale = Math.max(0, runtimePositions[entry.inst.instanceId].scale||1); }
+	      const dw=img.width*scale, dh=img.height*scale;
+	      let drawX, drawY;
+	      if (runtimePositions[entry.inst.instanceId]){ const p=worldToCanvas(runtimePositions[entry.inst.instanceId].x||0, runtimePositions[entry.inst.instanceId].y||0, canvas); drawX=Math.round(p.x-dw/2); drawY=Math.round(p.y-dh/2); } else { drawX=Math.round(centerX-dw/2); drawY=Math.round(centerY-dh/2); }
+	      const alpha = (typeof runtimePositions[entry.inst.instanceId]?.alpha === 'number') ? Math.max(0, Math.min(1, runtimePositions[entry.inst.instanceId].alpha)) : 1;
+	      if (typeof runtimePositions[entry.inst.instanceId]?.rot==='number'){ const angleRad=(runtimePositions[entry.inst.instanceId].rot||0)*Math.PI/180; gctx.save(); gctx.translate(drawX+dw/2, drawY+dh/2); gctx.rotate(angleRad); const prevAlpha=gctx.globalAlpha; gctx.globalAlpha = alpha; gctx.drawImage(img, -dw/2, -dh/2, dw, dh); gctx.globalAlpha=prevAlpha; gctx.restore(); } else { const prevAlpha=gctx.globalAlpha; gctx.globalAlpha = alpha; gctx.drawImage(img, drawX, drawY, dw, dh); gctx.globalAlpha=prevAlpha; }
+	    };
+	    if (img.complete) drawIfReady(); else img.onload=drawIfReady;
+	  });
+	}
+
+	let last=performance.now();
+	function loop(now){ const dt=now-last; last=now; stepInterpreter(dt); render(); requestAnimationFrame(loop); }
+	startPlay();
+	requestAnimationFrame(loop);
+	</script>
+	</body></html>`;
+}
+
 // Initialize tabs after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
     console.log('🚀 DOM Content Loaded - Initializing app...');
@@ -4641,6 +5335,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeDefaultImages();
     initializeTabs();
     initializeEditMenu();
+    initializeFileMenu();
     setTimeout(() => refreshObjectGridIcons(), 50);
     console.log('✅ App initialization complete');
     // Wire top-bar play/stop buttons if present, else add overlay fallback
@@ -4698,6 +5393,7 @@ if (document.readyState === 'loading') {
     setTimeout(() => {
         initializeTabs();
         initializeEditMenu();
+        initializeFileMenu();
     }, 10); // Small delay to ensure DOM is fully ready
 }
 
@@ -4710,29 +5406,34 @@ window.addEventListener("resize", () => {
 function renderGameWindowSprite() {
     const canvas = document.getElementById('game-window');
     const gctx = canvas.getContext('2d');
-    // Fit the canvas to right pane size
+    // Fit the canvas to right pane size only when changed to avoid expensive reallocation each frame
     const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width;
-    canvas.height = rect.height;
+    if (canvas.width !== rect.width || canvas.height !== rect.height) {
+        canvas.width = rect.width;
+        canvas.height = rect.height;
+    }
     // background
     gctx.clearRect(0, 0, canvas.width, canvas.height);
     gctx.fillStyle = '#777';
     gctx.fillRect(0, 0, canvas.width, canvas.height);
+    // Set smoothing once per frame (medium for better performance). Disable per-sprite toggles below.
+    gctx.imageSmoothingEnabled = true;
+    gctx.imageSmoothingQuality = 'medium';
 
     // Draw game content. In play, draw runtime instances; otherwise center object previews.
     const centerX = canvas.width / 2;
     const centerY = canvas.height / 2;
     let visibleEntries;
     if (isPlaying) {
-        visibleEntries = runtimeInstances
-            .map(inst => {
-                const tmpl = objects.find(o => o.id === inst.templateId);
-                const perInst = runtimePositions[inst.instanceId] || {};
-                const path = perInst.spritePath
-                    || (tmpl && tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
-                return path ? { inst, tmpl, path } : null;
-            })
-            .filter(Boolean);
+        visibleEntries = [];
+        for (let i = 0; i < runtimeInstances.length; i++) {
+            const inst = runtimeInstances[i];
+            const tmpl = objectById[inst.templateId];
+            const perInst = runtimePositions[inst.instanceId] || {};
+            const path = perInst.spritePath
+                || (tmpl && tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
+            if (path) visibleEntries.push({ inst, tmpl, path });
+        }
     } else {
         // Don't show object previews when not playing
         visibleEntries = [];
@@ -4744,15 +5445,15 @@ function renderGameWindowSprite() {
             img = new Image();
             imageCache[mediaPath] = img;
             img.src = mediaPath;
+            // Mark readiness on first load without re-assigning handlers every frame
+            img.onload = function(){ /* no-op; presence indicates readiness via img.complete */ };
         }
-
+        // Draw immediately if image is ready; otherwise skip this frame.
         const drawIfReady = () => {
             if (!img.complete) return;
-            gctx.imageSmoothingEnabled = true;
-            gctx.imageSmoothingQuality = 'high';
-            let scale = Math.min(canvas.width / img.width, canvas.height / img.height, 1);
+            let scale = 1;
             if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale === 'number') {
-                scale *= Math.max(0, runtimePositions[entry.inst.instanceId].scale || 1);
+                scale = Math.max(0, runtimePositions[entry.inst.instanceId].scale || 1);
             }
             const dw = img.width * scale;
             const dh = img.height * scale;
@@ -4769,24 +5470,28 @@ function renderGameWindowSprite() {
                 drawX = Math.round(centerX - dw / 2 + offsetX);
                 drawY = Math.round(centerY - dh / 2 + offsetY);
             }
+            // Simple AABB culling to skip fully offscreen sprites
+            if (drawX + dw < 0 || drawY + dh < 0 || drawX > canvas.width || drawY > canvas.height) return;
             // Apply rotation if in play mode
+            const alpha = (isPlaying && entry.inst && typeof runtimePositions[entry.inst.instanceId]?.alpha === 'number') ? Math.max(0, Math.min(1, runtimePositions[entry.inst.instanceId].alpha)) : 1;
             if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].rot === 'number') {
                 const angleRad = (runtimePositions[entry.inst.instanceId].rot || 0) * Math.PI / 180;
                 gctx.save();
                 gctx.translate(drawX + dw / 2, drawY + dh / 2);
                 gctx.rotate(angleRad);
+                const prevAlpha = gctx.globalAlpha;
+                gctx.globalAlpha = alpha;
                 gctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+                gctx.globalAlpha = prevAlpha;
                 gctx.restore();
             } else {
+                const prevAlpha = gctx.globalAlpha;
+                gctx.globalAlpha = alpha;
                 gctx.drawImage(img, drawX, drawY, dw, dh);
+                gctx.globalAlpha = prevAlpha;
             }
         };
-
-        if (img.complete) {
-            drawIfReady();
-        } else {
-            img.onload = drawIfReady;
-        }
+        if (img.complete) drawIfReady();
     });
 }
 
@@ -4829,7 +5534,6 @@ function refreshObjectGridIcons() {
         }
     });
 }
-
 // =========================
 // Image Editor Implementation
 // =========================

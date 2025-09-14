@@ -17,7 +17,17 @@
           <span>Maxiverse</span>
         </div>
         <div class="menu-bar">
-          <button class="menu-btn">File</button>
+          <div class="file-menu-container">
+            <button class="menu-btn file-menu-btn" onclick="toggleFileMenu()">File</button>
+            <div class="undo-menu" id="file-dropdown">
+              <button class="undo-menu-item" onclick="saveProjectToFile()">Save</button>
+              <div class="menu-separator"></div>
+              <button class="undo-menu-item" onclick="triggerLoadProjectFromFile()">Load</button>
+              <div class="menu-separator"></div>
+              <button class="undo-menu-item" onclick="exportProjectAsHtml()">Export HTML</button>
+            </div>
+            <input id="file-input" type="file" accept=".json,.maxiverse,.app,application/json" style="display:none" />
+          </div>
           <div class="edit-menu-container">
             <button class="menu-btn edit-menu-btn" onclick="toggleEditMenu()" onmouseenter="console.log('Edit button hovered')" onmouseleave="console.log('Edit button left')">Edit</button>
             <div class="undo-menu" id="edit-dropdown">
