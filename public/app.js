@@ -5443,14 +5443,18 @@ function renderGameWindowSprite() {
         let img = imageCache[mediaPath];
         if (!img) {
             img = new Image();
+            // Allow cross-origin-safe drawing when assets are served from CDN or different origin
+            img.crossOrigin = 'anonymous';
             imageCache[mediaPath] = img;
+            // Set handlers before src to ensure we catch events
+            img.onerror = function(){ img._broken = true; try { console.warn('Image failed to load', mediaPath); } catch(e){} };
+            // Presence of onload is used as readiness indicator; actual draw is gated below
+            img.onload = function(){ /* readiness indicated via img.complete */ };
             img.src = mediaPath;
-            // Mark readiness on first load without re-assigning handlers every frame
-            img.onload = function(){ /* no-op; presence indicates readiness via img.complete */ };
         }
         // Draw immediately if image is ready; otherwise skip this frame.
         const drawIfReady = () => {
-            if (!img.complete) return;
+            if (!img.complete || img._broken || !(img.naturalWidth > 0 && img.naturalHeight > 0)) return;
             let scale = 1;
             if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale === 'number') {
                 scale = Math.max(0, runtimePositions[entry.inst.instanceId].scale || 1);
@@ -5491,7 +5495,7 @@ function renderGameWindowSprite() {
                 gctx.globalAlpha = prevAlpha;
             }
         };
-        if (img.complete) drawIfReady();
+        if (img.complete) drawIfReady(); else img.onload = drawIfReady;
     });
 }
 
