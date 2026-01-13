@@ -136,12 +136,14 @@ const tabs = ['images', 'code', 'sound', 'threed'];
 
 // ===== Runtime/Play State =====
 let isPlaying = false;
-let runtimePositions = {}; // world coords centered at (0,0): { [objectId]: { x, y } }
+let runtimePositions = {}; // world coords centered at (0,0): { [objectId]: { x, y, rot, scale, alpha, spritePath, layer } }
 let runtimeExecState = {}; // per object execution state
-let runtimeVariables = {}; // per instance variables: { [instanceId]: { [name]: number } }
-let runtimeGlobalVariables = {}; // shared public variables across all instances: { [name]: number }
+let runtimeVariables = {}; // per instance variables: { [instanceId]: { [name]: any } }
+let runtimeGlobalVariables = {}; // shared public variables across all instances: { [name]: any }
 let lastCreatedVariable = null; // { name: string, isPrivate: boolean }
 let lastCreatedVariableByObject = {}; // { [objectId: number]: { name: string, isPrivate: true } }
+let lastCreatedArrayVariable = null; // { name: string, isPrivate: boolean }
+let lastCreatedArrayVariableByObject = {}; // { [objectId: number]: { name: string, isPrivate: true } }
 let lastCreatedPublicVariable = null; // { name: string, isPrivate: false }
 let playLoopHandle = null;
 let playStartTime = 0;
@@ -218,7 +220,7 @@ function worldToCanvas(x, y, canvas) {
 function resetRuntimePositions() {
     runtimePositions = {};
     runtimeInstances.forEach(inst => {
-        runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+        runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
     });
 }
 function stepInterpreter(dtMs) {
@@ -256,7 +258,29 @@ function stepInterpreter(dtMs) {
         while (isPlaying && exec.pc != null && steps < MAX_STEPS_PER_OBJECT) {
             const block = codeMap ? codeMap[exec.pc] : code.find(b => b && b.id === exec.pc);
             if (!block) { exec.pc = null; break; }
-            // Resolve inputs for numeric fields if connected
+            const coerceScalarLiteral = (v) => {
+                if (typeof v === 'number') return v;
+                if (typeof v === 'string') {
+                    const s = v.trim();
+                    if (s === '') return '';
+                    const n = Number(s);
+                    return Number.isFinite(n) ? n : v;
+                }
+                return v;
+            };
+            const getArrayRef = (varName, instanceOnly) => {
+                const name = varName || '';
+                const store = instanceOnly
+                    ? (runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId] = {}))
+                    : runtimeGlobalVariables;
+                let arr = store[name];
+                if (!Array.isArray(arr)) {
+                    arr = [];
+                    store[name] = arr;
+                }
+                return arr;
+            };
+            // Resolve inputs if connected
             const resolveInput = (blockRef, key) => {
                 const inputId = blockRef[key];
                 if (inputId == null) return null;
@@ -292,6 +316,26 @@ function stepInterpreter(dtMs) {
                     const dx = (typeof pos.x === 'number' ? pos.x : 0) - tx;
                     const dy = (typeof pos.y === 'number' ? pos.y : 0) - ty;
                     return Math.hypot(dx, dy);
+                }
+                if (node.content === 'pixel_is_rgb') {
+                    const canvas = document.getElementById('game-window');
+                    if (!canvas) return 0;
+                    const xw = Number((node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0));
+                    const yw = Number((node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0));
+                    const p = worldToCanvas(xw, yw, canvas);
+                    const px = Math.round(p.x);
+                    const py = Math.round(p.y);
+                    if (!Number.isFinite(px) || !Number.isFinite(py)) return 0;
+                    if (px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return 0;
+                    const cctx = canvas.getContext('2d');
+                    if (!cctx) return 0;
+                    let data;
+                    try { data = cctx.getImageData(px, py, 1, 1).data; } catch (_) { return 0; }
+                    const r = data[0], g = data[1], b = data[2];
+                    const tr = Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0)));
+                    const tg = Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0)));
+                    const tb = Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0)));
+                    return (r === tr && g === tg && b === tb) ? 1 : 0;
                 }
                 if (node.content === 'random_int') {
                     const minVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
@@ -361,6 +405,17 @@ function stepInterpreter(dtMs) {
                         return typeof v === 'number' ? v : 0;
                     }
                 }
+                if (node.content === 'array_get') {
+                    const arr = getArrayRef(node.var_name || '', !!node.var_instance_only);
+                    const idxVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
+                    const idx = Math.floor(Number(idxVal));
+                    if (!Number.isFinite(idx) || idx < 0 || idx >= arr.length) return '';
+                    return arr[idx];
+                }
+                if (node.content === 'array_length') {
+                    const arr = getArrayRef(node.var_name || '', !!node.var_instance_only);
+                    return arr.length;
+                }
                 return null;
             };
 
@@ -415,14 +470,21 @@ function stepInterpreter(dtMs) {
                     let a = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
                     if (Number.isNaN(a)) a = 1;
                     a = Math.max(0, Math.min(1, a));
-                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
                     runtimePositions[inst.instanceId].alpha = a;
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'set_layer') {
+                    const layer = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
+                    runtimePositions[inst.instanceId].layer = layer;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
                 if (block.content === 'point_towards') {
                     // Compute angle from current position to (x,y) and set rot
-                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
+                    if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
                     const pos = runtimePositions[inst.instanceId];
                     const targetX = Number((block.input_a != null ? (resolveInput(block, 'input_a') ?? block.val_a) : block.val_a) ?? 0);
                     const targetY = Number((block.input_b != null ? (resolveInput(block, 'input_b') ?? block.val_b) : block.val_b) ?? 0);
@@ -554,11 +616,46 @@ function stepInterpreter(dtMs) {
                     const delta = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (block.var_instance_only) {
                         if (!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId] = {};
-                        const current = runtimeVariables[inst.instanceId][varName] || 0;
+                        const curVal = runtimeVariables[inst.instanceId][varName];
+                        const current = (typeof curVal === 'number') ? curVal : 0;
                         runtimeVariables[inst.instanceId][varName] = current + delta;
                     } else {
-                        const current = runtimeGlobalVariables[varName] || 0;
+                        const curVal = runtimeGlobalVariables[varName];
+                        const current = (typeof curVal === 'number') ? curVal : 0;
                         runtimeGlobalVariables[varName] = current + delta;
+                    }
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'array_append') {
+                    const varName = block.var_name || '';
+                    const raw = (block.input_a != null) ? (resolveInput(block, 'input_a') ?? block.val_a ?? '') : (block.val_a ?? '');
+                    const value = coerceScalarLiteral(raw);
+                    const arr = getArrayRef(varName, !!block.var_instance_only);
+                    arr.push(value);
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'array_insert') {
+                    const varName = block.var_name || '';
+                    const raw = (block.input_a != null) ? (resolveInput(block, 'input_a') ?? block.val_a ?? '') : (block.val_a ?? '');
+                    const value = coerceScalarLiteral(raw);
+                    const idxVal = (block.input_b != null) ? (resolveInput(block, 'input_b') ?? block.val_b ?? 0) : (block.val_b ?? 0);
+                    let idx = Math.floor(Number(idxVal));
+                    if (!Number.isFinite(idx)) idx = 0;
+                    const arr = getArrayRef(varName, !!block.var_instance_only);
+                    idx = Math.max(0, Math.min(arr.length, idx));
+                    arr.splice(idx, 0, value);
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                    continue;
+                }
+                if (block.content === 'array_delete') {
+                    const varName = block.var_name || '';
+                    const idxVal = (block.input_a != null) ? (resolveInput(block, 'input_a') ?? block.val_a ?? 0) : (block.val_a ?? 0);
+                    const idx = Math.floor(Number(idxVal));
+                    const arr = getArrayRef(varName, !!block.var_instance_only);
+                    if (Number.isFinite(idx) && idx >= 0 && idx < arr.length) {
+                        arr.splice(idx, 1);
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
@@ -617,8 +714,13 @@ function stepInterpreter(dtMs) {
             const template = objectById[pending.templateId];
             if (!template) continue;
             runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId });
-            runtimePositions[pending.instanceId] = { x: 0, y: 0 };
+            runtimePositions[pending.instanceId] = { x: 0, y: 0, layer: 0 };
             runtimeVariables[pending.instanceId] = {};
+            // Seed private array variables for this template
+            try {
+                const arrs = Array.isArray(template.arrayVariables) ? template.arrayVariables : [];
+                arrs.forEach(name => { runtimeVariables[pending.instanceId][name] = []; });
+            } catch (_) {}
             const codeT = Array.isArray(template.code) ? template.code : [];
             const startT = codeT.find(b => b.type === 'start');
             const pcT = startT && typeof startT.next_block_a === 'number' ? startT.next_block_a : null;
@@ -677,9 +779,14 @@ function startPlay() {
     runtimeGlobalVariables = {};
     const controller = objects.find(o => o.type === 'controller' || o.name === 'AppController');
     if (controller) {
+        // Seed public array variables
+        try {
+            const pubArrs = Array.isArray(controller.arrayVariables) ? controller.arrayVariables : [];
+            pubArrs.forEach(name => { if (!Array.isArray(runtimeGlobalVariables[name])) runtimeGlobalVariables[name] = []; });
+        } catch (_) {}
         const instId = nextInstanceId++;
         runtimeInstances.push({ instanceId: instId, templateId: controller.id });
-        runtimePositions[instId] = { x: 0, y: 0 };
+        runtimePositions[instId] = { x: 0, y: 0, layer: 0 };
         runtimeVariables[instId] = {};
         const code = Array.isArray(controller.code) ? controller.code : [];
         const start = code.find(b => b.type === 'start');
@@ -959,6 +1066,39 @@ function createNodeBlock(codeData, x, y) {
         });
         sizeSpan.appendChild(btn);
         if (codeData.input_a != null) { sizeInput.value = '^'; sizeInput.readOnly = true; }
+    } else if (codeData.content === 'set_layer') {
+        label.textContent = '';
+        label.append('Set Layer (');
+        const layerSpan = document.createElement('span');
+        layerSpan.className = 'node-input-container';
+        const layerInput = document.createElement('input');
+        layerInput.type = 'number'; layerInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        layerInput.value = codeData.val_a;
+        layerInput.addEventListener('change', () => { codeData.val_a = parseFloat(layerInput.value) || 0; });
+        layerSpan.appendChild(layerInput);
+        label.appendChild(layerSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        layerSpan.appendChild(btn);
+        if (codeData.input_a != null) { layerInput.value = '^'; layerInput.readOnly = true; }
     } else if (codeData.content === 'set_opacity') {
         label.textContent = '';
         label.append('Set Opacity (');
@@ -1280,12 +1420,103 @@ function createNodeBlock(codeData, x, y) {
         addInputPlus(bSpan, 'b');
         if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
         if (codeData.input_b != null) { bInput.value = '^'; bInput.readOnly = true; }
+    } else if (codeData.content === 'pixel_is_rgb') {
+        // Pixel at (x,y) is rgb(r,g,b)  -> returns 1/0 when used as an input block
+        label.textContent = '';
+        label.append('Pixel at (');
+
+        const xSpan = document.createElement('span');
+        xSpan.className = 'node-input-container';
+        const xInput = document.createElement('input');
+        xInput.type = 'number'; xInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        xInput.value = codeData.val_a;
+        xInput.addEventListener('change', () => { codeData.val_a = parseFloat(xInput.value) || 0; });
+        xSpan.appendChild(xInput);
+        label.appendChild(xSpan);
+
+        label.append(', ');
+
+        const ySpan = document.createElement('span');
+        ySpan.className = 'node-input-container';
+        const yInput = document.createElement('input');
+        yInput.type = 'number'; yInput.step = '1';
+        if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
+        yInput.value = codeData.val_b;
+        yInput.addEventListener('change', () => { codeData.val_b = parseFloat(yInput.value) || 0; });
+        ySpan.appendChild(yInput);
+        label.appendChild(ySpan);
+
+        label.append(') is rgb (');
+
+        const rSpan = document.createElement('span');
+        rSpan.className = 'node-input-container';
+        const rInput = document.createElement('input');
+        rInput.type = 'number'; rInput.step = '1'; rInput.min = '0'; rInput.max = '255';
+        if (typeof codeData.rgb_r !== 'number') codeData.rgb_r = 0;
+        rInput.value = codeData.rgb_r;
+        rInput.addEventListener('change', () => { codeData.rgb_r = Math.max(0, Math.min(255, Math.round(parseFloat(rInput.value) || 0))); rInput.value = codeData.rgb_r; });
+        rSpan.appendChild(rInput);
+        label.appendChild(rSpan);
+
+        label.append(', ');
+
+        const gSpan = document.createElement('span');
+        gSpan.className = 'node-input-container';
+        const gInput = document.createElement('input');
+        gInput.type = 'number'; gInput.step = '1'; gInput.min = '0'; gInput.max = '255';
+        if (typeof codeData.rgb_g !== 'number') codeData.rgb_g = 0;
+        gInput.value = codeData.rgb_g;
+        gInput.addEventListener('change', () => { codeData.rgb_g = Math.max(0, Math.min(255, Math.round(parseFloat(gInput.value) || 0))); gInput.value = codeData.rgb_g; });
+        gSpan.appendChild(gInput);
+        label.appendChild(gSpan);
+
+        label.append(', ');
+
+        const bSpan = document.createElement('span');
+        bSpan.className = 'node-input-container';
+        const bInput = document.createElement('input');
+        bInput.type = 'number'; bInput.step = '1'; bInput.min = '0'; bInput.max = '255';
+        if (typeof codeData.rgb_b !== 'number') codeData.rgb_b = 0;
+        bInput.value = codeData.rgb_b;
+        bInput.addEventListener('change', () => { codeData.rgb_b = Math.max(0, Math.min(255, Math.round(parseFloat(bInput.value) || 0))); bInput.value = codeData.rgb_b; });
+        bSpan.appendChild(bInput);
+        label.appendChild(bSpan);
+
+        label.append(')');
+
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+'; btn.title = `Add input (${which.toUpperCase()})`;
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, which, btn); });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                if (isConnecting) return;
+                const container = document.getElementById('node-window'); if (!container) return;
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(xSpan, 'a');
+        addInputPlus(ySpan, 'b');
+        if (codeData.input_a != null) { xInput.value = '^'; xInput.readOnly = true; }
+        if (codeData.input_b != null) { yInput.value = '^'; yInput.readOnly = true; }
     } else if (codeData.content === 'set_variable') {
         label.textContent = '';
         label.append('Set ');
         const varSpan = document.createElement('span');
         varSpan.className = 'node-input-container';
         const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
         populateVariableSelect(varSelect, codeData);
         // Default UI selection to public 'i' if available and var not set
         try {
@@ -1302,7 +1533,8 @@ function createNodeBlock(codeData, x, y) {
         varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
         // Ensure reasonable size and alignment
         varSelect.style.minWidth = '120px';
-        varSelect.style.height = '22px';
+        // Avoid tiny fixed heights (can clip text on some platforms)
+        varSelect.style.minHeight = '30px';
         varSpan.appendChild(varSelect);
         label.appendChild(varSpan);
         label.append(' to (');
@@ -1342,6 +1574,7 @@ function createNodeBlock(codeData, x, y) {
         const varSpan = document.createElement('span');
         varSpan.className = 'node-input-container';
         const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
         populateVariableSelect(varSelect, codeData);
         // Default UI selection to public 'i' if available and var not set
         try {
@@ -1357,7 +1590,7 @@ function createNodeBlock(codeData, x, y) {
         varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
         varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
         varSelect.style.minWidth = '120px';
-        varSelect.style.height = '22px';
+        varSelect.style.minHeight = '30px';
         varSpan.appendChild(varSelect);
         label.appendChild(varSpan);
         label.append(' by (');
@@ -1391,11 +1624,222 @@ function createNodeBlock(codeData, x, y) {
         });
         valSpan.appendChild(btn);
         if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
+    } else if (codeData.content === 'array_append') {
+        // Array Append: Array <name> append (value)
+        label.textContent = '';
+        label.append('Array ');
+        const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
+        const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
+        populateArrayVariableSelect(varSelect, codeData);
+        try {
+            if (!codeData.var_name) {
+                const currentObj = objects.find(obj => obj.id == selected_object);
+                const last = (currentObj && lastCreatedArrayVariableByObject[currentObj.id]) ? lastCreatedArrayVariableByObject[currentObj.id] : lastCreatedArrayVariable;
+                if (last && last.name) {
+                    const key = `${last.isPrivate ? 'priv' : 'pub'}:${last.name}`;
+                    varSelect.value = key;
+                    if (varSelect.value === key) {
+                        codeData.var_name = last.name;
+                        codeData.var_instance_only = !!last.isPrivate;
+                    }
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleArrayVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleArrayVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.minHeight = '30px';
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append(' append (');
+        const valSpan = document.createElement('span');
+        valSpan.className = 'node-input-container';
+        const input = document.createElement('input');
+        input.type = 'text';
+        if (typeof codeData.val_a !== 'string' && typeof codeData.val_a !== 'number') codeData.val_a = '';
+        input.value = codeData.val_a;
+        input.addEventListener('change', () => { codeData.val_a = input.value; });
+        valSpan.appendChild(input);
+        label.appendChild(valSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        valSpan.appendChild(btn);
+        if (codeData.input_a != null) { input.value = '^'; input.readOnly = true; }
+    } else if (codeData.content === 'array_insert') {
+        // Array Insert: Array <name> insert (value) at (index)
+        label.textContent = '';
+        label.append('Array ');
+        const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
+        const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
+        populateArrayVariableSelect(varSelect, codeData);
+        try {
+            if (!codeData.var_name) {
+                const currentObj = objects.find(obj => obj.id == selected_object);
+                const last = (currentObj && lastCreatedArrayVariableByObject[currentObj.id]) ? lastCreatedArrayVariableByObject[currentObj.id] : lastCreatedArrayVariable;
+                if (last && last.name) {
+                    const key = `${last.isPrivate ? 'priv' : 'pub'}:${last.name}`;
+                    varSelect.value = key;
+                    if (varSelect.value === key) {
+                        codeData.var_name = last.name;
+                        codeData.var_instance_only = !!last.isPrivate;
+                    }
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleArrayVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleArrayVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.minHeight = '30px';
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append(' insert (');
+        const valSpan = document.createElement('span');
+        valSpan.className = 'node-input-container';
+        const valInput = document.createElement('input');
+        valInput.type = 'text';
+        if (typeof codeData.val_a !== 'string' && typeof codeData.val_a !== 'number') codeData.val_a = '';
+        valInput.value = codeData.val_a;
+        valInput.addEventListener('change', () => { codeData.val_a = valInput.value; });
+        valSpan.appendChild(valInput);
+        label.appendChild(valSpan);
+        label.append(') at (');
+        const idxSpan = document.createElement('span');
+        idxSpan.className = 'node-input-container';
+        const idxInput = document.createElement('input');
+        idxInput.type = 'number'; idxInput.step = '1';
+        if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
+        idxInput.value = codeData.val_b;
+        idxInput.addEventListener('change', () => { codeData.val_b = parseFloat(idxInput.value) || 0; });
+        idxSpan.appendChild(idxInput);
+        label.appendChild(idxSpan);
+        label.append(')');
+        const btnA = document.createElement('button');
+        btnA.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btnA.textContent = '+'; btnA.title = 'Add input (A)';
+        btnA.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btnA); });
+        btnA.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        valSpan.appendChild(btnA);
+        const btnB = document.createElement('button');
+        btnB.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-b';
+        btnB.textContent = '+'; btnB.title = 'Add input (B)';
+        btnB.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'b', btnB); });
+        btnB.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'b' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        idxSpan.appendChild(btnB);
+        if (codeData.input_a != null) { valInput.value = '^'; valInput.readOnly = true; }
+        if (codeData.input_b != null) { idxInput.value = '^'; idxInput.readOnly = true; }
+    } else if (codeData.content === 'array_delete') {
+        // Array Delete: Array <name> delete at (index)
+        label.textContent = '';
+        label.append('Array ');
+        const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
+        const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
+        populateArrayVariableSelect(varSelect, codeData);
+        try {
+            if (!codeData.var_name) {
+                const currentObj = objects.find(obj => obj.id == selected_object);
+                const last = (currentObj && lastCreatedArrayVariableByObject[currentObj.id]) ? lastCreatedArrayVariableByObject[currentObj.id] : lastCreatedArrayVariable;
+                if (last && last.name) {
+                    const key = `${last.isPrivate ? 'priv' : 'pub'}:${last.name}`;
+                    varSelect.value = key;
+                    if (varSelect.value === key) {
+                        codeData.var_name = last.name;
+                        codeData.var_instance_only = !!last.isPrivate;
+                    }
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleArrayVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleArrayVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.minHeight = '30px';
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append(' delete at (');
+        const idxSpan = document.createElement('span');
+        idxSpan.className = 'node-input-container';
+        const idxInput = document.createElement('input');
+        idxInput.type = 'number'; idxInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        idxInput.value = codeData.val_a;
+        idxInput.addEventListener('change', () => { codeData.val_a = parseFloat(idxInput.value) || 0; });
+        idxSpan.appendChild(idxInput);
+        label.appendChild(idxSpan);
+        label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        idxSpan.appendChild(btn);
+        if (codeData.input_a != null) { idxInput.value = '^'; idxInput.readOnly = true; }
     } else if (codeData.content === 'variable') {
         label.textContent = '';
         const varSpan = document.createElement('span');
         varSpan.className = 'node-input-container';
         const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
         populateVariableSelect(varSelect, codeData);
         // Default UI selection to public 'i' if available and var not set
         try {
@@ -1411,9 +1855,100 @@ function createNodeBlock(codeData, x, y) {
         varSelect.addEventListener('change', () => handleVariableSelectChange(varSelect, codeData));
         varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleVariableSelectChange(varSelect, codeData); } });
         varSelect.style.minWidth = '120px';
-        varSelect.style.height = '22px';
+        varSelect.style.minHeight = '30px';
         varSpan.appendChild(varSelect);
         label.appendChild(varSpan);
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'array_get') {
+        // Array Get: <array>[index]
+        label.textContent = '';
+        const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
+        const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
+        populateArrayVariableSelect(varSelect, codeData);
+        try {
+            if (!codeData.var_name) {
+                const currentObj = objects.find(obj => obj.id == selected_object);
+                const last = (currentObj && lastCreatedArrayVariableByObject[currentObj.id]) ? lastCreatedArrayVariableByObject[currentObj.id] : lastCreatedArrayVariable;
+                if (last && last.name) {
+                    const key = `${last.isPrivate ? 'priv' : 'pub'}:${last.name}`;
+                    varSelect.value = key;
+                    if (varSelect.value === key) {
+                        codeData.var_name = last.name;
+                        codeData.var_instance_only = !!last.isPrivate;
+                    }
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleArrayVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleArrayVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.minHeight = '30px';
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append('[');
+        const idxSpan = document.createElement('span');
+        idxSpan.className = 'node-input-container';
+        const idxInput = document.createElement('input');
+        idxInput.type = 'number'; idxInput.step = '1';
+        if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        idxInput.value = codeData.val_a;
+        idxInput.addEventListener('change', () => { codeData.val_a = parseFloat(idxInput.value) || 0; });
+        idxSpan.appendChild(idxInput);
+        label.appendChild(idxSpan);
+        label.append(']');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            const r = document.getElementById('node-window'); if (!r) return;
+            const rect = r.getBoundingClientRect();
+            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            document.addEventListener('mousemove', handleConnectMouseMove);
+            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            drawConnections();
+        });
+        idxSpan.appendChild(btn);
+        if (codeData.input_a != null) { idxInput.value = '^'; idxInput.readOnly = true; }
+        block.classList.add('node-block-compact');
+    } else if (codeData.content === 'array_length') {
+        // Array Length: len(array)
+        label.textContent = '';
+        label.append('Len(');
+        const varSpan = document.createElement('span');
+        varSpan.className = 'node-input-container';
+        const varSelect = document.createElement('select');
+        varSelect.classList.add('node-var-select');
+        populateArrayVariableSelect(varSelect, codeData);
+        try {
+            if (!codeData.var_name) {
+                const currentObj = objects.find(obj => obj.id == selected_object);
+                const last = (currentObj && lastCreatedArrayVariableByObject[currentObj.id]) ? lastCreatedArrayVariableByObject[currentObj.id] : lastCreatedArrayVariable;
+                if (last && last.name) {
+                    const key = `${last.isPrivate ? 'priv' : 'pub'}:${last.name}`;
+                    varSelect.value = key;
+                    if (varSelect.value === key) {
+                        codeData.var_name = last.name;
+                        codeData.var_instance_only = !!last.isPrivate;
+                    }
+                }
+            }
+        } catch(_) {}
+        varSelect.addEventListener('change', () => handleArrayVariableSelectChange(varSelect, codeData));
+        varSelect.addEventListener('mousedown', (e) => { if (varSelect.value === '__create__') { e.preventDefault(); e.stopPropagation(); handleArrayVariableSelectChange(varSelect, codeData); } });
+        varSelect.style.minWidth = '120px';
+        varSelect.style.minHeight = '30px';
+        varSpan.appendChild(varSelect);
+        label.appendChild(varSpan);
+        label.append(')');
         block.classList.add('node-block-compact');
     } else if (codeData.content === 'image_name') {
         label.textContent = 'ImageName';
@@ -1972,6 +2507,9 @@ function createNodeBlock(codeData, x, y) {
     function ensureVarArrays(obj) {
         if (!obj.variables) obj.variables = [];
     }
+    function ensureArrayVarArrays(obj) {
+        if (!obj.arrayVariables) obj.arrayVariables = [];
+    }
     function populateVariableSelect(selectEl, codeDataRef) {
         const currentObj = objects.find(obj => obj.id == selected_object);
         const app = getAppController();
@@ -2012,7 +2550,7 @@ function createNodeBlock(codeData, x, y) {
             selectEl.value = '__create__';
         }
     }
-    function openCreateVariableModal(onCreate, hideInstanceToggle) {
+    function openCreateVariableModal(onCreate, hideInstanceToggle, titleText = 'Create Variable') {
         // Remove any existing modal to avoid duplicates
         const existing = document.getElementById('__var_modal');
         if (existing) { try { document.body.removeChild(existing); } catch {} }
@@ -2024,7 +2562,7 @@ function createNodeBlock(codeData, x, y) {
         const panel = document.createElement('div');
         panel.style.cssText = 'background:#2a2a2a;border:1px solid #444;border-radius:8px;padding:16px;min-width:320px;color:#eee;';
         const title = document.createElement('div');
-        title.textContent = 'Create Variable';
+        title.textContent = titleText;
         title.style.cssText = 'font-weight:700;margin-bottom:8px;';
         const nameLabel = document.createElement('div');
         nameLabel.textContent = 'Name';
@@ -2115,9 +2653,86 @@ function createNodeBlock(codeData, x, y) {
                 const key = `${codeDataRef.var_instance_only ? 'priv' : 'pub'}:${codeDataRef.var_name}`;
                 selectEl.value = key;
                 updateWorkspace();
-            }, isAppController);
+            }, isAppController, 'Create Variable');
         } else {
             // Parse selection key
+            const [scope, name] = selectEl.value.split(':');
+            codeDataRef.var_name = name || '';
+            codeDataRef.var_instance_only = (scope === 'priv');
+        }
+    }
+
+    function populateArrayVariableSelect(selectEl, codeDataRef) {
+        const currentObj = objects.find(obj => obj.id == selected_object);
+        const app = getAppController();
+        if (!currentObj) return;
+        ensureArrayVarArrays(currentObj);
+        if (app) ensureArrayVarArrays(app);
+        selectEl.innerHTML = '';
+        // Public (App) arrays first
+        if (app && app.arrayVariables && app.arrayVariables.length) {
+            const groupPub = document.createElement('optgroup');
+            groupPub.label = 'Public Arrays';
+            app.arrayVariables.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = `pub:${name}`; opt.textContent = name; groupPub.appendChild(opt);
+            });
+            selectEl.appendChild(groupPub);
+        }
+        // Private (object) arrays
+        if (currentObj.arrayVariables && currentObj.arrayVariables.length) {
+            const groupPriv = document.createElement('optgroup');
+            groupPriv.label = 'Private Arrays (this object)';
+            currentObj.arrayVariables.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = `priv:${name}`; opt.textContent = name; groupPriv.appendChild(opt);
+            });
+            selectEl.appendChild(groupPriv);
+        }
+        const createOpt = document.createElement('option');
+        createOpt.value = '__create__'; createOpt.textContent = 'New array…';
+        selectEl.appendChild(createOpt);
+        // Initialize selection from codeDataRef
+        if (codeDataRef.var_name) {
+            const isPriv = !!codeDataRef.var_instance_only;
+            const key = `${isPriv ? 'priv' : 'pub'}:${codeDataRef.var_name}`;
+            selectEl.value = key;
+            if (selectEl.value !== key) selectEl.value = '__create__';
+        } else {
+            selectEl.value = '__create__';
+        }
+    }
+    function handleArrayVariableSelectChange(selectEl, codeDataRef) {
+        const currentObj = objects.find(obj => obj.id == selected_object);
+        const app = getAppController();
+        if (!currentObj) return;
+        if (selectEl.value === '__create__') {
+            const isAppController = !!(currentObj && (currentObj.type === 'controller' || currentObj.name === 'AppController'));
+            openCreateVariableModal((name, instanceOnly) => {
+                if (isAppController) {
+                    // AppManager cannot create instance-only
+                    instanceOnly = false;
+                }
+                if (instanceOnly) {
+                    ensureArrayVarArrays(currentObj);
+                    if (!currentObj.arrayVariables.includes(name)) currentObj.arrayVariables.push(name);
+                    codeDataRef.var_name = name;
+                    codeDataRef.var_instance_only = true;
+                    try { lastCreatedArrayVariableByObject[currentObj.id] = { name, isPrivate: true }; } catch(_) {}
+                } else {
+                    const appObj = app || currentObj;
+                    ensureArrayVarArrays(appObj);
+                    if (!appObj.arrayVariables.includes(name)) appObj.arrayVariables.push(name);
+                    codeDataRef.var_name = name;
+                    codeDataRef.var_instance_only = false;
+                }
+                lastCreatedArrayVariable = { name: codeDataRef.var_name, isPrivate: !!codeDataRef.var_instance_only };
+                populateArrayVariableSelect(selectEl, codeDataRef);
+                const key = `${codeDataRef.var_instance_only ? 'priv' : 'pub'}:${codeDataRef.var_name}`;
+                selectEl.value = key;
+                updateWorkspace();
+            }, isAppController, 'Create Array');
+        } else {
             const [scope, name] = selectEl.value.split(':');
             codeDataRef.var_name = name || '';
             codeDataRef.var_instance_only = (scope === 'priv');
@@ -2264,9 +2879,13 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
     addItem('Set Size', 'set_size');
     addItem('Change Size By', 'change_size');
     addItem('Set Opacity', 'set_opacity');
+    addItem('Set Layer', 'set_layer');
     // Variables
     addItem('Set Variable', 'set_variable');
     addItem('Change Variable By', 'change_variable');
+    addItem('Array Append', 'array_append');
+    addItem('Array Insert', 'array_insert');
+    addItem('Array Delete Index', 'array_delete');
     // Instances
     addItem('Create Instance', 'instantiate');
     addItem('Delete Instance', 'delete_instance');
@@ -2378,9 +2997,12 @@ function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn,
     addItem('Size', 'size');
     // Values
     addItem('Variable', 'variable');
+    addItem('Array Get Item', 'array_get');
+    addItem('Array Length', 'array_length');
     addItem('Random Integer', 'random_int');
     addItem('Image Name', 'image_name');
     addItem('Distance To (x, y)', 'distance_to');
+    addItem('Pixel is RGB at (x, y)', 'pixel_is_rgb');
     // Position menu above the specific button if available; else above block
     if (customPosition) {
         // For drag-opened: we'll place via fixed positioning after creation below
@@ -2520,6 +3142,9 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
     } else if (typeKey === 'set_opacity') {
         // val_a holds opacity in [0,1]
         newBlock.val_a = 1;
+    } else if (typeKey === 'set_layer') {
+        // val_a holds layer number
+        newBlock.val_a = 0;
     } else if (typeKey === 'set_x') {
         newBlock.val_a = 0;
     } else if (typeKey === 'set_y') {
@@ -2541,6 +3166,15 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
         newBlock.type = 'value';
         newBlock.val_a = 0;
         newBlock.val_b = 0;
+    } else if (typeKey === 'array_get') {
+        newBlock.type = 'value';
+        newBlock.val_a = 0; // index
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
+    } else if (typeKey === 'array_length') {
+        newBlock.type = 'value';
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
     } else if (typeKey === 'print') {
         newBlock.val_a = '';
     } else if (typeKey === 'not') {
@@ -2558,6 +3192,19 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
         newBlock.val_a = 1;
         newBlock.var_name = 'i';
         newBlock.var_instance_only = false; // public
+    } else if (typeKey === 'array_append') {
+        newBlock.val_a = '';
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
+    } else if (typeKey === 'array_insert') {
+        newBlock.val_a = '';
+        newBlock.val_b = 0;
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
+    } else if (typeKey === 'array_delete') {
+        newBlock.val_a = 0;
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
     }
 
     // Link anchor -> new -> oldNext on selected branch
@@ -2616,6 +3263,13 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     } else if (typeKey === 'variable') {
         newBlock.var_name = 'i';
         newBlock.var_instance_only = false; // public
+    } else if (typeKey === 'array_get') {
+        newBlock.val_a = 0;
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
+    } else if (typeKey === 'array_length') {
+        newBlock.var_name = (lastCreatedArrayVariable && lastCreatedArrayVariable.name) ? lastCreatedArrayVariable.name : '';
+        newBlock.var_instance_only = !!(lastCreatedArrayVariable && lastCreatedArrayVariable.isPrivate);
     } else if (typeKey === 'and') {
         // two-operand logical AND input block; default 0, 0
         newBlock.val_a = 0;
@@ -2624,6 +3278,13 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         // two-operand logical OR input block; default 0, 0
         newBlock.val_a = 0;
         newBlock.val_b = 0;
+    } else if (typeKey === 'pixel_is_rgb') {
+        // Pixel is RGB at (x,y)
+        newBlock.val_a = 0; // x (world coords)
+        newBlock.val_b = 0; // y (world coords)
+        newBlock.rgb_r = 0;
+        newBlock.rgb_g = 0;
+        newBlock.rgb_b = 0;
     }
 
     // Connect anchor block's input
@@ -2639,6 +3300,15 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         if (inputKey === 'a') anchorCodeData.op_x = '^';
         if (inputKey === 'b') anchorCodeData.op_y = '^';
     } else if (anchorCodeData.content === 'set_variable' || anchorCodeData.content === 'change_variable') {
+        anchorCodeData.val_a = '^';
+    } else if (anchorCodeData.content === 'array_append') {
+        anchorCodeData.val_a = '^';
+    } else if (anchorCodeData.content === 'array_insert') {
+        if (inputKey === 'a') anchorCodeData.val_a = '^';
+        if (inputKey === 'b') anchorCodeData.val_b = '^';
+    } else if (anchorCodeData.content === 'array_delete') {
+        anchorCodeData.val_a = '^';
+    } else if (anchorCodeData.content === 'array_get') {
         anchorCodeData.val_a = '^';
     }
 
@@ -3437,6 +4107,19 @@ function drawConnections() {
 let selectedImage = null; // current image src (path or data URL)
 let imageZoom = 1.0;
 let lastSelectedImage = localStorage.getItem('lastSelectedImage') || '';
+function lastSelectedImageKeyForObject(objectId) {
+    return `lastSelectedImage:${String(objectId)}`;
+}
+function getLastSelectedImageForObject(objectId) {
+    try { return localStorage.getItem(lastSelectedImageKeyForObject(objectId)) || ''; } catch (_) { return ''; }
+}
+function setLastSelectedImageForObject(objectId, imagePath) {
+    try {
+        const k = lastSelectedImageKeyForObject(objectId);
+        if (imagePath) localStorage.setItem(k, imagePath);
+        else localStorage.removeItem(k);
+    } catch (_) {}
+}
 // Deleted images per object for undo
 const deletedImagesMap = {};
 // Per-object image lists stored in-memory: { [objectId]: Array<{ id, name, src }> }
@@ -3605,167 +4288,241 @@ function createImagesInterface(container) {
     // Create main container
     const imagesContainer = document.createElement('div');
     imagesContainer.className = 'images-container';
-    imagesContainer.style.cssText = `
-        position: relative;
-        width: 100%;
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        background: #2a2a2a;
-    `;
 
     // Create top editing panel
     const editingPanel = document.createElement('div');
     editingPanel.className = 'image-editing-panel';
     editingPanel.style.cssText = `
         height: 60px;
-        background: #333;
-        border-bottom: 1px solid #444;
         display: flex;
         align-items: center;
-        padding: 10px;
-        gap: 10px;
     `;
 
     // Drawing tools toolbar
     const toolbar = document.createElement('div');
-    toolbar.style.cssText = `
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    `;
+    toolbar.className = 'images-toolbar';
+
+    function setIcon(el, iconNameOrNames, fallbackText) {
+        const names = Array.isArray(iconNameOrNames) ? iconNameOrNames : [iconNameOrNames];
+        // Prefer programmatic SVG rendering when available (gives us a reliable fallback).
+        const lucide = window.lucide;
+        if (lucide && lucide.icons) {
+            const found = names.find(n => lucide.icons && lucide.icons[n]);
+            const iconDef = found ? lucide.icons[found] : null;
+            if (iconDef && typeof iconDef.toSvg === 'function') {
+                el.innerHTML = iconDef.toSvg({ width: 18, height: 18 });
+                return;
+            }
+        }
+        // Fallback to createIcons() + data-lucide if that's all we have.
+        if (lucide && typeof lucide.createIcons === 'function') {
+            const primary = names[0];
+            el.innerHTML = `<i data-lucide="${primary}"></i>`;
+            return;
+        }
+        el.textContent = fallbackText || '';
+    }
+
+    function refreshLucideIcons() {
+        try { window.lucide && window.lucide.createIcons && window.lucide.createIcons(); } catch (_) {}
+    }
 
     const toolNames = [
-        { id: 'brush', label: '🖌️' },
-        { id: 'rect', label: '▭' },
-        { id: 'circle', label: '◯' },
-        { id: 'bucket', label: '🪣' },
-        { id: 'select', label: '▦' },
+        { id: 'brush', icon: ['brush', 'paintbrush'], fallback: 'B', title: 'Brush' },
+        { id: 'rect', icon: ['square', 'square-dashed'], fallback: '▭', title: 'Rectangle' },
+        { id: 'circle', icon: ['circle'], fallback: '◯', title: 'Circle' },
+        { id: 'bucket', icon: ['paint-bucket', 'bucket'], fallback: 'F', title: 'Fill (Bucket)' },
+        { id: 'select', icon: ['lasso-select', 'lasso', 'selection'], fallback: 'S', title: 'Select' },
     ];
     const toolButtons = {};
     toolNames.forEach(t => {
         const btn = document.createElement('button');
-        btn.textContent = t.label;
+        setIcon(btn, t.icon, t.fallback);
         btn.className = 'image-edit-tool';
-        btn.style.width = '36px';
-        btn.style.height = '36px';
-        btn.style.borderRadius = '6px';
         btn.dataset.tool = t.id;
+        btn.title = t.title;
         btn.addEventListener('click', () => {
             if (imageEditor) imageEditor.setTool(t.id);
-            Object.values(toolButtons).forEach(b => b.style.outline = 'none');
-            btn.style.outline = '2px solid #00ffcc';
+            Object.values(toolButtons).forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
         });
         toolButtons[t.id] = btn;
         toolbar.appendChild(btn);
     });
 
-    // Color picker and Alpha slider
+    // Symmetry toggle (cycles: off -> X -> Y -> XY)
+    const sep1 = document.createElement('div');
+    sep1.className = 'image-toolbar-separator';
+    toolbar.appendChild(sep1);
+
+    const symmetryBtn = document.createElement('button');
+    symmetryBtn.className = 'image-edit-tool';
+    symmetryBtn.title = 'Symmetry: Off';
+    symmetryBtn.dataset.mode = 'none';
+    const symmetryModes = ['none', 'x', 'y', 'xy'];
+    function applySymmetryMode(mode) {
+        symmetryBtn.dataset.mode = mode;
+        if (mode === 'none') {
+            setIcon(symmetryBtn, ['flip-horizontal', 'flip-horizontal-2'], 'SYM');
+            symmetryBtn.title = 'Symmetry: Off';
+        } else if (mode === 'x') {
+            setIcon(symmetryBtn, ['flip-horizontal', 'flip-horizontal-2'], '↔');
+            symmetryBtn.title = 'Symmetry: Mirror Left/Right';
+        } else if (mode === 'y') {
+            setIcon(symmetryBtn, ['flip-vertical', 'flip-vertical-2'], '↕');
+            symmetryBtn.title = 'Symmetry: Mirror Up/Down';
+        } else {
+            setIcon(symmetryBtn, 'grid-2x2', '⤧');
+            symmetryBtn.title = 'Symmetry: Both';
+        }
+        refreshLucideIcons();
+        if (imageEditor && imageEditor.setSymmetry) imageEditor.setSymmetry(mode);
+        if (imageEditor && imageEditor.drawCrosshair) imageEditor.drawCrosshair();
+        // Make it look toggled when enabled
+        symmetryBtn.classList.toggle('active', mode !== 'none');
+    }
+    symmetryBtn.addEventListener('click', () => {
+        const cur = symmetryBtn.dataset.mode || 'none';
+        const idx = symmetryModes.indexOf(cur);
+        const next = symmetryModes[(idx + 1) % symmetryModes.length];
+        applySymmetryMode(next);
+    });
+    toolbar.appendChild(symmetryBtn);
+
+    // Color picker + Transparency toggle
     const colorInput = document.createElement('input');
     colorInput.type = 'color';
     colorInput.value = '#ff0000';
     colorInput.title = 'Color';
+    colorInput.className = 'image-color';
     colorInput.style.width = '36px';
     colorInput.style.height = '36px';
     colorInput.style.borderRadius = '6px';
     colorInput.style.padding = '0';
-    const alphaLabel = document.createElement('div');
-    alphaLabel.textContent = 'Transparency';
-    alphaLabel.style.fontSize = '11px';
-    alphaLabel.style.color = '#aaa';
-    const alphaInput = document.createElement('input');
-    alphaInput.type = 'range';
-    alphaInput.min = '0';
-    alphaInput.max = '1';
-    alphaInput.step = '0.01';
-    alphaInput.value = '1';
-    alphaInput.title = 'Alpha';
-    alphaInput.style.width = '80px';
-    const alphaNumber = document.createElement('input');
-    alphaNumber.type = 'number';
-    alphaNumber.min = '0';
-    alphaNumber.max = '1';
-    alphaNumber.step = '0.01';
-    alphaNumber.value = '1';
-    alphaNumber.style.width = '60px';
-    colorInput.addEventListener('input', () => imageEditor && imageEditor.setColor(colorInput.value, parseFloat(alphaInput.value)));
-    alphaInput.addEventListener('input', () => imageEditor && imageEditor.setColor(colorInput.value, parseFloat(alphaInput.value)));
+    const transparencyToggle = document.createElement('label');
+    transparencyToggle.className = 'image-toggle';
+    transparencyToggle.title = 'Transparency: Off';
+    const transparencyCheckbox = document.createElement('input');
+    transparencyCheckbox.type = 'checkbox';
+    transparencyCheckbox.checked = false;
+    transparencyCheckbox.className = 'image-toggle-input';
+    const transparencySwitch = document.createElement('span');
+    transparencySwitch.className = 'image-toggle-switch';
+    const transparencyText = document.createElement('span');
+    transparencyText.className = 'image-toggle-label';
+    transparencyText.textContent = 'Transparent';
+    transparencyToggle.appendChild(transparencyCheckbox);
+    transparencyToggle.appendChild(transparencySwitch);
+    transparencyToggle.appendChild(transparencyText);
 
     // Brush size
     const sizeLabel = document.createElement('div');
     sizeLabel.textContent = 'Size';
-    sizeLabel.style.fontSize = '11px';
-    sizeLabel.style.color = '#aaa';
+    sizeLabel.className = 'image-control-label';
     const sizeInput = document.createElement('input');
     sizeInput.type = 'range';
     sizeInput.min = '1';
     sizeInput.max = '100';
     sizeInput.value = '16';
     sizeInput.title = 'Brush Size';
-    sizeInput.style.width = '120px';
-    const sizeNumber = document.createElement('input');
-    sizeNumber.type = 'number';
-    sizeNumber.min = '1';
-    sizeNumber.max = '100';
-    sizeNumber.value = '16';
-    sizeNumber.style.width = '60px';
-    sizeInput.addEventListener('input', () => imageEditor && imageEditor.setBrushSize(parseInt(sizeInput.value)));
+    sizeInput.className = 'image-range image-range-size';
+    const sizeValue = document.createElement('div');
+    sizeValue.className = 'image-value-pill';
+    sizeValue.textContent = sizeInput.value;
+    const sizeMinusBtn = document.createElement('button');
+    sizeMinusBtn.className = 'image-step-btn';
+    sizeMinusBtn.type = 'button';
+    setIcon(sizeMinusBtn, ['minus', 'minus-circle'], '−');
+    sizeMinusBtn.title = 'Smaller brush';
+    const sizePlusBtn = document.createElement('button');
+    sizePlusBtn.className = 'image-step-btn';
+    sizePlusBtn.type = 'button';
+    setIcon(sizePlusBtn, ['plus', 'plus-circle'], '+');
+    sizePlusBtn.title = 'Larger brush';
+
+    function getBrushSizeFromUI() {
+        const n = parseInt(sizeInput.value, 10);
+        return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : 16;
+    }
+    function setBrushSizeUI(next) {
+        const clamped = Math.max(1, Math.min(100, next | 0));
+        sizeInput.value = String(clamped);
+        sizeValue.textContent = String(clamped);
+        if (imageEditor) imageEditor.setBrushSize(clamped);
+    }
+    sizeInput.addEventListener('input', () => setBrushSizeUI(getBrushSizeFromUI()));
+    sizeMinusBtn.addEventListener('click', () => setBrushSizeUI(getBrushSizeFromUI() - (window.event && window.event.shiftKey ? 10 : 1)));
+    sizePlusBtn.addEventListener('click', () => setBrushSizeUI(getBrushSizeFromUI() + (window.event && window.event.shiftKey ? 10 : 1)));
 
     // Fill toggle for shapes
     const fillLabel = document.createElement('label');
-    fillLabel.style.display = 'flex';
-    fillLabel.style.alignItems = 'center';
-    fillLabel.style.gap = '4px';
+    fillLabel.className = 'image-toggle';
     const fillCheckbox = document.createElement('input');
     fillCheckbox.type = 'checkbox';
     fillCheckbox.checked = true;
+    fillCheckbox.className = 'image-toggle-input';
+    fillCheckbox.title = 'Fill shapes';
+    const fillSwitch = document.createElement('span');
+    fillSwitch.className = 'image-toggle-switch';
     const fillText = document.createElement('span');
     fillText.textContent = 'Fill';
+    fillText.className = 'image-toggle-label';
     fillLabel.appendChild(fillCheckbox);
+    fillLabel.appendChild(fillSwitch);
     fillLabel.appendChild(fillText);
     fillCheckbox.addEventListener('change', () => imageEditor && imageEditor.setFill(fillCheckbox.checked));
 
     // Undo / Redo
     const undoBtn = document.createElement('button');
-    undoBtn.textContent = '↩';
+    setIcon(undoBtn, ['undo-2', 'undo2', 'undo'], '↩');
     undoBtn.className = 'image-edit-tool';
+    undoBtn.title = 'Undo';
     undoBtn.addEventListener('click', () => imageEditor && imageEditor.undo());
     const redoBtn = document.createElement('button');
-    redoBtn.textContent = '↪';
+    setIcon(redoBtn, ['redo-2', 'redo2', 'redo'], '↪');
     redoBtn.className = 'image-edit-tool';
+    redoBtn.title = 'Redo';
     redoBtn.addEventListener('click', () => imageEditor && imageEditor.redo());
 
     // Clear
     const clearBtn = document.createElement('button');
-    clearBtn.textContent = '⎚';
+    setIcon(clearBtn, 'trash-2', 'CLR');
     clearBtn.className = 'image-edit-tool';
+    clearBtn.title = 'Clear';
     clearBtn.addEventListener('click', () => imageEditor && imageEditor.clear());
 
-    // Wire numeric and range inputs
-    colorInput.addEventListener('input', () => imageEditor && imageEditor.setColor(colorInput.value, parseFloat(alphaInput.value)));
-    alphaInput.addEventListener('input', () => { alphaNumber.value = alphaInput.value; imageEditor && imageEditor.setColor(colorInput.value, parseFloat(alphaInput.value)); });
-    alphaNumber.addEventListener('input', () => { alphaInput.value = alphaNumber.value; imageEditor && imageEditor.setColor(colorInput.value, parseFloat(alphaNumber.value)); });
-    sizeInput.addEventListener('input', () => { sizeNumber.value = sizeInput.value; imageEditor && imageEditor.setBrushSize(parseInt(sizeInput.value)); });
-    sizeNumber.addEventListener('input', () => { sizeInput.value = sizeNumber.value; imageEditor && imageEditor.setBrushSize(parseInt(sizeNumber.value)); });
+    // Wire color + transparency toggle (acts like "transparent paint"/eraser mode)
+    function currentAlpha() { return transparencyCheckbox.checked ? 0 : 1; }
+    function applyColorFromUI() {
+        if (!imageEditor) return;
+        imageEditor.setColor(colorInput.value, currentAlpha());
+    }
+    colorInput.addEventListener('input', applyColorFromUI);
+    transparencyCheckbox.addEventListener('change', () => {
+        transparencyToggle.title = transparencyCheckbox.checked ? 'Transparency: On (draw transparent)' : 'Transparency: Off';
+        transparencyToggle.classList.toggle('active', transparencyCheckbox.checked);
+        applyColorFromUI();
+    });
 
-    toolbar.appendChild(colorInput);
-    const alphaGroup = document.createElement('div');
-    alphaGroup.style.display = 'flex';
-    alphaGroup.style.flexDirection = 'column';
-    alphaGroup.style.gap = '2px';
-    const alphaRow = document.createElement('div');
-    alphaRow.style.display = 'flex'; alphaRow.style.gap = '6px'; alphaRow.style.alignItems = 'center';
-    alphaRow.appendChild(alphaInput); alphaRow.appendChild(alphaNumber);
-    alphaGroup.appendChild(alphaLabel); alphaGroup.appendChild(alphaRow);
-    toolbar.appendChild(alphaGroup);
+    const colorWrap = document.createElement('div');
+    colorWrap.className = 'image-color-wrap';
+    const colorIcon = document.createElement('span');
+    colorIcon.className = 'image-color-icon';
+    setIcon(colorIcon, ['palette', 'droplet'], '');
+    colorWrap.title = 'Color';
+    colorWrap.appendChild(colorIcon);
+    colorWrap.appendChild(colorInput);
+    toolbar.appendChild(colorWrap);
+    toolbar.appendChild(transparencyToggle);
 
     const sizeGroup = document.createElement('div');
-    sizeGroup.style.display = 'flex';
-    sizeGroup.style.flexDirection = 'column';
-    sizeGroup.style.gap = '2px';
+    sizeGroup.className = 'image-control-group';
     const sizeRow = document.createElement('div');
-    sizeRow.style.display = 'flex'; sizeRow.style.gap = '6px'; sizeRow.style.alignItems = 'center';
-    sizeRow.appendChild(sizeInput); sizeRow.appendChild(sizeNumber);
+    sizeRow.className = 'image-control-row';
+    sizeRow.appendChild(sizeMinusBtn);
+    sizeRow.appendChild(sizeInput);
+    sizeRow.appendChild(sizePlusBtn);
+    sizeRow.appendChild(sizeValue);
     sizeGroup.appendChild(sizeLabel); sizeGroup.appendChild(sizeRow);
     toolbar.appendChild(sizeGroup);
     toolbar.appendChild(fillLabel);
@@ -3827,7 +4584,7 @@ function createImagesInterface(container) {
 
     const addBtn = document.createElement('button');
     addBtn.className = 'add-image-btn';
-    addBtn.innerHTML = '+';
+    setIcon(addBtn, 'plus', '+');
     addBtn.style.cssText = `
         flex: 1 1 0;
         height: 32px;
@@ -3850,7 +4607,7 @@ function createImagesInterface(container) {
 
     const uploadBtn = document.createElement('button');
     uploadBtn.className = 'add-image-btn';
-    uploadBtn.innerHTML = 'Upload';
+    setIcon(uploadBtn, 'upload', 'Upload');
     uploadBtn.style.cssText = `
         flex: 1 1 0;
         height: 32px;
@@ -3913,8 +4670,9 @@ function createImagesInterface(container) {
     `;
 
     const zoomInBtn = document.createElement('button');
-    zoomInBtn.textContent = '+';
+    setIcon(zoomInBtn, ['zoom-in', 'search-plus', 'plus'], '+');
     zoomInBtn.className = 'zoom-btn';
+    zoomInBtn.title = 'Zoom In';
     zoomInBtn.style.cssText = `
         width: 40px;
         height: 40px;
@@ -3932,13 +4690,15 @@ function createImagesInterface(container) {
     `;
 
     const zoomOutBtn = document.createElement('button');
-    zoomOutBtn.textContent = '−';
+    setIcon(zoomOutBtn, ['zoom-out', 'search-minus', 'minus'], '−');
     zoomOutBtn.className = 'zoom-btn';
+    zoomOutBtn.title = 'Zoom Out';
     zoomOutBtn.style.cssText = zoomInBtn.style.cssText;
 
     const zoomResetBtn = document.createElement('button');
-    zoomResetBtn.textContent = '=';
+    setIcon(zoomResetBtn, ['rotate-ccw', 'refresh-ccw', 'rotateCcw'], '=');
     zoomResetBtn.className = 'zoom-btn';
+    zoomResetBtn.title = 'Reset Zoom';
     zoomResetBtn.style.cssText = zoomInBtn.style.cssText;
 
     zoomInBtn.addEventListener('click', () => zoomImage(1.2));
@@ -4004,6 +4764,13 @@ function createImagesInterface(container) {
         zoomResetBtn,
         setDefaultUI: () => {},
     });
+
+    // Defaults for toolbar state
+    toolButtons.brush && toolButtons.brush.classList.add('active');
+    applySymmetryMode('none');
+    refreshLucideIcons();
+    setBrushSizeUI(getBrushSizeFromUI());
+    applyColorFromUI();
 
     // After initializing the editor, ensure an image is shown immediately
     setTimeout(() => {
@@ -4211,6 +4978,7 @@ function selectImage(imagePath, thumbnailElement) {
 
     // Save to localStorage
     localStorage.setItem('lastSelectedImage', imagePath);
+    setLastSelectedImageForObject(selected_object, imagePath);
 
     // Display on editor canvas
     if (imageEditor) {
@@ -4340,6 +5108,7 @@ function deleteImage(imageItem, filename, imgInfo) {
         selectedImage = null;
         if (imageEditor) imageEditor.clear(true);
         localStorage.removeItem('lastSelectedImage');
+        setLastSelectedImageForObject(selected_object, '');
     }
 
     // Update undo menu
@@ -4459,6 +5228,7 @@ function createNewImage() {
     currentImageFilename = newInfo.name;
     currentImageInfo = newInfo;
     localStorage.setItem('lastSelectedImage', dataUrl);
+    setLastSelectedImageForObject(selected_object, dataUrl);
     selectedImage = dataUrl;
     if (imageEditor) imageEditor.loadImage(dataUrl);
 
@@ -4741,6 +5511,18 @@ function createBox(boxData) {
         // Reset editor state to avoid cross-object filename reuse
         currentImageFilename = null;
         currentImageInfo = null;
+        // Ensure images exist and point the draw screen at THIS object's image (avoid stale editor state)
+        const obj = objects.find(o => o.id == selected_object);
+        if (obj) ensureDefaultImageForObject(obj);
+        const images = getCurrentObjectImages();
+        const baseFromMedia = (obj && obj.media && obj.media[0] && obj.media[0].path) ? String(obj.media[0].path).split('?')[0] : '';
+        const remembered = getLastSelectedImageForObject(selected_object);
+        const rememberedBase = remembered ? remembered.split('?')[0] : '';
+        const chosen =
+            (baseFromMedia && images.find(img => (img.src || '').split('?')[0] === baseFromMedia)) ||
+            (rememberedBase && images.find(img => (img.src || '').split('?')[0] === rememberedBase)) ||
+            (images[0] || null);
+        selectedImage = chosen ? chosen.src : null;
         updateWorkspace();
         renderGameWindowSprite();
     });
@@ -5350,9 +6132,11 @@ function generateStandaloneHtml(project) {
 	  runtimeGlobalVariables = {};
 	  const controller = objects.find(o=>o.type==='controller' || o.name==='AppController');
 	  if (controller){
+	    // Seed public array variables
+	    try { const pubArrs = Array.isArray(controller.arrayVariables) ? controller.arrayVariables : []; pubArrs.forEach(name => { if (!Array.isArray(runtimeGlobalVariables[name])) runtimeGlobalVariables[name] = []; }); } catch(_) {}
 	    const instId = nextInstanceId++;
 	    runtimeInstances.push({ instanceId: instId, templateId: controller.id });
-	    runtimePositions[instId] = { x:0, y:0 };
+	    runtimePositions[instId] = { x:0, y:0, layer: 0 };
 	    runtimeVariables[instId] = {};
 	    const start = (controller.code||[]).find(b=>b && b.type==='start');
 	    runtimeExecState[instId] = { pc: start ? start.next_block_a : null, waitMs:0, waitingBlockId:null, repeatStack: [] };
@@ -5384,26 +6168,32 @@ function generateStandaloneHtml(project) {
 	    let steps=0;
 	    while (exec.pc!=null && steps++<maxStepsPerObject){
 	      const block = code.find(b=>b&&b.id===exec.pc); if(!block){ exec.pc=null; break; }
-	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='random_int'){ let a=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const xVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const yVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); switch(node.val_a){ case '+': return xVal + yVal; case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=Number(v)||0; return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=Number(aVal); let B=Number(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const v=runtimeGlobalVariables[varName]; return (typeof v==='number')?v:0; } } return null; };
+	      const coerceScalarLiteral=(v)=>{ if(typeof v==='number') return v; if(typeof v==='string'){ const s=v.trim(); if(s==='') return ''; const n=Number(s); return Number.isFinite(n)?n:v; } return v; };
+	      const getArrayRef=(varName,instanceOnly)=>{ const name=varName||''; const store=instanceOnly ? (runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={})) : runtimeGlobalVariables; let arr=store[name]; if(!Array.isArray(arr)){ arr=[]; store[name]=arr; } return arr; };
+	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='pixel_is_rgb'){ const c=document.getElementById('game'); if(!c) return 0; const xw=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const yw=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const p=worldToCanvas(xw,yw,c); const px=Math.round(p.x); const py=Math.round(p.y); if(!Number.isFinite(px)||!Number.isFinite(py)) return 0; if(px<0||py<0||px>=c.width||py>=c.height) return 0; const cctx=c.getContext('2d'); if(!cctx) return 0; let data; try{ data=cctx.getImageData(px,py,1,1).data; }catch(_){ return 0; } const r=data[0], g=data[1], b=data[2]; const tr=Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0))); const tg=Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0))); const tb=Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0))); return (r===tr && g===tg && b===tb) ? 1 : 0; } if(node.content==='random_int'){ let a=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const xVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const yVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); switch(node.val_a){ case '+': return xVal + yVal; case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=Number(v)||0; return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=Number(aVal); let B=Number(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const v=runtimeGlobalVariables[varName]; return (typeof v==='number')?v:0; } } if(node.content==='array_get'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); const idxVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const idx=Math.floor(Number(idxVal)); if(!Number.isFinite(idx) || idx<0 || idx>=arr.length) return ''; return arr[idx]; } if(node.content==='array_length'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); return arr.length; } return null; };
 	      if (block.type==='action'){
-	        if (block.content==='move_xy'){ const dx=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const dy=Number(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].x += dx; runtimePositions[inst.instanceId].y += dy; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='move_xy'){ const dx=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const dy=Number(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x += dx; runtimePositions[inst.instanceId].y += dy; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='move_forward'){ const distance=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const rotDeg=runtimePositions[inst.instanceId].rot || 0; const rotRad=(rotDeg)*Math.PI/180; runtimePositions[inst.instanceId].x += Math.sin(rotRad)*distance; runtimePositions[inst.instanceId].y += Math.cos(rotRad)*distance; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='rotate'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = (runtimePositions[inst.instanceId].rot||0) + Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_rotation'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='set_size'){ const s=Number(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; runtimePositions[inst.instanceId].scale = Math.max(0,s); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_size'){ const s=Number(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1,layer:0}; runtimePositions[inst.instanceId].scale = Math.max(0,s); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_layer'){ const layer=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].layer = layer; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='point_towards'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const pos=runtimePositions[inst.instanceId]; const tx=Number((block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0)); const ty=Number((block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0)); const dx=tx-(typeof pos.x==='number'?pos.x:0); const dy=ty-(typeof pos.y==='number'?pos.y:0); const ang=90 - (Math.atan2(dy,dx)*180/Math.PI); pos.rot = ang; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='change_size'){ const ds=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; const cur=runtimePositions[inst.instanceId].scale||1; runtimePositions[inst.instanceId].scale=Math.max(0,cur+ds); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='wait'){ const seconds=Math.max(0, parseFloat(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds>0){ exec.waitMs = seconds*1000; exec.waitingBlockId = block.id; exec.pc = null; } else { exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; } break; }
 	        if (block.content==='repeat'){ const times=Math.max(0, Number(block.val_a||0)); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = block.id; continue; }
 	        if (block.content==='print'){ const val=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); try{ console.log(val);}catch(_){} exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='if'){ const condVal=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const isTrue = !!condVal; exec.pc = isTrue ? ((typeof block.next_block_b==='number')?block.next_block_b:null) : ((typeof block.next_block_a==='number')?block.next_block_a:null); continue; }
-	        if (block.content==='set_x'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_x'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_y'){ const y=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].y=y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='switch_image'){ const imgs=(objectImages[String(o.id)]||[]); let found=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(typeof sel==='string'){ found=imgs.find(img=>img.name===sel);} else { found=imgs.find(img=>String(img.id)===String(sel)); } } else { found=imgs.find(img=>String(img.id)===String(block.val_a)); } if(found){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].spritePath = (found.src||'').split('?')[0]; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='instantiate'){ const objId=parseInt(block.val_a,10); const template=objects.find(obj=>obj.id===objId); if(template){ const newId=nextInstanceId++; instancesPendingCreation.push({ instanceId:newId, templateId:template.id }); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='delete_instance'){ instancesPendingRemoval.add(inst.instanceId); exec.pc=null; continue; }
 	        if (block.content==='set_variable'){ const varName=block.var_name||''; const value=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; runtimeVariables[inst.instanceId][varName]=value; } else { runtimeGlobalVariables[varName]=value; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='change_variable'){ const varName=block.var_name||''; const delta=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; const current=runtimeVariables[inst.instanceId][varName]||0; runtimeVariables[inst.instanceId][varName]=current+delta; } else { const current=runtimeGlobalVariables[varName]||0; runtimeGlobalVariables[varName]=current+delta; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='change_variable'){ const varName=block.var_name||''; const delta=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; const curVal=runtimeVariables[inst.instanceId][varName]; const current=(typeof curVal==='number')?curVal:0; runtimeVariables[inst.instanceId][varName]=current+delta; } else { const curVal=runtimeGlobalVariables[varName]; const current=(typeof curVal==='number')?curVal:0; runtimeGlobalVariables[varName]=current+delta; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='array_append'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const arr=getArrayRef(varName, !!block.var_instance_only); arr.push(value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='array_insert'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const idxVal=(block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0); let idx=Math.floor(Number(idxVal)); if(!Number.isFinite(idx)) idx=0; const arr=getArrayRef(varName, !!block.var_instance_only); idx=Math.max(0, Math.min(arr.length, idx)); arr.splice(idx,0,value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='array_delete'){ const varName=block.var_name||''; const idxVal=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0); const idx=Math.floor(Number(idxVal)); const arr=getArrayRef(varName, !!block.var_instance_only); if(Number.isFinite(idx) && idx>=0 && idx<arr.length){ arr.splice(idx,1); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='forever'){ exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:Infinity, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = block.id; continue; }
 	      }
 	      exec.pc = (typeof block.next_block_a==='number') ? block.next_block_a : null;
@@ -5415,7 +6205,7 @@ function generateStandaloneHtml(project) {
 	  }
 	  if (instancesPendingCreation && instancesPendingCreation.length>0){
 	    const createdIds = [];
-	    for (const pending of instancesPendingCreation){ const template=objects.find(o=>o.id===pending.templateId); if(!template) continue; runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId }); runtimePositions[pending.instanceId] = { x:0, y:0 }; runtimeVariables[pending.instanceId] = {}; const start=(template.code||[]).find(b=>b&&b.type==='start'); const pcT = start ? start.next_block_a : null; runtimeExecState[pending.instanceId] = { pc: pcT, waitMs:0, waitingBlockId:null, repeatStack: [] }; createdIds.push(pending.instanceId); }
+	    for (const pending of instancesPendingCreation){ const template=objects.find(o=>o.id===pending.templateId); if(!template) continue; runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId }); runtimePositions[pending.instanceId] = { x:0, y:0, layer: 0 }; runtimeVariables[pending.instanceId] = {}; try{ const arrs=Array.isArray(template.arrayVariables)?template.arrayVariables:[]; arrs.forEach(name=>{ runtimeVariables[pending.instanceId][name]=[]; }); }catch(_){} const start=(template.code||[]).find(b=>b&&b.type==='start'); const pcT = start ? start.next_block_a : null; runtimeExecState[pending.instanceId] = { pc: pcT, waitMs:0, waitingBlockId:null, repeatStack: [] }; createdIds.push(pending.instanceId); }
 	    instancesPendingCreation.length=0;
 	    if (createdIds.length>0){ const savedFilter = __stepOnlyInstanceIds; __stepOnlyInstanceIds = createdIds.slice(); try { stepInterpreter(0); } finally { __stepOnlyInstanceIds = savedFilter; } }
 	  }
@@ -5583,6 +6373,12 @@ function renderGameWindowSprite() {
                 || (tmpl && tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
             if (path) visibleEntries.push({ inst, tmpl, path });
         }
+        // Sort by layer (lower layer numbers render first, higher numbers render on top)
+        visibleEntries.sort((a, b) => {
+            const layerA = (runtimePositions[a.inst.instanceId] && typeof runtimePositions[a.inst.instanceId].layer === 'number') ? runtimePositions[a.inst.instanceId].layer : 0;
+            const layerB = (runtimePositions[b.inst.instanceId] && typeof runtimePositions[b.inst.instanceId].layer === 'number') ? runtimePositions[b.inst.instanceId].layer : 0;
+            return layerA - layerB;
+        });
     } else {
         // Don't show object previews when not playing
         visibleEntries = [];
@@ -5700,6 +6496,7 @@ function initializeImageEditor(params) {
         color: { r: 255, g: 0, b: 0, a: 1 },
         brushSize: 16,
         fill: true,
+        symmetry: 'none', // 'none' | 'x' | 'y' | 'xy'
         isDrawing: false,
         startX: 0,
         startY: 0,
@@ -5769,6 +6566,12 @@ function initializeImageEditor(params) {
     }
     function setBrushSize(s) { state.brushSize = Math.max(1, s|0); }
     function setFill(f) { state.fill = !!f; }
+    function setSymmetry(mode) {
+        const m = String(mode || 'none');
+        state.symmetry = (m === 'x' || m === 'y' || m === 'xy') ? m : 'none';
+        // Keep overlay updated (axes/crosshair)
+        try { drawCrosshair(); } catch (_) {}
+    }
     function setZoom(z) {
         state.zoom = Math.max(0.1, Math.min(8, z));
         canvas.style.transform = `scale(${state.zoom})`;
@@ -5884,7 +6687,23 @@ function initializeImageEditor(params) {
         img.src = src;
     }
 
-    function applyBrushLine(x0, y0, x1, y1) {
+    function symmetrySegmentsForLine(x0, y0, x1, y1) {
+        const mx = (x) => (canvas.width - 1) - x;
+        const my = (y) => (canvas.height - 1) - y;
+        const segs = [];
+        const seen = new Set();
+        const push = (a,b,c,d) => {
+            const key = `${a},${b},${c},${d}`;
+            if (!seen.has(key)) { seen.add(key); segs.push([a,b,c,d]); }
+        };
+        push(x0, y0, x1, y1);
+        if (state.symmetry === 'x' || state.symmetry === 'xy') push(mx(x0), y0, mx(x1), y1);
+        if (state.symmetry === 'y' || state.symmetry === 'xy') push(x0, my(y0), x1, my(y1));
+        if (state.symmetry === 'xy') push(mx(x0), my(y0), mx(x1), my(y1));
+        return segs;
+    }
+
+    function applyBrushLineRaw(x0, y0, x1, y1) {
         ctx.save();
         const isErase = state.color.a <= 0.01;
         ctx.globalCompositeOperation = isErase ? 'destination-out' : 'source-over';
@@ -5897,6 +6716,11 @@ function initializeImageEditor(params) {
         ctx.lineTo(x1, y1);
         ctx.stroke();
         ctx.restore();
+    }
+
+    function applyBrushLine(x0, y0, x1, y1) {
+        const segs = symmetrySegmentsForLine(x0, y0, x1, y1);
+        segs.forEach(([a,b,c,d]) => applyBrushLineRaw(a,b,c,d));
         // Crosshair is on overlay, no need to redraw
         updateGameObjectIcon();
     }
@@ -5933,14 +6757,36 @@ function initializeImageEditor(params) {
         const overlay = ensureOverlay();
         const octx = overlay.getContext('2d');
 
-        // Clear any previous crosshair
-        octx.clearRect(0, 0, overlay.width, overlay.height);
+        // If a selection overlay exists, draw it first (so crosshair/axes sit on top).
+        if (state.selection) drawSelectionOverlay();
+        else octx.clearRect(0, 0, overlay.width, overlay.height);
 
         const centerX = overlay.width / 2;
         const centerY = overlay.height / 2;
         const size = 12; // Smaller size of crosshair arms
 
         octx.save();
+        // Symmetry axes (subtle)
+        if (state.symmetry === 'x' || state.symmetry === 'xy') {
+            octx.strokeStyle = '#00ffcc';
+            octx.lineWidth = 1;
+            octx.globalAlpha = 0.22;
+            octx.beginPath();
+            octx.moveTo(centerX + 0.5, 0);
+            octx.lineTo(centerX + 0.5, overlay.height);
+            octx.stroke();
+        }
+        if (state.symmetry === 'y' || state.symmetry === 'xy') {
+            octx.strokeStyle = '#00ffcc';
+            octx.lineWidth = 1;
+            octx.globalAlpha = 0.22;
+            octx.beginPath();
+            octx.moveTo(0, centerY + 0.5);
+            octx.lineTo(overlay.width, centerY + 0.5);
+            octx.stroke();
+        }
+
+        // Crosshair center marker
         octx.strokeStyle = '#ffffff';
         octx.lineWidth = 1;
         octx.globalAlpha = 0.7;
@@ -6318,19 +7164,28 @@ function initializeImageEditor(params) {
             }
             const rx0 = Math.min(x0,x1), ry0 = Math.min(y0,y1), rx1 = Math.max(x0,x1), ry1 = Math.max(y0,y1);
             const rw = rx1 - rx0, rh = ry1 - ry0;
+            // If transparency/eraser mode is on, commit directly to the main canvas (like the brush tool).
+            // Offscreen "selection layer" compositing can't erase the destination canvas when later drawn via drawImage.
+            if (state.color.a <= 0.01) {
+                pushUndo();
+                commitRect(rx0, ry0, rx1, ry1);
+                clearOverlay();
+                updateGameObjectIcon();
+                saveToDisk();
+                return;
+            }
             // create floating selection layer with the rect drawn on it
             const layer = document.createElement('canvas');
             layer.width = Math.max(1, rw); layer.height = Math.max(1, rh);
             const lctx = layer.getContext('2d');
-            const isErase = state.color.a <= 0.01;
             lctx.save();
-            lctx.globalCompositeOperation = isErase ? 'destination-out' : 'source-over';
-            if (state.fill && !isErase) {
+            lctx.globalCompositeOperation = 'source-over';
+            if (state.fill) {
                 lctx.fillStyle = rgbaString();
                 lctx.fillRect(0, 0, rw, rh);
             } else {
                 lctx.lineWidth = Math.max(1, state.brushSize);
-                lctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+                lctx.strokeStyle = rgbaString();
                 lctx.strokeRect(0.5, 0.5, rw, rh);
             }
             lctx.restore();
@@ -6347,20 +7202,28 @@ function initializeImageEditor(params) {
             }
             const cx0 = Math.min(x0,x1), cy0 = Math.min(y0,y1), cx1 = Math.max(x0,x1), cy1 = Math.max(y0,y1);
             const cw = cx1 - cx0, ch = cy1 - cy0;
+            // If transparency/eraser mode is on, commit directly to the main canvas (like the brush tool).
+            if (state.color.a <= 0.01) {
+                pushUndo();
+                commitCircle(cx0, cy0, cx1, cy1);
+                clearOverlay();
+                updateGameObjectIcon();
+                saveToDisk();
+                return;
+            }
             const layer = document.createElement('canvas');
             layer.width = Math.max(1, cw); layer.height = Math.max(1, ch);
             const lctx = layer.getContext('2d');
-            const isErase = state.color.a <= 0.01;
             lctx.save();
-            lctx.globalCompositeOperation = isErase ? 'destination-out' : 'source-over';
+            lctx.globalCompositeOperation = 'source-over';
             lctx.beginPath();
             lctx.ellipse(cw/2, ch/2, Math.abs(cw/2), Math.abs(ch/2), 0, 0, Math.PI * 2);
-            if (state.fill && !isErase) {
+            if (state.fill) {
                 lctx.fillStyle = rgbaString();
                 lctx.fill();
             } else {
                 lctx.lineWidth = Math.max(1, state.brushSize);
-                lctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+                lctx.strokeStyle = rgbaString();
                 lctx.stroke();
             }
             lctx.restore();
@@ -6434,7 +7297,7 @@ function initializeImageEditor(params) {
     params.zoomResetBtn.addEventListener('click', () => setZoom(1));
 
     // Public API
-    const api = { setTool, setColor, setBrushSize, setFill, setZoom, clear, loadImage, undo, redo, drawCrosshair };
+    const api = { setTool, setColor, setBrushSize, setFill, setSymmetry, setZoom, clear, loadImage, undo, redo, drawCrosshair };
     // Defaults
     setColor('#ff0000', 1);
     setBrushSize(16);
