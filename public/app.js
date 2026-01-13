@@ -6504,9 +6504,26 @@ function initializeImageEditor(params) {
         lastY: 0,
         selection: null, // { x, y, w, h, layerCanvas, offsetX, offsetY, dragging }
         zoom: 1.0,
+        panX: 0, // screen px; positive moves canvas right
+        panY: 0, // screen px; positive moves canvas down
+        isPanning: false,
+        panPointerId: null,
+        _lastPanClientX: 0,
+        _lastPanClientY: 0,
         undoStack: [],
         redoStack: [],
     };
+
+    function updateViewTransform() {
+        // Pan in screen pixels (applied after scaling via transform order), then zoom.
+        canvas.style.transform = `translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
+        const overlay = wrapper.querySelector('canvas.__overlay');
+        if (overlay) {
+            overlay.style.setProperty('--zoom', state.zoom);
+            overlay.style.setProperty('--pan-x', `${state.panX}px`);
+            overlay.style.setProperty('--pan-y', `${state.panY}px`);
+        }
+    }
 
     function rgbaString() {
         const c = state.color;
@@ -6574,12 +6591,32 @@ function initializeImageEditor(params) {
     }
     function setZoom(z) {
         state.zoom = Math.max(0.1, Math.min(8, z));
-        canvas.style.transform = `scale(${state.zoom})`;
-        const overlay = wrapper.querySelector('canvas.__overlay');
-        if (overlay) {
-            overlay.style.setProperty('--zoom', state.zoom);
-        }
+        updateViewTransform();
         // Crosshair is automatically scaled with overlay
+    }
+    function panBy(dx, dy) {
+        // dx/dy are screen pixels to move the canvas by (positive right/down).
+        state.panX += dx;
+        state.panY += dy;
+        updateViewTransform();
+    }
+    function zoomAboutClientPoint(clientX, clientY, newZoom) {
+        const z0 = state.zoom;
+        const z1 = Math.max(0.1, Math.min(8, newZoom));
+        if (z1 === z0) return;
+        // Compute cursor vector from current canvas center in screen pixels.
+        const rect = canvas.getBoundingClientRect();
+        const vx = clientX - rect.left - rect.width / 2;
+        const vy = clientY - rect.top - rect.height / 2;
+        // Convert to canvas-space offset from center (unclamped).
+        const ox = vx / z0;
+        const oy = vy / z0;
+        // Adjust pan so the same canvas-space point stays under the cursor after zoom.
+        // New center needs to shift by -(ox*z1 - ox*z0) = -ox*(z1 - z0)
+        state.panX += -ox * (z1 - z0);
+        state.panY += -oy * (z1 - z0);
+        state.zoom = z1;
+        updateViewTransform();
     }
 
     async function saveToDisk(forceNewName) {
@@ -6737,6 +6774,8 @@ function initializeImageEditor(params) {
             overlay.style.top = '50%';
             overlay.style.left = '50%';
             overlay.style.setProperty('--zoom', state.zoom);
+            overlay.style.setProperty('--pan-x', `${state.panX}px`);
+            overlay.style.setProperty('--pan-y', `${state.panY}px`);
             overlay.style.transformOrigin = 'center';
             wrapper.appendChild(overlay);
         }
@@ -6940,11 +6979,15 @@ function initializeImageEditor(params) {
             overlay.style.top = '50%';
             overlay.style.left = '50%';
             overlay.style.setProperty('--zoom', state.zoom);
+            overlay.style.setProperty('--pan-x', `${state.panX}px`);
+            overlay.style.setProperty('--pan-y', `${state.panY}px`);
             overlay.style.transformOrigin = 'center';
             wrapper.appendChild(overlay);
         } else {
             overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
             overlay.style.setProperty('--zoom', state.zoom);
+            overlay.style.setProperty('--pan-x', `${state.panX}px`);
+            overlay.style.setProperty('--pan-y', `${state.panY}px`);
         }
         const octx = overlay.getContext('2d');
         octx.clearRect(0, 0, overlay.width, overlay.height);
@@ -7256,13 +7299,86 @@ function initializeImageEditor(params) {
         }
     });
 
-    // Mouse wheel zoom
+    // Pan/zoom controls:
+    // - Trackpad: two-finger pan (wheel deltaX/deltaY), pinch zoom (wheel + ctrlKey on macOS)
+    // - Mouse: wheel zoom, middle-button drag pan
+    // Tunables
+    // - Trackpad pan: lower = slower
+    // - Mouse wheel zoom: larger step = more aggressive per notch
+    const TRACKPAD_PAN_SPEED = 0.85;
+    const MOUSE_WHEEL_ZOOM_STEP_IN = 1.18;
+    const MOUSE_WHEEL_ZOOM_STEP_OUT = 0.85;
+    function isLikelyTrackpadWheel(e) {
+        // Heuristic: trackpads tend to emit pixel deltas (deltaMode=0) with small/fractional deltas,
+        // often with both deltaX and deltaY. Mouse wheels are commonly larger/step-like.
+        if (e.deltaMode !== 0) return false;
+        const ax = Math.abs(e.deltaX || 0);
+        const ay = Math.abs(e.deltaY || 0);
+        if (ax > 0 && ay > 0) return true;
+        if (ay > 0 && ay < 50) return true;
+        if (ax > 0 && ax < 50) return true;
+        return false;
+    }
     wrapper.addEventListener('wheel', (e) => {
+        // Keep the editor from scrolling the page/panels while interacting.
         e.preventDefault();
-        const delta = e.deltaY < 0 ? 1.1 : 0.9;
-        setZoom(state.zoom * delta);
+
+        // Pinch zoom (macOS trackpad commonly reports this as wheel with ctrlKey=true)
+        if (e.ctrlKey) {
+            // Smooth exponential zoom; deltaY sign: negative -> zoom in, positive -> zoom out
+            const factor = Math.exp(-e.deltaY * 0.01);
+            zoomAboutClientPoint(e.clientX, e.clientY, state.zoom * factor);
+            imageZoom = state.zoom;
+            return;
+        }
+
+        // Two-finger trackpad pan
+        if (isLikelyTrackpadWheel(e)) {
+            // Natural scrolling: wheel delta down should move the view down (canvas up), so invert.
+            panBy(-(e.deltaX || 0) * TRACKPAD_PAN_SPEED, -(e.deltaY || 0) * TRACKPAD_PAN_SPEED);
+            return;
+        }
+
+        // Mouse wheel zoom (discrete)
+        const step = e.deltaY < 0 ? MOUSE_WHEEL_ZOOM_STEP_IN : MOUSE_WHEEL_ZOOM_STEP_OUT;
+        zoomAboutClientPoint(e.clientX, e.clientY, state.zoom * step);
         imageZoom = state.zoom;
     }, { passive: false });
+
+    function onPanPointerDown(e) {
+        // Middle mouse button drag to pan
+        if (e.pointerType !== 'mouse') return;
+        if (e.button !== 1) return;
+        e.preventDefault();
+        e.stopPropagation();
+        state.isPanning = true;
+        state.panPointerId = e.pointerId;
+        state._lastPanClientX = e.clientX;
+        state._lastPanClientY = e.clientY;
+        try { wrapper.setPointerCapture(e.pointerId); } catch (_) {}
+        wrapper.style.cursor = 'grabbing';
+    }
+    function onPanPointerMove(e) {
+        if (!state.isPanning) return;
+        if (state.panPointerId != null && e.pointerId !== state.panPointerId) return;
+        e.preventDefault();
+        const dx = e.clientX - state._lastPanClientX;
+        const dy = e.clientY - state._lastPanClientY;
+        state._lastPanClientX = e.clientX;
+        state._lastPanClientY = e.clientY;
+        panBy(dx, dy);
+    }
+    function endPan(e) {
+        if (!state.isPanning) return;
+        if (state.panPointerId != null && e && e.pointerId != null && e.pointerId !== state.panPointerId) return;
+        state.isPanning = false;
+        state.panPointerId = null;
+        wrapper.style.cursor = '';
+    }
+    wrapper.addEventListener('pointerdown', onPanPointerDown);
+    wrapper.addEventListener('pointermove', onPanPointerMove);
+    wrapper.addEventListener('pointerup', endPan);
+    wrapper.addEventListener('pointercancel', endPan);
 
     // Keyboard shortcuts for undo/redo
     document.addEventListener('keydown', (e) => {

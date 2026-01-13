@@ -1347,7 +1347,8 @@ input[type="color"] {
   position: absolute !important;
   top: 50% !important;
   left: 50% !important;
-  transform: translate(-50%, -50%) scale(var(--zoom, 1)) !important;
+  /* Keep overlay perfectly aligned with the main editor canvas under pan+zoom */
+  transform: translate(-50%, -50%) translate(var(--pan-x, 0px), var(--pan-y, 0px)) scale(var(--zoom, 1)) !important;
   transform-origin: center !important;
   pointer-events: none !important;
   z-index: 1 !important;
