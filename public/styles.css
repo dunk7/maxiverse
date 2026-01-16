@@ -1094,6 +1094,17 @@ button {
   stroke: currentColor;
 }
 
+/* Icon fallback: ensures buttons never render "blank" if lucide fails to replace data-lucide tags */
+.icon-fallback {
+  display: inline-block;
+  line-height: 1;
+}
+.zoom-btn svg + .icon-fallback,
+.image-edit-tool svg + .icon-fallback,
+.image-step-btn svg + .icon-fallback {
+  display: none;
+}
+
 input[type="number"] {
   background: #222;
   color: #eee;

@@ -4304,23 +4304,30 @@ function createImagesInterface(container) {
 
     function setIcon(el, iconNameOrNames, fallbackText) {
         const names = Array.isArray(iconNameOrNames) ? iconNameOrNames : [iconNameOrNames];
-        // Prefer programmatic SVG rendering when available (gives us a reliable fallback).
+        const primary = names[0];
         const lucide = window.lucide;
+
+        // Always render a visible fallback so buttons never look "blank" if icon rendering fails.
+        // If lucide succeeds, CSS hides the fallback when an SVG is present.
+        const safeFallback = (fallbackText == null) ? '' : String(fallbackText);
+
+        // Prefer direct SVG rendering when available.
         if (lucide && lucide.icons) {
             const found = names.find(n => lucide.icons && lucide.icons[n]);
             const iconDef = found ? lucide.icons[found] : null;
             if (iconDef && typeof iconDef.toSvg === 'function') {
-                el.innerHTML = iconDef.toSvg({ width: 18, height: 18 });
+                el.innerHTML = `${iconDef.toSvg({ width: 18, height: 18 })}<span class="icon-fallback">${safeFallback}</span>`;
                 return;
             }
         }
-        // Fallback to createIcons() + data-lucide if that's all we have.
+
+        // Fallback to createIcons() + data-lucide scan.
         if (lucide && typeof lucide.createIcons === 'function') {
-            const primary = names[0];
-            el.innerHTML = `<i data-lucide="${primary}"></i>`;
+            el.innerHTML = `<i data-lucide="${primary}"></i><span class="icon-fallback">${safeFallback}</span>`;
             return;
         }
-        el.textContent = fallbackText || '';
+
+        el.textContent = safeFallback;
     }
 
     function refreshLucideIcons() {
@@ -5149,19 +5156,24 @@ function handleEditAction(action) {
 
     switch(action) {
         case 'undo':
-            undoLastDeletion();
+            if (activeTab === 'images' && imageEditor && typeof imageEditor.undo === 'function') imageEditor.undo();
+            else undoLastDeletion();
             break;
         case 'cut':
-            console.log('Cut action - not implemented yet');
+            if (activeTab === 'images' && imageEditor && typeof imageEditor.cut === 'function') imageEditor.cut();
+            else console.log('Cut action - not available in this tab');
             break;
         case 'copy':
-            console.log('Copy action - not implemented yet');
+            if (activeTab === 'images' && imageEditor && typeof imageEditor.copy === 'function') imageEditor.copy();
+            else console.log('Copy action - not available in this tab');
             break;
         case 'paste':
-            console.log('Paste action - not implemented yet');
+            if (activeTab === 'images' && imageEditor && typeof imageEditor.paste === 'function') imageEditor.paste();
+            else console.log('Paste action - not available in this tab');
             break;
         case 'selectAll':
-            console.log('Select All action - not implemented yet');
+            if (activeTab === 'images' && imageEditor && typeof imageEditor.selectAll === 'function') imageEditor.selectAll();
+            else console.log('Select All action - not available in this tab');
             break;
     }
 
@@ -6963,7 +6975,17 @@ function initializeImageEditor(params) {
         const imageData = ctx.getImageData(x0, y0, w, h);
         lctx.putImageData(imageData, 0, 0);
         ctx.clearRect(x0, y0, w, h);
-        state.selection = { x: x0, y: y0, w, h, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0 };
+        state.selection = {
+            x: x0, y: y0, w, h,
+            layerCanvas: layer,
+            dragging: false,
+            offsetX: 0,
+            offsetY: 0,
+            resizing: null,
+            _orig: null,
+            _initial: { x: x0, y: y0, w, h },
+            _cutFromCanvas: true,
+        };
         drawSelectionOverlay();
     }
     function drawSelectionOverlay() {
@@ -7011,19 +7033,101 @@ function initializeImageEditor(params) {
     }
     function commitSelection() {
         if (!state.selection || !state.selection.layerCanvas) return;
-        pushUndo();
+        // If this selection came from the select tool (cut-out), undo was already pushed when we cleared the canvas.
+        if (!state.selection._cutFromCanvas) pushUndo();
         // Clamp selection position to canvas bounds
         state.selection.x = Math.max(0, Math.min(canvas.width - state.selection.w, state.selection.x));
         state.selection.y = Math.max(0, Math.min(canvas.height - state.selection.h, state.selection.y));
         // draw scaled to current width/height
         ctx.drawImage(state.selection.layerCanvas, state.selection.x, state.selection.y, state.selection.w, state.selection.h);
         state.selection = null;
-        // Crosshair is on overlay, no need to redraw
-        const overlay = wrapper.querySelector('canvas.__overlay');
-        if (overlay) overlay.remove();
+        // Clear selection overlay but keep crosshair/axes visible
+        clearOverlay();
         updateGameObjectIcon();
         saveToDisk();
-        // Crosshair will be redrawn when overlay is recreated
+    }
+
+    function cancelSelection() {
+        if (!state.selection) return;
+        if (state.selection.layerCanvas && state.selection._cutFromCanvas && state.selection._initial) {
+            const init = state.selection._initial;
+            ctx.drawImage(state.selection.layerCanvas, init.x, init.y, init.w, init.h);
+            updateGameObjectIcon();
+            saveToDisk();
+        }
+        state.selection = null;
+        clearOverlay();
+    }
+
+    function deleteSelectionContents() {
+        if (!state.selection || !state.selection.layerCanvas) return;
+        const empty = document.createElement('canvas');
+        empty.width = Math.max(1, state.selection.layerCanvas.width);
+        empty.height = Math.max(1, state.selection.layerCanvas.height);
+        state.selection.layerCanvas = empty;
+        drawSelectionOverlay();
+    }
+
+    // Internal clipboard for the image editor (keeps this fast + works without OS clipboard permissions)
+    let clipboardCanvas = null;
+    function copySelectionToClipboard() {
+        const src = (state.selection && state.selection.layerCanvas) ? state.selection.layerCanvas : canvas;
+        const clip = document.createElement('canvas');
+        clip.width = Math.max(1, src.width);
+        clip.height = Math.max(1, src.height);
+        clip.getContext('2d').drawImage(src, 0, 0);
+        clipboardCanvas = clip;
+    }
+    function cutSelectionToClipboard() {
+        if (!state.selection || !state.selection.layerCanvas) return;
+        copySelectionToClipboard();
+        deleteSelectionContents();
+    }
+    function pasteFromClipboard() {
+        if (!clipboardCanvas) return;
+        if (state.selection && state.selection.layerCanvas) commitSelection();
+        const layer = document.createElement('canvas');
+        layer.width = clipboardCanvas.width;
+        layer.height = clipboardCanvas.height;
+        layer.getContext('2d').drawImage(clipboardCanvas, 0, 0);
+        const x0 = Math.floor((canvas.width - layer.width) / 2);
+        const y0 = Math.floor((canvas.height - layer.height) / 2);
+        const sx = Math.max(0, x0), sy = Math.max(0, y0);
+        const sw = Math.min(canvas.width, layer.width), sh = Math.min(canvas.height, layer.height);
+        state.selection = {
+            x: sx, y: sy, w: sw, h: sh,
+            layerCanvas: layer,
+            dragging: false,
+            offsetX: 0,
+            offsetY: 0,
+            resizing: null,
+            _orig: null,
+            _initial: { x: sx, y: sy, w: sw, h: sh },
+            _cutFromCanvas: false,
+        };
+        drawSelectionOverlay();
+        drawCrosshair();
+    }
+    function selectAll() {
+        if (state.selection && state.selection.layerCanvas) commitSelection();
+        pushUndo();
+        const layer = document.createElement('canvas');
+        layer.width = canvas.width;
+        layer.height = canvas.height;
+        layer.getContext('2d').drawImage(canvas, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        state.selection = {
+            x: 0, y: 0, w: canvas.width, h: canvas.height,
+            layerCanvas: layer,
+            dragging: false,
+            offsetX: 0,
+            offsetY: 0,
+            resizing: null,
+            _orig: null,
+            _initial: { x: 0, y: 0, w: canvas.width, h: canvas.height },
+            _cutFromCanvas: true,
+        };
+        drawSelectionOverlay();
     }
     function getSelectionHandles(handleSize) {
         const s = state.selection;
@@ -7102,6 +7206,16 @@ function initializeImageEditor(params) {
     }
     function onMouseMove(e) {
         if (!state.isDrawing) {
+            // Cursor polish for selection tool (handles + move)
+            if (activeTab === 'images' && state.tool === 'select' && state.selection && !state.selection.dragging && !state.selection.resizing) {
+                try {
+                    const p = canvasToLocal(e);
+                    const handle = hitTestHandle(p.x, p.y);
+                    const inside = p.x >= state.selection.x && p.x < state.selection.x + state.selection.w && p.y >= state.selection.y && p.y < state.selection.y + state.selection.h;
+                    const cursors = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize' };
+                    wrapper.style.cursor = handle ? (cursors[handle] || 'default') : (inside ? 'move' : '');
+                } catch (_) {}
+            }
             if (state.selection && state.selection.resizing) {
                 const p = canvasToLocal(e);
                 const s = state.selection;
@@ -7233,7 +7347,7 @@ function initializeImageEditor(params) {
             }
             lctx.restore();
             // floating selection (draggable/resizable)
-            state.selection = { x: rx0, y: ry0, w: rw, h: rh, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null };
+            state.selection = { x: rx0, y: ry0, w: rw, h: rh, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null, _orig: null, _initial: { x: rx0, y: ry0, w: rw, h: rh }, _cutFromCanvas: false };
             drawSelectionOverlay();
             clearOverlay();
         } else if (state.tool === 'circle') {
@@ -7270,7 +7384,7 @@ function initializeImageEditor(params) {
                 lctx.stroke();
             }
             lctx.restore();
-            state.selection = { x: cx0, y: cy0, w: cw, h: ch, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null };
+            state.selection = { x: cx0, y: cy0, w: cw, h: ch, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null, _orig: null, _initial: { x: cx0, y: cy0, w: cw, h: ch }, _cutFromCanvas: false };
             drawSelectionOverlay();
             clearOverlay();
         } else if (state.tool === 'brush') {
@@ -7380,16 +7494,53 @@ function initializeImageEditor(params) {
     wrapper.addEventListener('pointerup', endPan);
     wrapper.addEventListener('pointercancel', endPan);
 
-    // Keyboard shortcuts for undo/redo
+    // Keyboard shortcuts for undo/redo + selection editing
     document.addEventListener('keydown', (e) => {
         if (activeTab !== 'images') return;
+        // Don't steal shortcuts while typing in inputs.
+        const t = e.target;
+        const tag = t && t.tagName ? String(t.tagName).toLowerCase() : '';
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || (t && t.isContentEditable)) return;
+
         const isMeta = e.ctrlKey || e.metaKey;
         if (isMeta && e.key.toLowerCase() === 'z') {
             e.preventDefault();
             if (e.shiftKey) redo(); else undo();
+            return;
         }
+
+        // Copy/Cut/Paste/Select All
+        if (isMeta && e.key.toLowerCase() === 'c') { e.preventDefault(); copySelectionToClipboard(); return; }
+        if (isMeta && e.key.toLowerCase() === 'x') { e.preventDefault(); cutSelectionToClipboard(); return; }
+        if (isMeta && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteFromClipboard(); return; }
+        if (isMeta && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
+
         if (e.key === 'Escape') {
-            if (state.selection) commitSelection();
+            if (state.selection) { e.preventDefault(); cancelSelection(); }
+            return;
+        }
+        if (e.key === 'Enter') {
+            if (state.selection && state.selection.layerCanvas) { e.preventDefault(); commitSelection(); }
+            return;
+        }
+        if (e.key === 'Backspace' || e.key === 'Delete') {
+            if (state.selection && state.selection.layerCanvas) { e.preventDefault(); deleteSelectionContents(); }
+            return;
+        }
+
+        // Nudge selection with arrow keys
+        if (state.selection && state.selection.layerCanvas && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) {
+            e.preventDefault();
+            const step = e.shiftKey ? 10 : 1;
+            let dx = 0, dy = 0;
+            if (e.key === 'ArrowUp') dy = -step;
+            if (e.key === 'ArrowDown') dy = step;
+            if (e.key === 'ArrowLeft') dx = -step;
+            if (e.key === 'ArrowRight') dx = step;
+            state.selection.x = Math.max(0, Math.min(canvas.width - state.selection.w, state.selection.x + dx));
+            state.selection.y = Math.max(0, Math.min(canvas.height - state.selection.h, state.selection.y + dy));
+            drawSelectionOverlay();
+            return;
         }
     });
 
@@ -7413,7 +7564,16 @@ function initializeImageEditor(params) {
     params.zoomResetBtn.addEventListener('click', () => setZoom(1));
 
     // Public API
-    const api = { setTool, setColor, setBrushSize, setFill, setSymmetry, setZoom, clear, loadImage, undo, redo, drawCrosshair };
+    const api = {
+        setTool, setColor, setBrushSize, setFill, setSymmetry, setZoom, clear, loadImage, undo, redo, drawCrosshair,
+        // Used by Edit menu in the Images tab
+        cut: cutSelectionToClipboard,
+        copy: copySelectionToClipboard,
+        paste: pasteFromClipboard,
+        selectAll,
+        commitSelection,
+        cancelSelection,
+    };
     // Defaults
     setColor('#ff0000', 1);
     setBrushSize(16);
