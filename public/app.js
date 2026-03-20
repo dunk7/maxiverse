@@ -4161,6 +4161,8 @@ function ensureDefaultImageForObject(obj) {
     const key = String(obj.id);
     if (!objectImages[key]) objectImages[key] = [];
     if (objectImages[key].length === 0) {
+        // Last image(s) were deleted but may still be undoable — don't seed a blank on top.
+        if ((deletedImagesMap[key] || []).length > 0) return;
         const blank = generateBlankImageDataUrl();
         // Always start with image-1 for new objects
         const imgInfo = { id: Date.now(), name: `image-1`, src: blank };
@@ -4201,7 +4203,7 @@ function reorderImages(draggedImageName, targetImageName) {
     images.splice(targetIndex, 0, draggedImage);
 
     // Refresh the thumbnail display
-    const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+    const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
     if (thumbnailsContainer) {
         loadImagesFromDirectory(thumbnailsContainer);
     }
@@ -4292,11 +4294,6 @@ function createImagesInterface(container) {
     // Create top editing panel
     const editingPanel = document.createElement('div');
     editingPanel.className = 'image-editing-panel';
-    editingPanel.style.cssText = `
-        height: 60px;
-        display: flex;
-        align-items: center;
-    `;
 
     // Drawing tools toolbar
     const toolbar = document.createElement('div');
@@ -4342,6 +4339,29 @@ function createImagesInterface(container) {
         { id: 'select', icon: ['lasso-select', 'lasso', 'selection'], fallback: 'S', title: 'Select' },
     ];
     const toolButtons = {};
+    function updateShapeToolFillIndicators() {
+        if (!imageEditor || !imageEditor.getFill) return;
+        const fill = imageEditor.getFill();
+        const rectBtn = toolButtons.rect;
+        const circBtn = toolButtons.circle;
+        if (rectBtn) {
+            rectBtn.classList.toggle('shape-fill', fill);
+            rectBtn.classList.toggle('shape-outline', !fill);
+            setIcon(rectBtn, fill ? ['square'] : ['square-dashed', 'square'], '▭');
+            rectBtn.title = fill
+                ? 'Rectangle (filled) — click again for outline'
+                : 'Rectangle (outline) — click again for fill';
+        }
+        if (circBtn) {
+            circBtn.classList.toggle('shape-fill', fill);
+            circBtn.classList.toggle('shape-outline', !fill);
+            setIcon(circBtn, ['circle'], '◯');
+            circBtn.title = fill
+                ? 'Circle (filled) — click again for outline'
+                : 'Circle (outline) — click again for fill';
+        }
+        refreshLucideIcons();
+    }
     toolNames.forEach(t => {
         const btn = document.createElement('button');
         setIcon(btn, t.icon, t.fallback);
@@ -4349,9 +4369,15 @@ function createImagesInterface(container) {
         btn.dataset.tool = t.id;
         btn.title = t.title;
         btn.addEventListener('click', () => {
+            if (imageEditor && (t.id === 'rect' || t.id === 'circle') && imageEditor.getTool && imageEditor.getTool() === t.id) {
+                imageEditor.toggleFill();
+                updateShapeToolFillIndicators();
+                return;
+            }
             if (imageEditor) imageEditor.setTool(t.id);
             Object.values(toolButtons).forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
+            updateShapeToolFillIndicators();
         });
         toolButtons[t.id] = btn;
         toolbar.appendChild(btn);
@@ -4396,88 +4422,363 @@ function createImagesInterface(container) {
     });
     toolbar.appendChild(symmetryBtn);
 
-    // Color picker + Transparency toggle
+    const RECENT_IMAGE_COLORS_KEY = 'maxiverseImageRecentColors';
+    function normalizeImageHex(s) {
+        if (typeof s !== 'string') return null;
+        let h = s.trim();
+        if (!h.startsWith('#')) h = `#${h}`;
+        if (/^#([0-9a-f]{3})$/i.test(h)) {
+            const m = h.slice(1);
+            return (`#${m[0]}${m[0]}${m[1]}${m[1]}${m[2]}${m[2]}`).toLowerCase();
+        }
+        if (/^#([0-9a-f]{6})$/i.test(h)) return h.toLowerCase();
+        return null;
+    }
+    function rgbToHex(r, g, b) {
+        return `#${[r, g, b]
+            .map((x) => {
+                const v = Math.max(0, Math.min(255, x | 0));
+                return v.toString(16).padStart(2, '0');
+            })
+            .join('')}`;
+    }
+    function hslToRgb(h, s, l) {
+        h /= 360;
+        let r;
+        let g;
+        let b;
+        if (s === 0) {
+            r = g = b = l;
+        } else {
+            const hue2rgb = (p, q, t) => {
+                if (t < 0) t += 1;
+                if (t > 1) t -= 1;
+                if (t < 1 / 6) return p + (q - p) * 6 * t;
+                if (t < 1 / 2) return q;
+                if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+                return p;
+            };
+            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+            const p = 2 * l - q;
+            r = hue2rgb(p, q, h + 1 / 3);
+            g = hue2rgb(p, q, h);
+            b = hue2rgb(p, q, h - 1 / 3);
+        }
+        return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+    }
+    function hslToHex(hDeg, s01, l01) {
+        const [r, g, b] = hslToRgb(hDeg, s01, l01);
+        return rgbToHex(r, g, b);
+    }
+    function buildImageColorPopupGridHexes() {
+        const seen = new Set();
+        const out = [];
+        const add = (hex) => {
+            const n = normalizeImageHex(hex);
+            if (n && !seen.has(n)) {
+                seen.add(n);
+                out.push(n);
+            }
+        };
+        [
+            '#000000',
+            '#0f0f0f',
+            '#1a1a1a',
+            '#2a2a2a',
+            '#404040',
+            '#5c5c5c',
+            '#787878',
+            '#9e9e9e',
+            '#bdbdbd',
+            '#e0e0e0',
+            '#f5f5f5',
+            '#ffffff',
+        ].forEach(add);
+        ['#1b0f0a', '#3e2723', '#5d4037', '#6d4c41', '#8d6e63', '#a1887f', '#bcaaa4', '#d7ccc8'].forEach(add);
+        ['#1a237e', '#283593', '#3949ab', '#5c6bc0', '#7e57c2', '#8e24aa', '#ad1457', '#c62828', '#d84315', '#ef6c00', '#f9a825', '#f57f17', '#558b2f', '#33691e', '#00695c', '#00838f', '#0277bd'].forEach(add);
+        for (let L = 0.26; L <= 0.74; L += 0.12) {
+            for (let hue = 0; hue < 360; hue += 24) {
+                add(hslToHex(hue, 0.82, L));
+            }
+        }
+        for (let hue = 0; hue < 360; hue += 20) {
+            add(hslToHex(hue, 0.42, 0.86));
+        }
+        for (let hue = 0; hue < 360; hue += 20) {
+            add(hslToHex(hue, 0.92, 0.2));
+        }
+        for (let hue = 0; hue < 360; hue += 30) {
+            add(hslToHex(hue, 0.18, 0.48));
+        }
+        return out;
+    }
+    function readRecentImageColors() {
+        try {
+            const raw = localStorage.getItem(RECENT_IMAGE_COLORS_KEY);
+            const arr = raw ? JSON.parse(raw) : [];
+            if (!Array.isArray(arr)) return [];
+            return arr.map(normalizeImageHex).filter(Boolean).slice(0, 7);
+        } catch (_) {
+            return [];
+        }
+    }
+    function writeRecentImageColors(arr) {
+        try {
+            localStorage.setItem(RECENT_IMAGE_COLORS_KEY, JSON.stringify(arr.slice(0, 7)));
+        } catch (_) {}
+    }
+
+    // Color: opaque from picker; transparent control = alpha 0 (erase)
+    let paintAlpha = 1;
     const colorInput = document.createElement('input');
     colorInput.type = 'color';
     colorInput.value = '#ff0000';
-    colorInput.title = 'Color';
-    colorInput.className = 'image-color';
-    colorInput.style.width = '36px';
-    colorInput.style.height = '36px';
-    colorInput.style.borderRadius = '6px';
-    colorInput.style.padding = '0';
-    const transparencyToggle = document.createElement('label');
-    transparencyToggle.className = 'image-toggle';
-    transparencyToggle.title = 'Transparency: Off';
-    const transparencyCheckbox = document.createElement('input');
-    transparencyCheckbox.type = 'checkbox';
-    transparencyCheckbox.checked = false;
-    transparencyCheckbox.className = 'image-toggle-input';
-    const transparencySwitch = document.createElement('span');
-    transparencySwitch.className = 'image-toggle-switch';
-    const transparencyText = document.createElement('span');
-    transparencyText.className = 'image-toggle-label';
-    transparencyText.textContent = 'Transparent';
-    transparencyToggle.appendChild(transparencyCheckbox);
-    transparencyToggle.appendChild(transparencySwitch);
-    transparencyToggle.appendChild(transparencyText);
+    colorInput.title = 'System color dialog';
+    colorInput.className = 'image-color image-color--native-hidden';
+    const transparentBtn = document.createElement('button');
+    transparentBtn.type = 'button';
+    transparentBtn.className = 'image-transparent-btn';
+    transparentBtn.title = 'Transparent — paints with 0 alpha (erase)';
+    transparentBtn.setAttribute('aria-label', 'Transparent color');
+    setIcon(transparentBtn, ['circle-slash', 'ban'], '∅');
 
-    // Brush size
-    const sizeLabel = document.createElement('div');
-    sizeLabel.textContent = 'Size';
-    sizeLabel.className = 'image-control-label';
+    const colorWrap = document.createElement('div');
+    colorWrap.className = 'image-color-wrap';
+    colorWrap.title = 'Brush color';
+    const colorSwatchSlot = document.createElement('div');
+    colorSwatchSlot.className = 'image-color-swatch-slot image-color-swatch-slot--current';
+    colorSwatchSlot.title = 'Current color (most recent)';
+    const swatchUnlockCover = document.createElement('button');
+    swatchUnlockCover.type = 'button';
+    swatchUnlockCover.className = 'image-color-swatch-unlock';
+    swatchUnlockCover.title = 'Switch to opaque color (palette opens on next click)';
+    swatchUnlockCover.setAttribute('aria-label', 'Switch to opaque color');
+    setIcon(swatchUnlockCover, ['droplet', 'paintbrush'], '◆');
+    const colorPreviewBtn = document.createElement('button');
+    colorPreviewBtn.type = 'button';
+    colorPreviewBtn.className = 'image-color-preview-btn';
+    colorPreviewBtn.title = 'Choose color';
+    colorSwatchSlot.appendChild(colorPreviewBtn);
+    colorSwatchSlot.appendChild(colorInput);
+    colorSwatchSlot.appendChild(swatchUnlockCover);
+    colorWrap.appendChild(colorSwatchSlot);
+    colorWrap.appendChild(transparentBtn);
+
+    const paletteRow = document.createElement('div');
+    paletteRow.className = 'image-color-palette';
+
+    const recentInitial = readRecentImageColors();
+    if (recentInitial.length) colorInput.value = recentInitial[0];
+
+    function renderRecentPalette() {
+        paletteRow.innerHTML = '';
+        paletteRow.title = 'Six older colors from history (newest is the large swatch)';
+        const recent = readRecentImageColors();
+        // recent[0] is always the large picker swatch; palette shows recent[1..6] only
+        for (let i = 1; i < 7; i++) {
+            const hex = recent[i];
+            if (hex) {
+                const sw = document.createElement('button');
+                sw.type = 'button';
+                sw.className = 'image-color-palette-swatch';
+                sw.style.background = hex;
+                sw.title = hex.toUpperCase();
+                sw.dataset.hex = hex;
+                sw.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    colorInput.value = hex;
+                    paintAlpha = 1;
+                    syncPaintAlphaUI();
+                    updateColorPreview();
+                    applyColorFromUI();
+                    pushRecentImageColor(hex);
+                });
+                paletteRow.appendChild(sw);
+            } else {
+                const empty = document.createElement('span');
+                empty.className = 'image-color-palette-slot--empty';
+                empty.title = 'Pick colors to build history';
+                empty.addEventListener('click', () => {
+                    if (colorInput.style.pointerEvents === 'none') return;
+                    openColorPopup();
+                });
+                paletteRow.appendChild(empty);
+            }
+        }
+    }
+
+    function pushRecentImageColor(hex) {
+        const n = normalizeImageHex(hex);
+        if (!n) return;
+        const list = readRecentImageColors().filter(h => h !== n);
+        list.unshift(n);
+        writeRecentImageColors(list);
+        renderRecentPalette();
+    }
+
+    function updateColorPreview() {
+        colorPreviewBtn.style.backgroundColor = colorInput.value;
+    }
+
+    let colorPopupRoot = null;
+    function closeColorPopup() {
+        if (!colorPopupRoot) return;
+        colorPopupRoot.classList.remove('is-open');
+        colorPopupRoot.setAttribute('aria-hidden', 'true');
+        document.removeEventListener('keydown', onColorPopupEsc);
+    }
+    function onColorPopupEsc(e) {
+        if (e.key === 'Escape') closeColorPopup();
+    }
+    function positionColorPopup() {
+        if (!colorPopupRoot) return;
+        const panel = colorPopupRoot.querySelector('.image-color-popup-panel');
+        const margin = 8;
+        const pw = panel.offsetWidth || 280;
+        const ph = panel.offsetHeight || 200;
+        const rect = colorPreviewBtn.getBoundingClientRect();
+        let left = rect.left;
+        let top = rect.bottom + margin;
+        if (left + pw > window.innerWidth - margin) left = window.innerWidth - pw - margin;
+        if (left < margin) left = margin;
+        if (top + ph > window.innerHeight - margin) top = rect.top - ph - margin;
+        if (top < margin) top = margin;
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+    }
+    function ensureColorPopup() {
+        if (colorPopupRoot) return;
+        colorPopupRoot = document.createElement('div');
+        colorPopupRoot.className = 'image-color-popup-root';
+        colorPopupRoot.setAttribute('aria-hidden', 'true');
+        const backdrop = document.createElement('div');
+        backdrop.className = 'image-color-popup-backdrop';
+        const panel = document.createElement('div');
+        panel.className = 'image-color-popup-panel';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-label', 'Choose color');
+        const grid = document.createElement('div');
+        grid.className = 'image-color-popup-grid';
+        buildImageColorPopupGridHexes().forEach((hex) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'image-color-popup-swatch';
+            b.style.background = hex;
+            b.title = hex.toUpperCase();
+            b.addEventListener('click', (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const n = normalizeImageHex(hex);
+                if (!n) return;
+                colorInput.value = n;
+                paintAlpha = 1;
+                syncPaintAlphaUI();
+                updateColorPreview();
+                applyColorFromUI();
+                pushRecentImageColor(n);
+                closeColorPopup();
+            });
+            grid.appendChild(b);
+        });
+        const moreBtn = document.createElement('button');
+        moreBtn.type = 'button';
+        moreBtn.className = 'image-color-popup-more';
+        moreBtn.textContent = 'More colors…';
+        moreBtn.title = 'Open system color dialog';
+        moreBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            closeColorPopup();
+            requestAnimationFrame(() => {
+                try {
+                    if (typeof colorInput.showPicker === 'function') colorInput.showPicker();
+                    else colorInput.click();
+                } catch (_) {
+                    colorInput.click();
+                }
+            });
+        });
+        panel.appendChild(grid);
+        panel.appendChild(moreBtn);
+        backdrop.addEventListener('click', closeColorPopup);
+        colorPopupRoot.appendChild(backdrop);
+        colorPopupRoot.appendChild(panel);
+        document.body.appendChild(colorPopupRoot);
+    }
+    function openColorPopup() {
+        if (paintAlpha < 0.5) return;
+        ensureColorPopup();
+        if (colorPopupRoot.classList.contains('is-open')) return;
+        document.removeEventListener('keydown', onColorPopupEsc);
+        colorPopupRoot.classList.add('is-open');
+        colorPopupRoot.setAttribute('aria-hidden', 'false');
+        requestAnimationFrame(() => {
+            positionColorPopup();
+            requestAnimationFrame(() => positionColorPopup());
+        });
+        document.addEventListener('keydown', onColorPopupEsc);
+    }
+
+    renderRecentPalette();
+    updateColorPreview();
+
+    const colorBlock = document.createElement('div');
+    colorBlock.className = 'image-color-block';
+    colorBlock.appendChild(colorWrap);
+    colorBlock.appendChild(paletteRow);
+
+    function syncPaintAlphaUI() {
+        const transparent = paintAlpha < 0.5;
+        transparentBtn.classList.toggle('active', transparent);
+        transparentBtn.setAttribute('aria-pressed', transparent ? 'true' : 'false');
+        transparentBtn.title = transparent
+            ? 'Opaque color — first click swatch (no picker), then pick color'
+            : 'Transparent (erase) — click to paint with alpha 0';
+        colorWrap.classList.toggle('image-color-wrap--transparent', transparent);
+        colorWrap.classList.toggle('image-color-wrap--opaque', !transparent);
+        swatchUnlockCover.style.display = transparent ? 'flex' : 'none';
+        colorInput.style.pointerEvents = transparent ? 'none' : 'auto';
+        colorSwatchSlot.title = transparent
+            ? 'Click to leave erase mode, then choose a color'
+            : 'Click to choose color';
+    }
+
     const sizeInput = document.createElement('input');
     sizeInput.type = 'range';
     sizeInput.min = '1';
     sizeInput.max = '100';
     sizeInput.value = '16';
-    sizeInput.title = 'Brush Size';
+    sizeInput.title = 'Brush size';
     sizeInput.className = 'image-range image-range-size';
-    const sizeValue = document.createElement('div');
-    sizeValue.className = 'image-value-pill';
-    sizeValue.textContent = sizeInput.value;
-    const sizeMinusBtn = document.createElement('button');
-    sizeMinusBtn.className = 'image-step-btn';
-    sizeMinusBtn.type = 'button';
-    setIcon(sizeMinusBtn, ['minus', 'minus-circle'], '−');
-    sizeMinusBtn.title = 'Smaller brush';
-    const sizePlusBtn = document.createElement('button');
-    sizePlusBtn.className = 'image-step-btn';
-    sizePlusBtn.type = 'button';
-    setIcon(sizePlusBtn, ['plus', 'plus-circle'], '+');
-    sizePlusBtn.title = 'Larger brush';
+    const sizeNum = document.createElement('input');
+    sizeNum.type = 'number';
+    sizeNum.min = '1';
+    sizeNum.max = '100';
+    sizeNum.step = '1';
+    sizeNum.value = '16';
+    sizeNum.className = 'image-value-input';
+    sizeNum.title = 'Brush size';
+    sizeNum.setAttribute('aria-label', 'Brush size');
 
-    function getBrushSizeFromUI() {
-        const n = parseInt(sizeInput.value, 10);
-        return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : 16;
-    }
     function setBrushSizeUI(next) {
         const clamped = Math.max(1, Math.min(100, next | 0));
         sizeInput.value = String(clamped);
-        sizeValue.textContent = String(clamped);
+        sizeNum.value = String(clamped);
         if (imageEditor) imageEditor.setBrushSize(clamped);
     }
-    sizeInput.addEventListener('input', () => setBrushSizeUI(getBrushSizeFromUI()));
-    sizeMinusBtn.addEventListener('click', () => setBrushSizeUI(getBrushSizeFromUI() - (window.event && window.event.shiftKey ? 10 : 1)));
-    sizePlusBtn.addEventListener('click', () => setBrushSizeUI(getBrushSizeFromUI() + (window.event && window.event.shiftKey ? 10 : 1)));
-
-    // Fill toggle for shapes
-    const fillLabel = document.createElement('label');
-    fillLabel.className = 'image-toggle';
-    const fillCheckbox = document.createElement('input');
-    fillCheckbox.type = 'checkbox';
-    fillCheckbox.checked = true;
-    fillCheckbox.className = 'image-toggle-input';
-    fillCheckbox.title = 'Fill shapes';
-    const fillSwitch = document.createElement('span');
-    fillSwitch.className = 'image-toggle-switch';
-    const fillText = document.createElement('span');
-    fillText.textContent = 'Fill';
-    fillText.className = 'image-toggle-label';
-    fillLabel.appendChild(fillCheckbox);
-    fillLabel.appendChild(fillSwitch);
-    fillLabel.appendChild(fillText);
-    fillCheckbox.addEventListener('change', () => imageEditor && imageEditor.setFill(fillCheckbox.checked));
+    // Slider must drive size directly — do not prefer the number field or drags are ignored.
+    sizeInput.addEventListener('input', () => {
+        const v = parseInt(sizeInput.value, 10);
+        if (Number.isFinite(v)) setBrushSizeUI(v);
+    });
+    sizeNum.addEventListener('input', () => {
+        const v = parseInt(sizeNum.value, 10);
+        if (Number.isFinite(v)) setBrushSizeUI(v);
+    });
+    sizeNum.addEventListener('blur', () => {
+        let v = parseInt(sizeNum.value, 10);
+        if (!Number.isFinite(v)) v = 16;
+        setBrushSizeUI(v);
+    });
 
     // Undo / Redo
     const undoBtn = document.createElement('button');
@@ -4498,41 +4799,60 @@ function createImagesInterface(container) {
     clearBtn.title = 'Clear';
     clearBtn.addEventListener('click', () => imageEditor && imageEditor.clear());
 
-    // Wire color + transparency toggle (acts like "transparent paint"/eraser mode)
-    function currentAlpha() { return transparencyCheckbox.checked ? 0 : 1; }
     function applyColorFromUI() {
         if (!imageEditor) return;
-        imageEditor.setColor(colorInput.value, currentAlpha());
+        imageEditor.setColor(colorInput.value, paintAlpha);
     }
-    colorInput.addEventListener('input', applyColorFromUI);
-    transparencyCheckbox.addEventListener('change', () => {
-        transparencyToggle.title = transparencyCheckbox.checked ? 'Transparency: On (draw transparent)' : 'Transparency: Off';
-        transparencyToggle.classList.toggle('active', transparencyCheckbox.checked);
+    function onColorPickerInput() {
+        paintAlpha = 1;
+        syncPaintAlphaUI();
+        updateColorPreview();
+        applyColorFromUI();
+    }
+    function onColorPickerChange() {
+        onColorPickerInput();
+        pushRecentImageColor(colorInput.value);
+    }
+    colorInput.addEventListener('input', onColorPickerInput);
+    colorInput.addEventListener('change', onColorPickerChange);
+    colorPreviewBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (paintAlpha < 0.5) return;
+        openColorPopup();
+    });
+    swatchUnlockCover.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        paintAlpha = 1;
+        syncPaintAlphaUI();
+        updateColorPreview();
         applyColorFromUI();
     });
-
-    const colorWrap = document.createElement('div');
-    colorWrap.className = 'image-color-wrap';
-    const colorIcon = document.createElement('span');
-    colorIcon.className = 'image-color-icon';
-    setIcon(colorIcon, ['palette', 'droplet'], '');
-    colorWrap.title = 'Color';
-    colorWrap.appendChild(colorIcon);
-    colorWrap.appendChild(colorInput);
-    toolbar.appendChild(colorWrap);
-    toolbar.appendChild(transparencyToggle);
+    transparentBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        if (paintAlpha < 0.5) {
+            paintAlpha = 1;
+            syncPaintAlphaUI();
+            updateColorPreview();
+            applyColorFromUI();
+        } else {
+            paintAlpha = 0;
+            syncPaintAlphaUI();
+            applyColorFromUI();
+        }
+    });
 
     const sizeGroup = document.createElement('div');
     sizeGroup.className = 'image-control-group';
     const sizeRow = document.createElement('div');
     sizeRow.className = 'image-control-row';
-    sizeRow.appendChild(sizeMinusBtn);
     sizeRow.appendChild(sizeInput);
-    sizeRow.appendChild(sizePlusBtn);
-    sizeRow.appendChild(sizeValue);
-    sizeGroup.appendChild(sizeLabel); sizeGroup.appendChild(sizeRow);
+    sizeRow.appendChild(sizeNum);
+    sizeGroup.title = 'Brush size';
+    sizeGroup.appendChild(sizeRow);
+    toolbar.appendChild(colorBlock);
     toolbar.appendChild(sizeGroup);
-    toolbar.appendChild(fillLabel);
     toolbar.appendChild(undoBtn);
     toolbar.appendChild(redoBtn);
     toolbar.appendChild(clearBtn);
@@ -4541,98 +4861,34 @@ function createImagesInterface(container) {
     // Create main content area (split view)
     const contentArea = document.createElement('div');
     contentArea.className = 'images-content';
-    contentArea.style.cssText = `
-        flex: 1;
-        display: flex;
-        overflow: hidden;
-    `;
 
     // Left scroll view for image thumbnails
     const leftPanel = document.createElement('div');
     leftPanel.className = 'images-left-panel';
-    leftPanel.style.cssText = `
-        width: 140px;
-        background: #222;
-        border-right: 1px solid #444;
-        overflow-y: hidden;
-        overflow-x: hidden;
-        padding: 10px;
-        display: flex;
-        flex-direction: column;
-        position: relative;
-    `;
 
     // Create thumbnails container
     const thumbnailsContainer = document.createElement('div');
-    thumbnailsContainer.style.cssText = `
-        flex: 1;
-        overflow-y: auto;
-        overflow-x: hidden;
-        padding-bottom: 48px;
-        margin-right: 0;
-        padding-right: 0;
-        width: 100%;
-        box-sizing: border-box;
-    `;
+    thumbnailsContainer.className = 'images-thumbnails-scroll';
 
     // Load and display images from ./images/0/
     loadImagesFromDirectory(thumbnailsContainer);
 
     // Add action buttons row at bottom (Add + Upload)
     const actionsRow = document.createElement('div');
-    actionsRow.style.cssText = `
-        display: flex;
-        gap: 8px;
-        position: absolute;
-        left: 10px;
-        right: 10px;
-        bottom: 10px;
-    `;
+    actionsRow.className = 'images-actions-row';
 
     const addBtn = document.createElement('button');
-    addBtn.className = 'add-image-btn';
+    addBtn.className = 'add-image-btn images-action-btn';
+    addBtn.type = 'button';
     setIcon(addBtn, 'plus', '+');
-    addBtn.style.cssText = `
-        flex: 1 1 0;
-        height: 32px;
-        background: #00ffcc;
-        border: none;
-        color: #1a1a1a;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 18px;
-        font-weight: bold;
-        transition: background 0.2s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    `;
     addBtn.title = 'Add new image';
-    addBtn.addEventListener('mouseover', () => addBtn.style.background = '#00cccc');
-    addBtn.addEventListener('mouseout', () => addBtn.style.background = '#00ffcc');
     addBtn.addEventListener('click', () => createNewImage());
 
     const uploadBtn = document.createElement('button');
-    uploadBtn.className = 'add-image-btn';
-    setIcon(uploadBtn, 'upload', 'Upload');
-    uploadBtn.style.cssText = `
-        flex: 1 1 0;
-        height: 32px;
-        background: #00ffcc;
-        border: none;
-        color: #1a1a1a;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 14px;
-        font-weight: 600;
-        transition: background 0.2s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    `;
+    uploadBtn.className = 'add-image-btn images-action-btn';
+    uploadBtn.type = 'button';
+    setIcon(uploadBtn, ['upload', 'upload-cloud'], '↑');
     uploadBtn.title = 'Upload image file';
-    uploadBtn.addEventListener('mouseover', () => uploadBtn.style.background = '#00cccc');
-    uploadBtn.addEventListener('mouseout', () => uploadBtn.style.background = '#00ffcc');
     uploadBtn.addEventListener('click', () => triggerUploadImage());
 
     actionsRow.appendChild(addBtn);
@@ -4645,24 +4901,12 @@ function createImagesInterface(container) {
     const rightPanel = document.createElement('div');
     rightPanel.className = 'images-right-panel';
     rightPanel.style.cssText = `
-        flex: 1;
         background: #1a1a1a;
-        display: flex;
-        flex-direction: column;
-        position: relative;
     `;
 
     // Image preview container
     const previewContainer = document.createElement('div');
     previewContainer.className = 'image-preview-container';
-    previewContainer.style.cssText = `
-        flex: 1;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        overflow: hidden;
-        position: relative;
-    `;
 
     // Zoom controls (bottom right)
     const zoomControls = document.createElement('div');
@@ -4776,8 +5020,10 @@ function createImagesInterface(container) {
     toolButtons.brush && toolButtons.brush.classList.add('active');
     applySymmetryMode('none');
     refreshLucideIcons();
-    setBrushSizeUI(getBrushSizeFromUI());
+    setBrushSizeUI(parseInt(sizeInput.value, 10) || 16);
     applyColorFromUI();
+    syncPaintAlphaUI();
+    updateShapeToolFillIndicators();
 
     // After initializing the editor, ensure an image is shown immediately
     setTimeout(() => {
@@ -4786,7 +5032,7 @@ function createImagesInterface(container) {
         if (selectedImage) {
             imageEditor.loadImage(selectedImage);
         } else {
-            const containerEl = document.querySelector('.images-left-panel > div');
+            const containerEl = document.querySelector('.images-thumbnails-scroll');
             if (containerEl && containerEl.firstElementChild) {
                 const firstItem = containerEl.firstElementChild;
                 const firstImg = firstItem.querySelector('img');
@@ -5133,11 +5379,16 @@ function undoLastDeletion() {
     if (stack.length === 0) return;
 
     const lastDeleted = stack.pop();
-    const container = document.querySelector('.images-left-panel > div');
+    const container = document.querySelector('.images-thumbnails-scroll');
     if (!container) return;
 
     const restored = { id: Date.now(), name: lastDeleted.filename, src: lastDeleted.src };
-    const list = getCurrentObjectImages();
+    // Must not call getCurrentObjectImages() here while the list is still empty: we pop the
+    // undo stack first, so pending-delete state is cleared and getCurrentObjectImages would
+    // auto-seed a blank, then unshift would leave [restored, blank].
+    const key = String(selected_object);
+    if (!objectImages[key]) objectImages[key] = [];
+    const list = objectImages[key];
     list.unshift(restored);
     loadImagesFromDirectory(container);
     setTimeout(() => {
@@ -5150,14 +5401,32 @@ function undoLastDeletion() {
     setTimeout(() => updateUndoMenu(), 100);
 }
 
+/** True if there is a thumbnail deletion to undo for the current object (Edit → Undo Delete). */
+function hasPendingImageDeletionUndo() {
+    const objectId = String(selected_object);
+    return (deletedImagesMap[objectId] || []).length > 0;
+}
+
+/** Restores the last deleted thumbnail if any; returns true if handled (so canvas undo can be skipped). */
+function tryUndoImageDeletion() {
+    if (!hasPendingImageDeletionUndo()) return false;
+    undoLastDeletion();
+    return true;
+}
+
 // Handle edit menu actions
 function handleEditAction(action) {
     console.log('Edit action triggered:', action);
 
     switch(action) {
         case 'undo':
-            if (activeTab === 'images' && imageEditor && typeof imageEditor.undo === 'function') imageEditor.undo();
-            else undoLastDeletion();
+            if (activeTab === 'images') {
+                if (!tryUndoImageDeletion() && imageEditor && typeof imageEditor.undo === 'function') {
+                    imageEditor.undo();
+                }
+            } else {
+                undoLastDeletion();
+            }
             break;
         case 'cut':
             if (activeTab === 'images' && imageEditor && typeof imageEditor.cut === 'function') imageEditor.cut();
@@ -5263,7 +5532,7 @@ function createNewImage() {
     }
 
     // Refresh thumbnails and visually select the new image
-    const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+    const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
     if (thumbnailsContainer) {
         loadImagesFromDirectory(thumbnailsContainer);
         setTimeout(() => {
@@ -5335,7 +5604,7 @@ function triggerUploadImage() {
                 }
 
                 // Refresh thumbnails and select the uploaded one
-                const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+                const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
                 if (thumbnailsContainer) {
                     loadImagesFromDirectory(thumbnailsContainer);
                     setTimeout(() => {
@@ -6015,7 +6284,7 @@ async function loadProjectFromFile(file) {
 					// Rebuild current workspace (code or images)
 					try { updateWorkspace(); } catch {}
 					try {
-						const thumbnailsContainer = document.querySelector('.images-left-panel > div');
+						const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
 						if (thumbnailsContainer) loadImagesFromDirectory(thumbnailsContainer);
 					} catch {}
 					try { setTimeout(renderGameWindowSprite, 30); } catch {}
@@ -6526,15 +6795,28 @@ function initializeImageEditor(params) {
         redoStack: [],
     };
 
+    function syncOverlayDomTransform(overlayEl) {
+        if (!overlayEl || !canvas) return;
+        const w = canvas.width;
+        const h = canvas.height;
+        const t = `translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
+        overlayEl.style.position = 'absolute';
+        overlayEl.style.left = '50%';
+        overlayEl.style.top = '50%';
+        overlayEl.style.width = `${w}px`;
+        overlayEl.style.height = `${h}px`;
+        overlayEl.style.marginLeft = `${-w / 2}px`;
+        overlayEl.style.marginTop = `${-h / 2}px`;
+        overlayEl.style.transform = t;
+        overlayEl.style.transformOrigin = 'center center';
+        overlayEl.style.pointerEvents = 'none';
+    }
+
     function updateViewTransform() {
         // Pan in screen pixels (applied after scaling via transform order), then zoom.
         canvas.style.transform = `translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
         const overlay = wrapper.querySelector('canvas.__overlay');
-        if (overlay) {
-            overlay.style.setProperty('--zoom', state.zoom);
-            overlay.style.setProperty('--pan-x', `${state.panX}px`);
-            overlay.style.setProperty('--pan-y', `${state.panY}px`);
-        }
+        syncOverlayDomTransform(overlay);
     }
 
     function rgbaString() {
@@ -6586,6 +6868,7 @@ function initializeImageEditor(params) {
     }
 
     function setTool(t) { state.tool = t; }
+    function getTool() { return state.tool; }
     function setColor(hex, a) {
         const bigint = parseInt(hex.slice(1), 16);
         const r = (bigint >> 16) & 255;
@@ -6595,6 +6878,8 @@ function initializeImageEditor(params) {
     }
     function setBrushSize(s) { state.brushSize = Math.max(1, s|0); }
     function setFill(f) { state.fill = !!f; }
+    function getFill() { return state.fill; }
+    function toggleFill() { state.fill = !state.fill; return state.fill; }
     function setSymmetry(mode) {
         const m = String(mode || 'none');
         state.symmetry = (m === 'x' || m === 'y' || m === 'xy') ? m : 'none';
@@ -6752,6 +7037,34 @@ function initializeImageEditor(params) {
         return segs;
     }
 
+    /** Axis-aligned bounds (min/max) mirrored the same way as brush strokes; deduped. */
+    function symmetryRectsForBounds(x0, y0, x1, y1) {
+        const mx = (x) => (canvas.width - 1) - x;
+        const my = (y) => (canvas.height - 1) - y;
+        const norm = (a, b, c, d) => [Math.min(a, c), Math.min(b, d), Math.max(a, c), Math.max(b, d)];
+        const rects = [];
+        const seen = new Set();
+        const push = (a, b, c, d) => {
+            const [rx0, ry0, rx1, ry1] = norm(a, b, c, d);
+            const key = `${rx0},${ry0},${rx1},${ry1}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                rects.push([rx0, ry0, rx1, ry1]);
+            }
+        };
+        push(x0, y0, x1, y1);
+        if (state.symmetry === 'x' || state.symmetry === 'xy') {
+            push(mx(x1), y0, mx(x0), y1);
+        }
+        if (state.symmetry === 'y' || state.symmetry === 'xy') {
+            push(x0, my(y1), x1, my(y0));
+        }
+        if (state.symmetry === 'xy') {
+            push(mx(x1), my(y1), mx(x0), my(y0));
+        }
+        return rects;
+    }
+
     function applyBrushLineRaw(x0, y0, x1, y1) {
         ctx.save();
         const isErase = state.color.a <= 0.01;
@@ -6781,16 +7094,9 @@ function initializeImageEditor(params) {
             overlay.className = '__overlay';
             overlay.width = canvas.width;
             overlay.height = canvas.height;
-            overlay.style.position = 'absolute';
-            overlay.style.pointerEvents = 'none';
-            overlay.style.top = '50%';
-            overlay.style.left = '50%';
-            overlay.style.setProperty('--zoom', state.zoom);
-            overlay.style.setProperty('--pan-x', `${state.panX}px`);
-            overlay.style.setProperty('--pan-y', `${state.panY}px`);
-            overlay.style.transformOrigin = 'center';
             wrapper.appendChild(overlay);
         }
+        syncOverlayDomTransform(overlay);
         return overlay;
     }
 
@@ -6859,20 +7165,23 @@ function initializeImageEditor(params) {
         octx.restore();
     }
 
-    function previewRect(x0, y0, x1, y1) {
-        const overlay = ensureOverlay();
-        const octx = overlay.getContext('2d');
-        octx.clearRect(0, 0, overlay.width, overlay.height);
+    function paintPreviewRectOn(octx, x0, y0, x1, y1) {
         octx.setLineDash([6, 4]);
         octx.strokeStyle = '#00ffcc';
         octx.lineWidth = 1;
-        octx.strokeRect(x0 + 0.5, y0 + 0.5, x1 - x0, y1 - y0);
+        const rw = x1 - x0;
+        const rh = y1 - y0;
+        if (state.fill) {
+            octx.strokeRect(x0 + 0.5, y0 + 0.5, rw, rh);
+        } else {
+            const lw = Math.max(1, state.brushSize);
+            const iw = Math.max(0, rw - lw);
+            const ih = Math.max(0, rh - lw);
+            if (iw > 0 && ih > 0) octx.strokeRect(x0 + lw / 2, y0 + lw / 2, iw, ih);
+        }
     }
 
-    function previewCircle(x0, y0, x1, y1) {
-        const overlay = ensureOverlay();
-        const octx = overlay.getContext('2d');
-        octx.clearRect(0, 0, overlay.width, overlay.height);
+    function paintPreviewCircleOn(octx, x0, y0, x1, y1) {
         const rx = (x1 - x0) / 2;
         const ry = (y1 - y0) / 2;
         const cx = x0 + rx;
@@ -6881,8 +7190,26 @@ function initializeImageEditor(params) {
         octx.strokeStyle = '#00ffcc';
         octx.lineWidth = 1;
         octx.beginPath();
-        octx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI * 2);
+        if (state.fill) {
+            octx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI * 2);
+        } else {
+            const lw = Math.max(1, state.brushSize);
+            const rxIn = Math.max(0, Math.abs(rx) - lw / 2);
+            const ryIn = Math.max(0, Math.abs(ry) - lw / 2);
+            if (rxIn > 0 && ryIn > 0) octx.ellipse(cx, cy, rxIn, ryIn, 0, 0, Math.PI * 2);
+        }
         octx.stroke();
+    }
+
+    function previewShapeTools(tool, minX, minY, maxX, maxY) {
+        const rects = symmetryRectsForBounds(minX, minY, maxX, maxY);
+        const overlay = ensureOverlay();
+        const octx = overlay.getContext('2d');
+        octx.clearRect(0, 0, overlay.width, overlay.height);
+        rects.forEach(([x0, y0, x1, y1]) => {
+            if (tool === 'rect') paintPreviewRectOn(octx, x0, y0, x1, y1);
+            else paintPreviewCircleOn(octx, x0, y0, x1, y1);
+        });
     }
 
     function commitRect(x0, y0, x1, y1) {
@@ -6895,8 +7222,11 @@ function initializeImageEditor(params) {
         ctx.fillStyle = rgbaString();
         if (state.fill && !isErase) ctx.fillRect(x0, y0, w, h);
         else {
-            ctx.lineWidth = Math.max(1, state.brushSize);
-            ctx.strokeRect(x0 + 0.5, y0 + 0.5, w, h);
+            const lw = Math.max(1, state.brushSize);
+            ctx.lineWidth = lw;
+            const iw = Math.max(0, w - lw);
+            const ih = Math.max(0, h - lw);
+            if (iw > 0 && ih > 0) ctx.strokeRect(x0 + lw / 2, y0 + lw / 2, iw, ih);
         }
         if (isErase && state.fill) ctx.clearRect(x0, y0, w, h);
         ctx.restore();
@@ -6911,19 +7241,27 @@ function initializeImageEditor(params) {
         ctx.save();
         const isErase = state.color.a <= 0.01;
         ctx.globalCompositeOperation = isErase ? 'destination-out' : 'source-over';
-        ctx.beginPath();
-        ctx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI * 2);
         if (state.fill && !isErase) {
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI * 2);
             ctx.fillStyle = rgbaString();
             ctx.fill();
-        } else {
-            ctx.lineWidth = Math.max(1, state.brushSize);
-            ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
-            ctx.stroke();
-        }
-        if (isErase && state.fill) {
+        } else if (isErase && state.fill) {
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI * 2);
             ctx.clip();
             ctx.clearRect(0, 0, canvas.width, canvas.height);
+        } else {
+            const lw = Math.max(1, state.brushSize);
+            ctx.lineWidth = lw;
+            ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+            const rxIn = Math.max(0, Math.abs(rx) - lw / 2);
+            const ryIn = Math.max(0, Math.abs(ry) - lw / 2);
+            ctx.beginPath();
+            if (rxIn > 0 && ryIn > 0) {
+                ctx.ellipse(cx, cy, rxIn, ryIn, 0, 0, Math.PI * 2);
+                ctx.stroke();
+            }
         }
         ctx.restore();
         // Crosshair is on overlay, no need to redraw
@@ -6996,21 +7334,11 @@ function initializeImageEditor(params) {
             overlay.className = '__overlay';
             overlay.width = canvas.width;
             overlay.height = canvas.height;
-            overlay.style.position = 'absolute';
-            overlay.style.pointerEvents = 'none';
-            overlay.style.top = '50%';
-            overlay.style.left = '50%';
-            overlay.style.setProperty('--zoom', state.zoom);
-            overlay.style.setProperty('--pan-x', `${state.panX}px`);
-            overlay.style.setProperty('--pan-y', `${state.panY}px`);
-            overlay.style.transformOrigin = 'center';
             wrapper.appendChild(overlay);
         } else {
             overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
-            overlay.style.setProperty('--zoom', state.zoom);
-            overlay.style.setProperty('--pan-x', `${state.panX}px`);
-            overlay.style.setProperty('--pan-y', `${state.panY}px`);
         }
+        syncOverlayDomTransform(overlay);
         const octx = overlay.getContext('2d');
         octx.clearRect(0, 0, overlay.width, overlay.height);
         // draw floating layer if present (scaled to current w/h)
@@ -7287,8 +7615,7 @@ function initializeImageEditor(params) {
                 x1 = x0 + Math.sign(x1 - x0) * size;
                 y1 = y0 + Math.sign(y1 - y0) * size;
             }
-            if (state.tool === 'rect') previewRect(Math.min(x0,x1), Math.min(y0,y1), Math.max(x0,x1), Math.max(y0,y1));
-            else previewCircle(Math.min(x0,x1), Math.min(y0,y1), Math.max(x0,x1), Math.max(y0,y1));
+            previewShapeTools(state.tool, Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1));
         }
         if (state.tool === 'select' && state.selection && !state.selection.dragging) {
             state.selection.w = Math.abs(p.x - state.startX);
@@ -7321,11 +7648,11 @@ function initializeImageEditor(params) {
             }
             const rx0 = Math.min(x0,x1), ry0 = Math.min(y0,y1), rx1 = Math.max(x0,x1), ry1 = Math.max(y0,y1);
             const rw = rx1 - rx0, rh = ry1 - ry0;
-            // If transparency/eraser mode is on, commit directly to the main canvas (like the brush tool).
+            // Eraser, or symmetry: commit like the brush (mirrored copies); no floating layer.
             // Offscreen "selection layer" compositing can't erase the destination canvas when later drawn via drawImage.
-            if (state.color.a <= 0.01) {
+            if (state.color.a <= 0.01 || state.symmetry !== 'none') {
                 pushUndo();
-                commitRect(rx0, ry0, rx1, ry1);
+                symmetryRectsForBounds(rx0, ry0, rx1, ry1).forEach(([a, b, c, d]) => commitRect(a, b, c, d));
                 clearOverlay();
                 updateGameObjectIcon();
                 saveToDisk();
@@ -7341,9 +7668,12 @@ function initializeImageEditor(params) {
                 lctx.fillStyle = rgbaString();
                 lctx.fillRect(0, 0, rw, rh);
             } else {
-                lctx.lineWidth = Math.max(1, state.brushSize);
+                const lw = Math.max(1, state.brushSize);
+                lctx.lineWidth = lw;
                 lctx.strokeStyle = rgbaString();
-                lctx.strokeRect(0.5, 0.5, rw, rh);
+                const iw = Math.max(0, rw - lw);
+                const ih = Math.max(0, rh - lw);
+                if (iw > 0 && ih > 0) lctx.strokeRect(lw / 2, lw / 2, iw, ih);
             }
             lctx.restore();
             // floating selection (draggable/resizable)
@@ -7359,10 +7689,9 @@ function initializeImageEditor(params) {
             }
             const cx0 = Math.min(x0,x1), cy0 = Math.min(y0,y1), cx1 = Math.max(x0,x1), cy1 = Math.max(y0,y1);
             const cw = cx1 - cx0, ch = cy1 - cy0;
-            // If transparency/eraser mode is on, commit directly to the main canvas (like the brush tool).
-            if (state.color.a <= 0.01) {
+            if (state.color.a <= 0.01 || state.symmetry !== 'none') {
                 pushUndo();
-                commitCircle(cx0, cy0, cx1, cy1);
+                symmetryRectsForBounds(cx0, cy0, cx1, cy1).forEach(([a, b, c, d]) => commitCircle(a, b, c, d));
                 clearOverlay();
                 updateGameObjectIcon();
                 saveToDisk();
@@ -7373,15 +7702,22 @@ function initializeImageEditor(params) {
             const lctx = layer.getContext('2d');
             lctx.save();
             lctx.globalCompositeOperation = 'source-over';
-            lctx.beginPath();
-            lctx.ellipse(cw/2, ch/2, Math.abs(cw/2), Math.abs(ch/2), 0, 0, Math.PI * 2);
             if (state.fill) {
+                lctx.beginPath();
+                lctx.ellipse(cw/2, ch/2, Math.abs(cw/2), Math.abs(ch/2), 0, 0, Math.PI * 2);
                 lctx.fillStyle = rgbaString();
                 lctx.fill();
             } else {
-                lctx.lineWidth = Math.max(1, state.brushSize);
+                const lw = Math.max(1, state.brushSize);
+                lctx.lineWidth = lw;
                 lctx.strokeStyle = rgbaString();
-                lctx.stroke();
+                const rxIn = Math.max(0, cw / 2 - lw / 2);
+                const ryIn = Math.max(0, ch / 2 - lw / 2);
+                lctx.beginPath();
+                if (rxIn > 0 && ryIn > 0) {
+                    lctx.ellipse(cw / 2, ch / 2, rxIn, ryIn, 0, 0, Math.PI * 2);
+                    lctx.stroke();
+                }
             }
             lctx.restore();
             state.selection = { x: cx0, y: cy0, w: cw, h: ch, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null, _orig: null, _initial: { x: cx0, y: cy0, w: cw, h: ch }, _cutFromCanvas: false };
@@ -7505,7 +7841,11 @@ function initializeImageEditor(params) {
         const isMeta = e.ctrlKey || e.metaKey;
         if (isMeta && e.key.toLowerCase() === 'z') {
             e.preventDefault();
-            if (e.shiftKey) redo(); else undo();
+            if (e.shiftKey) {
+                redo();
+            } else if (!tryUndoImageDeletion()) {
+                undo();
+            }
             return;
         }
 
@@ -7565,7 +7905,7 @@ function initializeImageEditor(params) {
 
     // Public API
     const api = {
-        setTool, setColor, setBrushSize, setFill, setSymmetry, setZoom, clear, loadImage, undo, redo, drawCrosshair,
+        setTool, getTool, setColor, setBrushSize, setFill, getFill, toggleFill, setSymmetry, setZoom, clear, loadImage, undo, redo, drawCrosshair,
         // Used by Edit menu in the Images tab
         cut: cutSelectionToClipboard,
         copy: copySelectionToClipboard,
