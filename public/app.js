@@ -152,9 +152,10 @@ let lastFrameTime = 0;
 const MAX_STEPS_PER_OBJECT = 16;        // quantum per instance per frame
 const MAX_TOTAL_STEPS_PER_FRAME = 5000; // hard cap across all instances per frame
 const TIME_BUDGET_MS = 6;               // soft time budget for interpreter per frame
+const LOOP_YIELD_MS = 1000 / 60;        // yield when repeat/forever has no runnable body (avoids freezing the tab)
+// Outer repeat continuation must not use `steps` — action blocks never increment `steps` (only non-actions do).
+const MAX_REPEAT_OUTER_PASSES = Math.max(MAX_TOTAL_STEPS_PER_FRAME, 50000);
 let rrInstanceStartIndex = 0;           // round-robin start index for fairness
-// Default delay between loop iterations (approx 60 FPS)
-const LOOP_FRAME_WAIT_MS = 1000 / 60;
 // Mouse and keyboard state for input blocks
 // Optional filter: when set to an array of instanceIds, interpreter will only step those instances
 let __stepOnlyInstanceIds = null;
@@ -203,7 +204,17 @@ function normalizeKeyName(k) {
     if (k === ' ' || k === 'Spacebar') return 'Space';
     return k;
 }
-document.addEventListener('keydown', (e) => { const k = normalizeKeyName(e.key); runtimeKeys[k] = true; });
+document.addEventListener('keydown', (e) => {
+    const k = normalizeKeyName(e.key);
+    if (isPlaying && k === 'Space') {
+        const t = e.target;
+        const tag = t && t.tagName ? String(t.tagName).toLowerCase() : '';
+        if (tag !== 'input' && tag !== 'textarea' && tag !== 'select' && !(t && t.isContentEditable)) {
+            e.preventDefault();
+        }
+    }
+    runtimeKeys[k] = true;
+}, true);
 document.addEventListener('keyup', (e) => { const k = normalizeKeyName(e.key); runtimeKeys[k] = false; });
 // Cache images by URL so we don't reload every frame
 const imageCache = {};
@@ -255,6 +266,9 @@ function stepInterpreter(dtMs) {
         }
 
         let steps = 0;
+        let outerPasses = 0;
+        outerInstanceLoop: while (isPlaying && outerPasses < MAX_REPEAT_OUTER_PASSES) {
+            outerPasses++;
         while (isPlaying && exec.pc != null && steps < MAX_STEPS_PER_OBJECT) {
             const block = codeMap ? codeMap[exec.pc] : code.find(b => b && b.id === exec.pc);
             if (!block) { exec.pc = null; break; }
@@ -421,11 +435,11 @@ function stepInterpreter(dtMs) {
 
             if (block.type === 'action') {
                 if (block.content === 'move_xy') {
-                    const dx = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
-                    const dy = Number(resolveInput(block, 'input_b') ?? block.val_b ?? 0);
+                    const x = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const y = Number(resolveInput(block, 'input_b') ?? block.val_b ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
-                    runtimePositions[inst.instanceId].x += dx;
-                    runtimePositions[inst.instanceId].y += dy;
+                    runtimePositions[inst.instanceId].x += x;
+                    runtimePositions[inst.instanceId].y += y;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
@@ -524,9 +538,6 @@ function stepInterpreter(dtMs) {
                     }
                     exec.repeatStack.push({ repeatBlockId: block.id, timesRemaining: times, afterId: (typeof block.next_block_b === 'number') ? block.next_block_b : null });
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
-                    // Default 60fps pacing for loop iterations
-                    exec.waitMs = LOOP_FRAME_WAIT_MS;
-                    exec.waitingBlockId = block.id;
                     continue;
                 }
                 if (block.content === 'print') {
@@ -664,9 +675,6 @@ function stepInterpreter(dtMs) {
                     // Enter infinite loop over branch A
                     exec.repeatStack.push({ repeatBlockId: block.id, timesRemaining: Infinity, afterId: (typeof block.next_block_b === 'number') ? block.next_block_b : null });
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
-                    // Default 60fps pacing for loop iterations
-                    exec.waitMs = LOOP_FRAME_WAIT_MS;
-                    exec.waitingBlockId = block.id;
                     continue;
                 }
             }
@@ -678,22 +686,26 @@ function stepInterpreter(dtMs) {
             if ((performance.now() - startTime) >= TIME_BUDGET_MS) break;
         }
 
-        // If we reached end of a chain, check repeat stack
+        // If we reached end of a chain, check repeat stack (may loop same frame)
         if (exec.pc == null && exec.repeatStack.length > 0) {
             const frame = exec.repeatStack[exec.repeatStack.length - 1];
             frame.timesRemaining -= 1;
             if (frame.timesRemaining > 0) {
-                // Repeat body again
                 const repeatBlock = codeMap ? codeMap[frame.repeatBlockId] : code.find(b => b && b.id === frame.repeatBlockId);
                 exec.pc = repeatBlock && (typeof repeatBlock.next_block_a === 'number') ? repeatBlock.next_block_a : null;
-                // Add default frame delay between loop iterations
-                exec.waitMs = LOOP_FRAME_WAIT_MS;
+                if (exec.pc != null) {
+                    continue outerInstanceLoop;
+                }
+                // No first block (empty repeat body): outerInstanceLoop would spin forever without advancing steps
+                exec.waitMs = LOOP_YIELD_MS;
                 exec.waitingBlockId = repeatBlock ? repeatBlock.id : null;
-            } else {
-                // Done repeating. Continue after repeat
-                exec.repeatStack.pop();
-                exec.pc = frame.afterId != null ? frame.afterId : null;
+                break outerInstanceLoop;
             }
+            exec.repeatStack.pop();
+            exec.pc = frame.afterId != null ? frame.afterId : null;
+            continue outerInstanceLoop;
+        }
+        break outerInstanceLoop;
         }
 
         if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) { break; }
@@ -2558,21 +2570,21 @@ function createNodeBlock(codeData, x, y) {
         // Build lightweight modal
         const overlay = document.createElement('div');
         overlay.id = '__var_modal';
-        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center;';
+        overlay.className = 'modal-overlay';
         const panel = document.createElement('div');
-        panel.style.cssText = 'background:#2a2a2a;border:1px solid #444;border-radius:8px;padding:16px;min-width:320px;color:#eee;';
+        panel.className = 'modal-panel';
         const title = document.createElement('div');
+        title.className = 'modal-title';
         title.textContent = titleText;
-        title.style.cssText = 'font-weight:700;margin-bottom:8px;';
         const nameLabel = document.createElement('div');
+        nameLabel.className = 'modal-field-label';
         nameLabel.textContent = 'Name';
-        nameLabel.style.cssText = 'font-size:12px;color:#bbb;margin-bottom:4px;';
         const nameInput = document.createElement('input');
         nameInput.type = 'text';
         nameInput.placeholder = 'score';
-        nameInput.style.cssText = 'width:100%;padding:8px;border-radius:6px;border:1px solid #555;background:#1e1e1e;color:#eee;';
+        nameInput.className = 'modal-input';
         const scopeRow = document.createElement('label');
-        scopeRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:10px;';
+        scopeRow.className = 'modal-scope-row';
         const scopeCb = document.createElement('input');
         scopeCb.type = 'checkbox';
         const scopeText = document.createElement('span');
@@ -2580,13 +2592,15 @@ function createNodeBlock(codeData, x, y) {
         scopeRow.appendChild(scopeCb); scopeRow.appendChild(scopeText);
         if (hideInstanceToggle) scopeRow.style.display = 'none';
         const btnRow = document.createElement('div');
-        btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:12px;';
+        btnRow.className = 'modal-actions';
         const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
         cancelBtn.textContent = 'Cancel';
-        cancelBtn.style.cssText = 'padding:6px 10px;border:1px solid #555;background:#333;color:#eee;border-radius:6px;';
+        cancelBtn.className = 'ui-btn-secondary';
         const createBtn = document.createElement('button');
+        createBtn.type = 'button';
         createBtn.textContent = 'Create';
-        createBtn.style.cssText = 'padding:6px 10px;border:1px solid #0aa;background:#00ffcc;color:#1a1a1a;border-radius:6px;';
+        createBtn.className = 'ui-btn-primary';
         btnRow.appendChild(cancelBtn); btnRow.appendChild(createBtn);
         panel.appendChild(title); panel.appendChild(nameLabel); panel.appendChild(nameInput); panel.appendChild(scopeRow); panel.appendChild(btnRow);
         overlay.appendChild(panel);
@@ -2867,7 +2881,7 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
     addItem('Forever', 'forever');
     addItem('Wait', 'wait');
     // Motion
-    addItem('Move By (dx, dy)', 'move_xy');
+    addItem('Move By (x, y)', 'move_xy');
     addItem('Move Forward', 'move_forward');
     addItem('Set X', 'set_x');
     addItem('Set Y', 'set_y');
@@ -2887,7 +2901,7 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
     addItem('Array Insert', 'array_insert');
     addItem('Array Delete Index', 'array_delete');
     // Instances
-    addItem('Create Instance', 'instantiate');
+    addItem('Instantiate', 'instantiate');
     addItem('Delete Instance', 'delete_instance');
     // Debug
     addItem('Print', 'print');
@@ -2895,10 +2909,11 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
     // Position: append within block so CSS absolute positioning can anchor it
     if (customPosition) {
         // For drag-opened: show near mouse using fixed positioning, without changing size
+        const scrollHost = getCodeScrollContainer();
         const nodeWindow = document.getElementById('node-window');
-        const nodeRect = nodeWindow.getBoundingClientRect();
-        const absoluteX = nodeRect.left + (customPosition.x - (nodeWindow.scrollLeft || 0));
-        const absoluteY = nodeRect.top + (customPosition.y - (nodeWindow.scrollTop || 0));
+        const nodeRect = scrollHost.getBoundingClientRect();
+        const absoluteX = nodeRect.left + (customPosition.x - (scrollHost.scrollLeft || 0));
+        const absoluteY = nodeRect.top + (customPosition.y - (scrollHost.scrollTop || 0));
 
         menu.style.position = 'fixed';
         menu.style.left = `${absoluteX}px`;
@@ -3021,10 +3036,11 @@ function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn,
 
     if (customPosition) {
         // For drag-opened: show near mouse using fixed positioning, without changing size
+        const scrollHost = getCodeScrollContainer();
         const nodeWindow = document.getElementById('node-window');
-        const nodeRect = nodeWindow.getBoundingClientRect();
-        const absoluteX = nodeRect.left + (customPosition.x - (nodeWindow.scrollLeft || 0));
-        const absoluteY = nodeRect.top + (customPosition.y - (nodeWindow.scrollTop || 0));
+        const nodeRect = scrollHost.getBoundingClientRect();
+        const absoluteX = nodeRect.left + (customPosition.x - (scrollHost.scrollLeft || 0));
+        const absoluteY = nodeRect.top + (customPosition.y - (scrollHost.scrollTop || 0));
 
         menu.style.position = 'fixed';
         menu.style.left = `${absoluteX}px`;
@@ -3091,7 +3107,8 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
     const branchKey = branch === 'b' ? 'next_block_b' : 'next_block_a';
     const oldNext = (anchorCodeData && typeof anchorCodeData[branchKey] !== 'undefined') ? anchorCodeData[branchKey] : null;
     const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
-    // customPosition is already in node-window content coordinates when provided
+    // Drag-to-create passes scroll content coords; block.position is layer-local (unscaled) inside #code-zoom-layer
+    const placementPoint = customPosition ? scrollContentToLayerLocal(customPosition) : null;
 
     let newBlock = {
         id: newId,
@@ -3104,7 +3121,7 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
         input_b: null,
         next_block_a: oldNext,
         next_block_b: null,
-        position: customPosition ? { x: customPosition.x, y: customPosition.y } : { x: basePosition.x, y: basePosition.y + 60 }
+        position: placementPoint ? { x: placementPoint.x, y: placementPoint.y } : { x: basePosition.x, y: basePosition.y + 60 }
     };
 
     if (typeKey === 'move_xy') {
@@ -3214,7 +3231,7 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
     selectedObj.code.push(newBlock);
 
     // For drag-to-create, adjust position to center the block on mouse coordinates
-    if (customPosition) {
+    if (placementPoint) {
         // Create a temporary block to get its dimensions
         const tempBlock = createNodeBlock(newBlock, 0, 0);
         tempBlock.style.visibility = 'hidden';
@@ -3225,8 +3242,8 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
         const blockHeight = tempBlock.offsetHeight;
 
         // Center the block on the mouse position
-        newBlock.position.x = customPosition.x - (blockWidth / 2);
-        newBlock.position.y = customPosition.y - (blockHeight / 2);
+        newBlock.position.x = placementPoint.x - (blockWidth / 2);
+        newBlock.position.y = placementPoint.y - (blockHeight / 2);
 
         // Remove temporary block
         document.body.removeChild(tempBlock);
@@ -3241,7 +3258,7 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     const existingIds = selectedObj.code.map(b => b.id);
     const newId = (existingIds.length ? Math.max(...existingIds) : 0) + 1;
     const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
-    // customPosition is already in node-window content coordinates when provided
+    const placementPoint = customPosition ? scrollContentToLayerLocal(customPosition) : null;
 
     let newBlock = {
         id: newId,
@@ -3254,7 +3271,7 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         input_b: null,
         next_block_a: null,
         next_block_b: null,
-        position: customPosition ? { x: customPosition.x, y: customPosition.y } : { x: basePosition.x, y: basePosition.y - 60 }
+        position: placementPoint ? { x: placementPoint.x, y: placementPoint.y } : { x: basePosition.x, y: basePosition.y - 60 }
     };
 
     // Optional defaults for specific input blocks
@@ -3315,7 +3332,7 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     selectedObj.code.push(newBlock);
 
     // For drag-to-create, adjust position to center the block on mouse coordinates
-    if (customPosition) {
+    if (placementPoint) {
         // Create a temporary block to get its dimensions
         const tempBlock = createNodeBlock(newBlock, 0, 0);
         tempBlock.style.visibility = 'hidden';
@@ -3326,8 +3343,8 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         const blockHeight = tempBlock.offsetHeight;
 
         // Center the block on the mouse position
-        newBlock.position.x = customPosition.x - (blockWidth / 2);
-        newBlock.position.y = customPosition.y - (blockHeight / 2);
+        newBlock.position.x = placementPoint.x - (blockWidth / 2);
+        newBlock.position.y = placementPoint.y - (blockHeight / 2);
 
         // Remove temporary block
         document.body.removeChild(tempBlock);
@@ -3342,9 +3359,10 @@ function handleMouseMove(e) {
 
     const dx = e.clientX - dragStartX;
     const dy = e.clientY - dragStartY;
+    const z = codeZoom || 1;
 
-    const newX = blockStartX + dx;
-    const newY = blockStartY + dy;
+    const newX = blockStartX + dx / z;
+    const newY = blockStartY + dy / z;
 
     draggedBlock.style.left = `${newX}px`;
     draggedBlock.style.top = `${newY}px`;
@@ -3357,9 +3375,10 @@ function handleMouseUp(e) {
 
     const dx = e.clientX - dragStartX;
     const dy = e.clientY - dragStartY;
+    const z = codeZoom || 1;
 
-    const finalX = blockStartX + dx;
-    const finalY = blockStartY + dy;
+    const finalX = blockStartX + dx / z;
+    const finalY = blockStartY + dy / z;
 
     draggedBlock.style.left = `${finalX}px`;
     draggedBlock.style.top = `${finalY}px`;
@@ -3391,9 +3410,10 @@ function handleTouchMove(e) {
     const touch = e.touches[0];
     const dx = touch.clientX - dragStartX;
     const dy = touch.clientY - dragStartY;
+    const z = codeZoom || 1;
 
-    const newX = blockStartX + dx;
-    const newY = blockStartY + dy;
+    const newX = blockStartX + dx / z;
+    const newY = blockStartY + dy / z;
 
     draggedBlock.style.left = `${newX}px`;
     draggedBlock.style.top = `${newY}px`;
@@ -3411,8 +3431,9 @@ function handleTouchEnd(e) {
         const touch = e.changedTouches[0];
         const dx = touch.clientX - dragStartX;
         const dy = touch.clientY - dragStartY;
-        finalX = blockStartX + dx;
-        finalY = blockStartY + dy;
+        const z = codeZoom || 1;
+        finalX = blockStartX + dx / z;
+        finalY = blockStartY + dy / z;
     }
 
     draggedBlock.style.left = `${finalX}px`;
@@ -3438,11 +3459,13 @@ function handleTouchEnd(e) {
     updateSpacerFromBlocks();
 }
 
-// Canvas for drawing connections
+// Canvas lives inside #code-zoom-layer (same scroll + transform as blocks) so wires stay aligned when panning.
 const connectionCanvas = document.createElement("canvas");
-connectionCanvas.style.position = "sticky";
+connectionCanvas.style.position = "absolute";
 connectionCanvas.style.top = "0";
 connectionCanvas.style.left = "0";
+connectionCanvas.style.width = "100%";
+connectionCanvas.style.height = "100%";
 connectionCanvas.style.pointerEvents = "none";
 connectionCanvas.style.zIndex = "0";
 const connectionCtx = connectionCanvas.getContext("2d");
@@ -3456,9 +3479,83 @@ let autoScrollTarget = { dx: 0, dy: 0 };
 const BASE_SPACER_SIZE_PX = 2000;
 const EXTRA_SPACER_PADDING_PX = 400;
 let nodeWindowListenersAttached = false;
+let codeMiddlePanAttached = false;
+
+/** Scrollable host for the code tab (#code-viewport) or legacy #node-window */
+function getCodeScrollContainer() {
+    return document.getElementById('code-viewport') || document.getElementById('node-window');
+}
+
+let codeZoom = 1.0;
+
+function setCodeZoom(z) {
+    codeZoom = Math.max(0.25, Math.min(2.5, z));
+    updateSpacerFromBlocks();
+    drawConnections();
+}
+
+function setCodeZoomBtnIcon(btn, iconNameOrNames, fallbackText) {
+    const names = Array.isArray(iconNameOrNames) ? iconNameOrNames : [iconNameOrNames];
+    const primary = names[0];
+    const lucide = window.lucide;
+    const safeFallback = fallbackText == null ? '' : String(fallbackText);
+    if (lucide && lucide.icons) {
+        const found = names.find(n => lucide.icons && lucide.icons[n]);
+        const iconDef = found ? lucide.icons[found] : null;
+        if (iconDef && typeof iconDef.toSvg === 'function') {
+            btn.innerHTML = `${iconDef.toSvg({ width: 18, height: 18 })}<span class="icon-fallback">${safeFallback}</span>`;
+            return;
+        }
+    }
+    if (lucide && typeof lucide.createIcons === 'function') {
+        btn.innerHTML = `<i data-lucide="${primary}"></i><span class="icon-fallback">${safeFallback}</span>`;
+        return;
+    }
+    btn.textContent = safeFallback;
+}
+
+/**
+ * Shared zoom strip for code tab + image draw area — reset uses Lucide Equal (equal).
+ * @param {{ onZoomOut: function, onZoomReset: function, onZoomIn: function }} handlers
+ */
+function createZoomControlStrip(handlers) {
+    const wrap = document.createElement('div');
+    wrap.className = 'code-zoom-controls';
+    const mk = (iconNames, title, onClick, fallback) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'zoom-btn';
+        b.title = title;
+        setCodeZoomBtnIcon(b, iconNames, fallback);
+        b.addEventListener('click', (e) => {
+            e.stopPropagation();
+            onClick();
+        });
+        return b;
+    };
+    const zoomOutBtn = mk(['zoom-out', 'search-minus', 'minus'], 'Zoom out', handlers.onZoomOut, '−');
+    const zoomResetBtn = mk(['equal'], 'Reset zoom (100%)', handlers.onZoomReset, '=');
+    const zoomInBtn = mk(['zoom-in', 'search-plus', 'plus'], 'Zoom in', handlers.onZoomIn, '+');
+    wrap.appendChild(zoomOutBtn);
+    wrap.appendChild(zoomResetBtn);
+    wrap.appendChild(zoomInBtn);
+    // Do not call createIcons() here — the strip is often not in the document yet; Lucide only
+    // replaces [data-lucide] nodes that are connected. Call createIcons after append (code tab)
+    // or rely on refreshLucideIcons after the images UI is mounted.
+    return { wrap, zoomOutBtn, zoomResetBtn, zoomInBtn };
+}
+
+function createCodeZoomControls() {
+    const { wrap } = createZoomControlStrip({
+        onZoomOut: () => setCodeZoom(codeZoom / 1.2),
+        onZoomReset: () => setCodeZoom(1),
+        onZoomIn: () => setCodeZoom(codeZoom * 1.2),
+    });
+    return wrap;
+}
 
 function autoScrollIfNearEdge(clientX, clientY) {
-    const nodeWindow = document.getElementById('node-window');
+    const nodeWindow = getCodeScrollContainer();
     if (!nodeWindow) return;
     const r = nodeWindow.getBoundingClientRect();
     let dx = 0, dy = 0;
@@ -3489,62 +3586,106 @@ function autoScrollIfNearEdge(clientX, clientY) {
 function updateSpacerFromBlocks() {
     const nodeWindow = document.getElementById('node-window');
     if (!nodeWindow || activeTab !== 'code') return;
-    let spacer = nodeWindow.querySelector('#node-spacer');
-    if (!spacer) {
-        spacer = document.createElement('div');
-        spacer.id = 'node-spacer';
-        spacer.style.position = 'relative';
-        spacer.style.pointerEvents = 'none';
-        spacer.style.border = 'none';
-        nodeWindow.appendChild(spacer);
-    }
-    const nodeRect = nodeWindow.getBoundingClientRect();
-    let maxRight = nodeRect.width;
-    let maxBottom = nodeRect.height;
+    const layer = document.getElementById('code-zoom-layer');
+    const sizer = document.getElementById('code-zoom-sizer');
     const blocks = nodeWindow.querySelectorAll('.node-block');
+    let maxRight = BASE_SPACER_SIZE_PX;
+    let maxBottom = BASE_SPACER_SIZE_PX;
     blocks.forEach(el => {
-        const br = el.getBoundingClientRect();
-        const right = br.right - nodeRect.left;
-        const bottom = br.bottom - nodeRect.top;
-        if (right > maxRight) maxRight = right;
-        if (bottom > maxBottom) maxBottom = bottom;
+        const x = parseFloat(el.style.left);
+        const y = parseFloat(el.style.top);
+        const lx = Number.isFinite(x) ? x : 0;
+        const ly = Number.isFinite(y) ? y : 0;
+        const bw = el.offsetWidth;
+        const bh = el.offsetHeight;
+        maxRight = Math.max(maxRight, lx + bw + EXTRA_SPACER_PADDING_PX);
+        maxBottom = Math.max(maxBottom, ly + bh + EXTRA_SPACER_PADDING_PX);
     });
-    const w = Math.max(BASE_SPACER_SIZE_PX, Math.ceil(maxRight + EXTRA_SPACER_PADDING_PX));
-    const h = Math.max(BASE_SPACER_SIZE_PX, Math.ceil(maxBottom + EXTRA_SPACER_PADDING_PX));
-    spacer.style.width = w + 'px';
-    spacer.style.height = h + 'px';
+    const w = Math.max(BASE_SPACER_SIZE_PX, Math.ceil(maxRight));
+    const h = Math.max(BASE_SPACER_SIZE_PX, Math.ceil(maxBottom));
+    const z = codeZoom || 1;
+    if (layer) {
+        layer.style.width = w + 'px';
+        layer.style.height = h + 'px';
+        layer.style.minWidth = '';
+        layer.style.minHeight = '';
+        layer.style.transform = `scale(${z})`;
+        layer.style.transformOrigin = '0 0';
+    }
+    if (sizer) {
+        sizer.style.width = Math.max(1, Math.ceil(w * z)) + 'px';
+        sizer.style.height = Math.max(1, Math.ceil(h * z)) + 'px';
+    }
 }
 
 function ensureScrollableWorkspace() {
     const nodeWindow = document.getElementById('node-window');
     if (!nodeWindow || activeTab !== 'code') return;
-    // Enable both-axis scrolling and layering
-    nodeWindow.style.overflow = 'auto';
-    if (!nodeWindow.style.position) nodeWindow.style.position = 'relative';
-    // Subtle grid background for polish
-    nodeWindow.style.backgroundImage = `
-        linear-gradient(to right, rgba(255,255,255,0.05) 1px, transparent 1px),
-        linear-gradient(to bottom, rgba(255,255,255,0.05) 1px, transparent 1px)`;
-    nodeWindow.style.backgroundSize = '24px 24px';
-    nodeWindow.style.backgroundColor = nodeWindow.style.backgroundColor || '#1e1e1e';
+    const scrollHost = getCodeScrollContainer();
+    if (!scrollHost) return;
+    nodeWindow.style.overflow = 'hidden';
+    scrollHost.style.overflow = 'auto';
+    if (!scrollHost.style.position) scrollHost.style.position = 'relative';
+    scrollHost.style.backgroundImage = 'none';
+    scrollHost.style.backgroundColor = '#1e1e1e';
 
-    // Ensure spacer exists and is sized after layout
+    const layer = document.getElementById('code-zoom-layer');
+    if (layer) {
+        layer.style.backgroundImage = `
+            linear-gradient(to right, rgba(255,255,255,0.06) 1px, transparent 1px),
+            linear-gradient(to bottom, rgba(255,255,255,0.06) 1px, transparent 1px)`;
+        layer.style.backgroundSize = '24px 24px';
+        layer.style.backgroundColor = '#1e1e1e';
+    }
+
+    /* Sync first so scrollHeight is correct before any wheel/scrollbar interaction */
+    updateSpacerFromBlocks();
     requestAnimationFrame(updateSpacerFromBlocks);
 
-    if (!nodeWindowListenersAttached) {
-        nodeWindow.addEventListener('scroll', () => {
+    if (!scrollHost.__drawOnScrollBound) {
+        scrollHost.__drawOnScrollBound = true;
+        scrollHost.addEventListener('scroll', () => {
             drawConnections();
         });
+    }
+
+    if (!nodeWindowListenersAttached) {
         window.addEventListener('resize', () => {
             drawConnections();
             requestAnimationFrame(updateSpacerFromBlocks);
         });
         nodeWindowListenersAttached = true;
     }
-}
 
-// Zoom state for code viewport
-// Zoom disabled
+    if (!codeMiddlePanAttached) {
+        nodeWindow.addEventListener('mousedown', (e) => {
+            if (activeTab !== 'code') return;
+            if (e.button !== 1) return;
+            const host = getCodeScrollContainer();
+            if (!host || !host.contains(e.target)) return;
+            if (e.target.closest && e.target.closest('.code-zoom-controls')) return;
+            e.preventDefault();
+            let lastX = e.clientX;
+            let lastY = e.clientY;
+            function onMove(ev) {
+                host.scrollLeft -= ev.clientX - lastX;
+                host.scrollTop -= ev.clientY - lastY;
+                lastX = ev.clientX;
+                lastY = ev.clientY;
+                drawConnections();
+            }
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp, true);
+                document.removeEventListener('mouseup', onUp);
+            }
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp, true);
+            document.addEventListener('mouseup', onUp);
+        });
+        codeMiddlePanAttached = true;
+    }
+}
 
 // Drag-to-connect state
 let isConnecting = false;
@@ -3555,11 +3696,69 @@ let connectFromNext = null; // { blockId, which }
 let lastConnectEndedAt = 0;
 let connectStartTime = 0;
 
-// Convert content-space point to viewport-space (node-window visible area)
-function contentToViewport(nodeWindow, point) {
-    const sl = nodeWindow ? (nodeWindow.scrollLeft || 0) : 0;
-    const st = nodeWindow ? (nodeWindow.scrollTop || 0) : 0;
-    return { x: point.x - sl, y: point.y - st };
+// connectMouse: scroll content coords = scrollLeft + (clientX - hostBorderLeft).
+// Layer has transform: scale(z); layer-local (unscaled) coords = (screen - layerOrigin) / z.
+/** Uniform scale from layer's computed transform (matches rendered blocks; avoids JS/CSS drift). */
+function getLayerUniformScale(layer) {
+    if (!layer) return codeZoom || 1;
+    const inline = layer.style && layer.style.transform;
+    if (inline && typeof inline === 'string') {
+        const mScale = inline.match(/scale\(\s*([0-9.eE+-]+)\s*\)/);
+        if (mScale) {
+            const s = parseFloat(mScale[1]);
+            if (s > 0.001 && Number.isFinite(s)) return s;
+        }
+    }
+    try {
+        const t = getComputedStyle(layer).transform;
+        if (!t || t === 'none') return codeZoom || 1;
+        const m = new DOMMatrixReadOnly(t);
+        const s = Math.hypot(m.a, m.b);
+        if (s > 0.001 && Number.isFinite(s)) return s;
+    } catch (_) {}
+    return codeZoom || 1;
+}
+
+function contentToViewport(_nodeWindow, point) {
+    const c = getCodeScrollContainer();
+    const layer = document.getElementById('code-zoom-layer');
+    if (!c || !layer) return { x: 0, y: 0 };
+    const sl = c.scrollLeft || 0;
+    const st = c.scrollTop || 0;
+    const host = c.getBoundingClientRect();
+    const vx = point.x - sl + host.left;
+    const vy = point.y - st + host.top;
+    const lr = layer.getBoundingClientRect();
+    const z = getLayerUniformScale(layer);
+    return {
+        x: (vx - lr.left) / z,
+        y: (vy - lr.top) / z
+    };
+}
+
+/** Same coordinate system as connectMouse / scrollLeft + viewport offset → layer-local unscaled (block position). */
+function scrollContentToLayerLocal(point) {
+    const c = getCodeScrollContainer();
+    if (!point || !c) return point;
+    return contentToViewport(c, point);
+}
+
+/** Element geometry in #code-zoom-layer local space (unscaled px), matching block style.left/top. */
+function getLayerLocalRect(layer, el, lrCache, scale) {
+    const lr = lrCache || layer.getBoundingClientRect();
+    const br = el.getBoundingClientRect();
+    const zz = scale || 1;
+    const left = (br.left - lr.left) / zz;
+    const top = (br.top - lr.top) / zz;
+    return {
+        left,
+        top,
+        width: br.width / zz,
+        height: br.height / zz,
+        cx: left + br.width / (2 * zz),
+        cy: top + br.height / (2 * zz),
+        bottom: top + br.height / zz
+    };
 }
 
 // Track active document click handlers for node-add menus so we can remove them reliably
@@ -3596,7 +3795,8 @@ function startConnectFromNext(blockId, which) {
 }
 
 function handleConnectMouseMove(e) {
-    const container = document.getElementById('node-window');
+    const container = getCodeScrollContainer();
+    if (!container) return;
     const rect = container.getBoundingClientRect();
     const sl = container.scrollLeft || 0;
     const st = container.scrollTop || 0;
@@ -3615,7 +3815,7 @@ function handleConnectMouseUp(e) {
     try {
         // Normalize mouse position to content coordinates at release time
         try {
-            const container = document.getElementById('node-window');
+            const container = getCodeScrollContainer();
             if (container) {
                 const rect = container.getBoundingClientRect();
                 const sl = container.scrollLeft || 0;
@@ -3932,140 +4132,147 @@ function connectProviderToInput(selectedObj, targetBlock, which, providerId) {
     updateWorkspace();
 }
 
-// Resize canvas to match node window
+// Resize canvas to match zoom layer (unscaled layout size)
 function resizeConnectionCanvas() {
+    const layer = document.getElementById('code-zoom-layer');
     const viewport = document.getElementById('code-viewport') || document.getElementById('node-window');
-    const r = viewport.getBoundingClientRect();
-    connectionCanvas.width = Math.max(1, Math.floor(r.width));
-    connectionCanvas.height = Math.max(1, Math.floor(r.height));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const cw = Math.max(1, layer ? layer.offsetWidth : viewport.clientWidth);
+    const ch = Math.max(1, layer ? layer.offsetHeight : viewport.clientHeight);
+    connectionCanvas.width = Math.floor(cw * dpr);
+    connectionCanvas.height = Math.floor(ch * dpr);
+    connectionCanvas.style.width = cw + 'px';
+    connectionCanvas.style.height = ch + 'px';
 }
-// Draw connections between blocks
+// Draw connections between blocks (layer-local unscaled coords; canvas is inside transformed layer)
 function drawConnections() {
-    // Base off the unscaled node window to keep lines crisp
     const nodeWindow = document.getElementById('node-window');
-    const vr = nodeWindow.getBoundingClientRect();
-    // Keep the overlay canvas sized to the visible viewport for crisp lines
-    connectionCanvas.width = Math.max(1, Math.floor(vr.width));
-    connectionCanvas.height = Math.max(1, Math.floor(vr.height));
-    connectionCanvas.style.width = vr.width + 'px';
-    connectionCanvas.style.height = vr.height + 'px';
-    connectionCtx.setTransform(1, 0, 0, 1, 0, 0);
-    connectionCtx.clearRect(0, 0, connectionCanvas.width, connectionCanvas.height);
-    
+    if (!nodeWindow) return;
+    const layer = document.getElementById('code-zoom-layer');
+    if (!layer) return;
+    if (!layer.contains(connectionCanvas)) {
+        try {
+            layer.insertBefore(connectionCanvas, layer.firstChild);
+        } catch (_) {
+            return;
+        }
+    }
+
+    const lrCached = layer.getBoundingClientRect();
+    const scale = getLayerUniformScale(layer);
+
+    const cw = Math.max(1, layer.offsetWidth);
+    const ch = Math.max(1, layer.offsetHeight);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    connectionCanvas.width = Math.floor(cw * dpr);
+    connectionCanvas.height = Math.floor(ch * dpr);
+    connectionCanvas.style.width = cw + 'px';
+    connectionCanvas.style.height = ch + 'px';
+    connectionCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    connectionCtx.clearRect(0, 0, cw, ch);
+    connectionCtx.lineCap = 'round';
+    connectionCtx.lineJoin = 'round';
+    const strokeW = Math.max(1.25, 1.75 * scale);
+    const dashOn = Math.max(4, 6 * scale);
+    const dashOff = Math.max(3, 4 * scale);
+
     const selectedObj = objects.find(obj => obj.id == selected_object);
     if (!selectedObj) return;
 
     selectedObj.code.forEach(code => {
         const startBlock = nodeWindow.querySelector(`.node-block[data-code-id="${code.id}"]`);
         if (!startBlock) return;
-        const startRect = startBlock.getBoundingClientRect();
-        const nodeWindowRect = vr;
-        const containerEl0 = document.getElementById('node-window');
+        const st = getLayerLocalRect(layer, startBlock, lrCached, scale);
         const plusA = startBlock.querySelector('.node-plus-btn-a');
         const plusB = startBlock.querySelector('.node-plus-btn-b');
-        const startX_A = plusA ? (plusA.getBoundingClientRect().left - nodeWindowRect.left + plusA.offsetWidth / 2) : (startRect.left - nodeWindowRect.left + startRect.width * 0.45);
-        const startX_B = plusB ? (plusB.getBoundingClientRect().left - nodeWindowRect.left + plusB.offsetWidth / 2) : (startRect.left - nodeWindowRect.left + startRect.width * 0.55);
-        const startY_A = plusA ? (plusA.getBoundingClientRect().bottom - nodeWindowRect.top) : (startRect.bottom - nodeWindowRect.top);
-        const startY_B = plusB ? (plusB.getBoundingClientRect().bottom - nodeWindowRect.top) : (startRect.bottom - nodeWindowRect.top);
+        const rectA = plusA ? getLayerLocalRect(layer, plusA, lrCached, scale) : null;
+        const rectB = plusB ? getLayerLocalRect(layer, plusB, lrCached, scale) : null;
+        const startX_A = rectA ? rectA.cx : st.left + st.width * 0.45;
+        const startX_B = rectB ? rectB.cx : st.left + st.width * 0.55;
+        const startY_A = rectA ? rectA.bottom : st.top + st.height;
+        const startY_B = rectB ? rectB.bottom : st.top + st.height;
 
         const drawArrow = (targetId, color, useB) => {
             if (targetId === null || typeof targetId === 'undefined') return;
             const endBlock = nodeWindow.querySelector(`.node-block[data-code-id="${targetId}"]`);
             if (!endBlock) return;
-            const endRect = endBlock.getBoundingClientRect();
-            // Aim to the block's top anchor circle (aligned with ::before)
-            const endX = endRect.left - nodeWindowRect.left + 18 + 5; // left + offset + radius
-            const endY = endRect.top - nodeWindowRect.top - 1; // just above top edge
+            const en = getLayerLocalRect(layer, endBlock, lrCached, scale);
+            const endX = en.left + 23;
+            const endY = en.top - 1;
             connectionCtx.beginPath();
             const pStart = { x: (useB ? startX_B : startX_A), y: (useB ? startY_B : startY_A) };
             const pEnd = { x: endX, y: endY };
-            // These are already in node-window viewport space
             connectionCtx.moveTo(pStart.x, pStart.y);
             connectionCtx.lineTo(pEnd.x, pEnd.y);
             connectionCtx.strokeStyle = color;
-            connectionCtx.lineWidth = 2;
+            connectionCtx.lineWidth = strokeW;
             connectionCtx.stroke();
         };
 
         drawArrow(code.next_block_a, "#4da3ff", false); // blue-ish for A
         drawArrow(code.next_block_b, "#ffb84d", true); // orange-ish for B
 
-        // Input connections (from top input plus buttons to value blocks)
         const inputPlusA = startBlock.querySelector('.node-input-plus-btn-a');
         const inputPlusB = startBlock.querySelector('.node-input-plus-btn-b');
         const getInputStart = (btnEl) => {
             if (!btnEl) return null;
-            const r = btnEl.getBoundingClientRect();
-            // Project to viewport space of node-window (canvas coords)
-            const containerEl = document.getElementById('node-window');
-            const containerRect = containerEl.getBoundingClientRect();
-            return {
-                x: (r.left - containerRect.left) + r.width / 2,
-                y: (r.top - containerRect.top)
-            };
+            const r = getLayerLocalRect(layer, btnEl, lrCached, scale);
+            return { x: r.cx, y: r.top };
         };
         const drawInputArrow = (targetId, btnEl, color) => {
             if (targetId === null || typeof targetId === 'undefined' || !btnEl) return;
             const endBlock = nodeWindow.querySelector(`.node-block[data-code-id="${targetId}"]`);
             if (!endBlock) return;
             const outAnchor = endBlock.querySelector('.node-output-anchor');
-            const outRect = outAnchor ? outAnchor.getBoundingClientRect() : endBlock.getBoundingClientRect();
+            const outEl = outAnchor || endBlock;
+            const outR = getLayerLocalRect(layer, outEl, lrCached, scale);
             const start = getInputStart(btnEl);
             if (!start) return;
-            // Start at consumer's input plus (top), end at provider's bottom-center output anchor
-            const containerEl2 = document.getElementById('node-window');
-            const containerRect2 = containerEl2.getBoundingClientRect();
-            const endX = (outRect.left - containerRect2.left) + outRect.width / 2;
-            const endY = (outRect.top - containerRect2.top) + outRect.height / 2;
+            const endX = outR.cx;
+            const endY = outR.cy;
             connectionCtx.beginPath();
             connectionCtx.moveTo(start.x, start.y);
             connectionCtx.lineTo(endX, endY);
             connectionCtx.strokeStyle = color;
-            connectionCtx.lineWidth = 2;
+            connectionCtx.lineWidth = strokeW;
             connectionCtx.stroke();
         };
 
-        // While connecting, draw a provisional line
+        const scrollHost = getCodeScrollContainer();
+
         if (isConnecting && connectFromBlockId != null) {
             const fromBlock = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromBlockId}"]`);
             if (fromBlock) {
                 const anchor = fromBlock.querySelector('.node-output-anchor');
                 if (anchor) {
-                    const ar = anchor.getBoundingClientRect();
-                    const containerEl3 = document.getElementById('node-window');
-                    const containerRect3 = containerEl3.getBoundingClientRect();
-                    const sx = (ar.left - containerRect3.left) + ar.width / 2;
-                    const sy = (ar.top - containerRect3.top) + ar.height / 2;
+                    const ar = getLayerLocalRect(layer, anchor, lrCached, scale);
                     connectionCtx.beginPath();
-                    connectionCtx.moveTo(sx, sy);
-                    const p2 = contentToViewport(containerEl3, connectMouse);
+                    connectionCtx.moveTo(ar.cx, ar.cy);
+                    const p2 = contentToViewport(scrollHost, connectMouse);
                     connectionCtx.lineTo(p2.x, p2.y);
                     connectionCtx.strokeStyle = '#66ff99';
-                    connectionCtx.lineWidth = 2;
-                    connectionCtx.setLineDash([6, 4]);
+                    connectionCtx.lineWidth = strokeW;
+                    connectionCtx.setLineDash([dashOn, dashOff]);
                     connectionCtx.stroke();
                     connectionCtx.setLineDash([]);
                 }
             }
         }
 
-        // While connecting from input, draw preview from input-plus to mouse
         if (isConnecting && connectFromInput) {
-            const startBlock = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromInput.blockId}"]`);
-            if (startBlock) {
-                const btnEl = startBlock.querySelector(connectFromInput.which === 'b' ? '.node-input-plus-btn-b' : '.node-input-plus-btn-a');
+            const sb = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromInput.blockId}"]`);
+            if (sb) {
+                const btnEl = sb.querySelector(connectFromInput.which === 'b' ? '.node-input-plus-btn-b' : '.node-input-plus-btn-a');
                 if (btnEl) {
                     const start = getInputStart(btnEl);
                     if (start) {
                         connectionCtx.beginPath();
                         connectionCtx.moveTo(start.x, start.y);
-                        // connectMouse is in content coordinates; convert to viewport for drawing
-                        const containerElPreview = document.getElementById('node-window');
-                        const p = contentToViewport(containerElPreview, connectMouse);
+                        const p = contentToViewport(scrollHost, connectMouse);
                         connectionCtx.lineTo(p.x, p.y);
                         connectionCtx.strokeStyle = '#66ff99';
-                        connectionCtx.lineWidth = 2;
-                        connectionCtx.setLineDash([6, 4]);
+                        connectionCtx.lineWidth = strokeW;
+                        connectionCtx.setLineDash([dashOn, dashOff]);
                         connectionCtx.stroke();
                         connectionCtx.setLineDash([]);
                     }
@@ -4073,25 +4280,21 @@ function drawConnections() {
             }
         }
 
-        // While connecting from next (A/B), draw preview from bottom plus to mouse
         if (isConnecting && connectFromNext) {
             const startBlockEl = nodeWindow.querySelector(`.node-block[data-code-id="${connectFromNext.blockId}"]`);
             if (startBlockEl) {
                 const btnEl = startBlockEl.querySelector(connectFromNext.which === 'b' ? '.node-plus-btn-b' : '.node-plus-btn-a');
-                const r = btnEl && btnEl.getBoundingClientRect();
-                if (r) {
-                    const containerEl4 = document.getElementById('node-window');
-                    const containerRect4 = containerEl4.getBoundingClientRect();
-                    const sx = (r.left - containerRect4.left) + r.width / 2;
-                    const sy = (r.bottom - containerRect4.top);
+                if (btnEl) {
+                    const br = getLayerLocalRect(layer, btnEl, lrCached, scale);
+                    const sx = br.cx;
+                    const sy = br.bottom;
                     connectionCtx.beginPath();
                     connectionCtx.moveTo(sx, sy);
-                    // connectMouse is in content space; convert to viewport for drawing
-                    const p = contentToViewport(containerEl4, connectMouse);
+                    const p = contentToViewport(scrollHost, connectMouse);
                     connectionCtx.lineTo(p.x, p.y);
                     connectionCtx.strokeStyle = '#4da3ff';
-                    connectionCtx.lineWidth = 2;
-                    connectionCtx.setLineDash([6, 4]);
+                    connectionCtx.lineWidth = strokeW;
+                    connectionCtx.setLineDash([dashOn, dashOff]);
                     connectionCtx.stroke();
                     connectionCtx.setLineDash([]);
                 }
@@ -4214,21 +4417,120 @@ let imageEditor = null;
 let currentImageFilename = null;
 let currentImageInfo = null;
 let imageRevision = 0; // increment to bust caches when saving
+
+function removeImageAssetContextMenu() {
+    const el = document.getElementById('__image_asset_ctx_menu');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+let _imageAssetCtxMenuDismissBound = false;
+function bindImageAssetContextMenuDismiss() {
+    if (_imageAssetCtxMenuDismissBound) return;
+    _imageAssetCtxMenuDismissBound = true;
+    document.addEventListener('mousedown', (ev) => {
+        const menu = document.getElementById('__image_asset_ctx_menu');
+        if (!menu || menu.contains(ev.target)) return;
+        removeImageAssetContextMenu();
+    }, true);
+}
+function sanitizeImageDownloadFilename(name) {
+    const raw = name || `image_${Date.now()}.png`;
+    const safeBase = String(raw).replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^\.+/, '') || 'image';
+    return /\.(png|gif|jpe?g|webp)$/i.test(safeBase) ? safeBase : `${safeBase}.png`;
+}
+function downloadImageAssetToComputer(src, filename) {
+    const name = sanitizeImageDownloadFilename(filename);
+    const finishBlob = (blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = name;
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) {} }, 1500);
+    };
+    if (typeof src === 'string' && src.startsWith('data:')) {
+        const a = document.createElement('a');
+        a.href = src;
+        a.download = name;
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        return;
+    }
+    fetch(src)
+        .then(r => {
+            if (!r.ok) throw new Error('fetch failed');
+            return r.blob();
+        })
+        .then(finishBlob)
+        .catch(() => {
+            const a = document.createElement('a');
+            a.href = src;
+            a.download = name;
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        });
+}
+function showImageAssetSaveMenu(clientX, clientY, imgInfo) {
+    bindImageAssetContextMenuDismiss();
+    removeImageAssetContextMenu();
+    const menu = document.createElement('div');
+    menu.id = '__image_asset_ctx_menu';
+    menu.setAttribute('role', 'menu');
+    menu.className = 'ctx-menu';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Save image';
+    btn.setAttribute('role', 'menuitem');
+    btn.className = 'ctx-menu-item';
+    btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        downloadImageAssetToComputer(imgInfo.src, imgInfo.name);
+        removeImageAssetContextMenu();
+    });
+    menu.appendChild(btn);
+    document.body.appendChild(menu);
+    const w = menu.offsetWidth;
+    const h = menu.offsetHeight;
+    let lx = clientX;
+    let ly = clientY;
+    if (lx + w > window.innerWidth - 8) lx = window.innerWidth - w - 8;
+    if (ly + h > window.innerHeight - 8) ly = window.innerHeight - h - 8;
+    menu.style.left = `${Math.max(8, lx)}px`;
+    menu.style.top = `${Math.max(8, ly)}px`;
+}
+
 // Update workspace with node blocks or images interface
 function updateWorkspace() {
     const nodeWindow = document.getElementById('node-window');
 
-    // Preserve scroll position across re-render
-    const prevScrollLeft = nodeWindow ? nodeWindow.scrollLeft : 0;
-    const prevScrollTop = nodeWindow ? nodeWindow.scrollTop : 0;
+    const scrollHostBefore = getCodeScrollContainer();
+    const prevScrollLeft = scrollHostBefore ? scrollHostBefore.scrollLeft : 0;
+    const prevScrollTop = scrollHostBefore ? scrollHostBefore.scrollTop : 0;
 
-    // Clear existing content
     nodeWindow.innerHTML = '';
 
-    // Only show code blocks and connections if code tab is active
     if (activeTab === 'code') {
-        // Overlay connection canvas on node window
-        nodeWindow.appendChild(connectionCanvas);
+        nodeWindow.classList.add('code-tab-active');
+        nodeWindow.style.overflow = 'hidden';
+
+        const codeViewport = document.createElement('div');
+        codeViewport.id = 'code-viewport';
+
+        const sizer = document.createElement('div');
+        sizer.id = 'code-zoom-sizer';
+
+        const zoomLayer = document.createElement('div');
+        zoomLayer.id = 'code-zoom-layer';
+
+        sizer.appendChild(zoomLayer);
+
+        zoomLayer.appendChild(connectionCanvas);
 
         const selectedObj = objects.find(obj => obj.id == selected_object);
         if (!selectedObj) return;
@@ -4239,28 +4541,35 @@ function updateWorkspace() {
                 codeData.position.x,
                 codeData.position.y
             );
-            nodeWindow.appendChild(block);
+            zoomLayer.appendChild(block);
         });
 
+        codeViewport.appendChild(sizer);
+
+        nodeWindow.appendChild(codeViewport);
+        nodeWindow.appendChild(createCodeZoomControls());
+        try {
+            window.lucide && window.lucide.createIcons && window.lucide.createIcons();
+        } catch (_) {}
+
         ensureScrollableWorkspace();
-        updateSpacerFromBlocks();
-        // Restore scroll after layout so it doesn't jump to top
+        setCodeZoom(codeZoom);
         requestAnimationFrame(() => {
             try {
-                nodeWindow.scrollLeft = prevScrollLeft;
-                nodeWindow.scrollTop = prevScrollTop;
-            } catch(_) {}
-            // One more frame to ensure spacer and layout have settled
+                codeViewport.scrollLeft = prevScrollLeft;
+                codeViewport.scrollTop = prevScrollTop;
+            } catch (_) {}
             requestAnimationFrame(() => {
                 try {
-                    nodeWindow.scrollLeft = prevScrollLeft;
-                    nodeWindow.scrollTop = prevScrollTop;
-                } catch(_) {}
+                    codeViewport.scrollLeft = prevScrollLeft;
+                    codeViewport.scrollTop = prevScrollTop;
+                } catch (_) {}
                 drawConnections();
             });
         });
-        // Zoom disabled for now
     } else if (activeTab === 'images') {
+        nodeWindow.classList.remove('code-tab-active');
+        nodeWindow.style.overflow = '';
         // Create images tab interface
         createImagesInterface(nodeWindow);
         // Draw crosshair when switching to images tab
@@ -4268,19 +4577,11 @@ function updateWorkspace() {
             setTimeout(() => imageEditor.drawCrosshair && imageEditor.drawCrosshair(), 100);
         }
     } else {
+        nodeWindow.classList.remove('code-tab-active');
+        nodeWindow.style.overflow = '';
         // Show a message for non-code tabs (no canvas, no connections)
         const message = document.createElement('div');
-        message.style.cssText = `
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            color: #ccc;
-            font-size: 18px;
-            text-align: center;
-            pointer-events: none;
-            z-index: 1;
-        `;
+        message.className = 'tab-placeholder';
         message.innerHTML = `${activeTab.charAt(0).toUpperCase() + activeTab.slice(1)}<br>Coming Soon`;
         nodeWindow.appendChild(message);
     }
@@ -4336,7 +4637,12 @@ function createImagesInterface(container) {
         { id: 'rect', icon: ['square', 'square-dashed'], fallback: '▭', title: 'Rectangle' },
         { id: 'circle', icon: ['circle'], fallback: '◯', title: 'Circle' },
         { id: 'bucket', icon: ['paint-bucket', 'bucket'], fallback: 'F', title: 'Fill (Bucket)' },
-        { id: 'select', icon: ['lasso-select', 'lasso', 'selection'], fallback: 'S', title: 'Select' },
+        {
+            id: 'select',
+            icon: ['square-dashed-mouse-pointer', 'mouse-pointer-square-dashed', 'crop', 'scan-line', 'square-dashed'],
+            fallback: '▢',
+            title: 'Select — lift pixels; top handle rotates (Shift = 45° steps); Shift+drag corners for square · Enter places, Esc cancels',
+        },
     ];
     const toolButtons = {};
     function updateShapeToolFillIndicators() {
@@ -4442,6 +4748,53 @@ function createImagesInterface(container) {
             })
             .join('')}`;
     }
+    function hexToRgbVals(hex) {
+        const n = normalizeImageHex(hex);
+        if (!n) return null;
+        const h = n.slice(1);
+        return [
+            parseInt(h.slice(0, 2), 16),
+            parseInt(h.slice(2, 4), 16),
+            parseInt(h.slice(4, 6), 16),
+        ];
+    }
+    function rgbToHsv01(r, g, b) {
+        r /= 255;
+        g /= 255;
+        b /= 255;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const d = max - min;
+        let hh = 0;
+        if (d > 1e-8) {
+            if (max === r) hh = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+            else if (max === g) hh = ((b - r) / d + 2) / 6;
+            else hh = ((r - g) / d + 4) / 6;
+        }
+        const s = max < 1e-8 ? 0 : d / max;
+        const v = max;
+        return { h: hh * 360, s, v };
+    }
+    function hsv01ToRgb(h, s, v) {
+        h = ((h % 360) + 360) % 360;
+        const c = v * s;
+        const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+        const m = v - c;
+        let rp = 0;
+        let gp = 0;
+        let bp = 0;
+        if (h < 60) [rp, gp, bp] = [c, x, 0];
+        else if (h < 120) [rp, gp, bp] = [x, c, 0];
+        else if (h < 180) [rp, gp, bp] = [0, c, x];
+        else if (h < 240) [rp, gp, bp] = [0, x, c];
+        else if (h < 300) [rp, gp, bp] = [x, 0, c];
+        else [rp, gp, bp] = [c, 0, x];
+        return [
+            Math.round((rp + m) * 255),
+            Math.round((gp + m) * 255),
+            Math.round((bp + m) * 255),
+        ];
+    }
     function hslToRgb(h, s, l) {
         h /= 360;
         let r;
@@ -4540,7 +4893,6 @@ function createImagesInterface(container) {
     transparentBtn.className = 'image-transparent-btn';
     transparentBtn.title = 'Transparent — paints with 0 alpha (erase)';
     transparentBtn.setAttribute('aria-label', 'Transparent color');
-    setIcon(transparentBtn, ['circle-slash', 'ban'], '∅');
 
     const colorWrap = document.createElement('div');
     colorWrap.className = 'image-color-wrap';
@@ -4553,7 +4905,6 @@ function createImagesInterface(container) {
     swatchUnlockCover.className = 'image-color-swatch-unlock';
     swatchUnlockCover.title = 'Switch to opaque color (palette opens on next click)';
     swatchUnlockCover.setAttribute('aria-label', 'Switch to opaque color');
-    setIcon(swatchUnlockCover, ['droplet', 'paintbrush'], '◆');
     const colorPreviewBtn = document.createElement('button');
     colorPreviewBtn.type = 'button';
     colorPreviewBtn.className = 'image-color-preview-btn';
@@ -4627,6 +4978,18 @@ function createImagesInterface(container) {
         colorPopupRoot.setAttribute('aria-hidden', 'true');
         document.removeEventListener('keydown', onColorPopupEsc);
     }
+    function resetColorPopupToPalette() {
+        if (!colorPopupRoot) return;
+        const grid = colorPopupRoot.querySelector('.image-color-popup-grid');
+        const moreBtn = colorPopupRoot.querySelector('.image-color-popup-more');
+        const custom = colorPopupRoot.querySelector('.image-color-popup-custom');
+        const panel = colorPopupRoot.querySelector('.image-color-popup-panel');
+        if (!grid || !moreBtn || !custom || !panel) return;
+        grid.style.display = '';
+        moreBtn.style.display = '';
+        custom.setAttribute('hidden', '');
+        panel.classList.remove('image-color-popup-panel--custom');
+    }
     function onColorPopupEsc(e) {
         if (e.key === 'Escape') closeColorPopup();
     }
@@ -4683,11 +5046,172 @@ function createImagesInterface(container) {
         const moreBtn = document.createElement('button');
         moreBtn.type = 'button';
         moreBtn.className = 'image-color-popup-more';
-        moreBtn.textContent = 'More colors…';
-        moreBtn.title = 'Open system color dialog';
+        moreBtn.textContent = 'Custom color…';
+        moreBtn.title = 'Full custom picker — hue, saturation, and brightness';
+        let customH = 0;
+        let customS = 1;
+        let customV = 1;
+        const customPanel = document.createElement('div');
+        customPanel.className = 'image-color-popup-custom';
+        customPanel.setAttribute('hidden', '');
+        const customTop = document.createElement('div');
+        customTop.className = 'image-color-popup-custom-top';
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'image-color-popup-custom-back';
+        backBtn.textContent = '← Palette';
+        backBtn.title = 'Back to preset colors';
+        customTop.appendChild(backBtn);
+        const svCanvas = document.createElement('canvas');
+        svCanvas.className = 'image-color-popup-sv';
+        svCanvas.width = 200;
+        svCanvas.height = 130;
+        svCanvas.setAttribute('role', 'img');
+        svCanvas.setAttribute('aria-label', 'Saturation and brightness');
+        const svCtx = svCanvas.getContext('2d', { willReadFrequently: true });
+        const hueInput = document.createElement('input');
+        hueInput.type = 'range';
+        hueInput.className = 'image-color-popup-hue';
+        hueInput.min = '0';
+        hueInput.max = '360';
+        hueInput.step = '1';
+        hueInput.title = 'Hue';
+        hueInput.setAttribute('aria-label', 'Hue');
+        const hexWrap = document.createElement('div');
+        hexWrap.className = 'image-color-popup-hex-row';
+        const hexLabel = document.createElement('label');
+        hexLabel.className = 'image-color-popup-hex-label';
+        hexLabel.textContent = 'Hex';
+        hexLabel.htmlFor = 'image-color-popup-hex';
+        const hexInput = document.createElement('input');
+        hexInput.type = 'text';
+        hexInput.id = 'image-color-popup-hex';
+        hexInput.className = 'image-color-popup-hex';
+        hexInput.spellcheck = false;
+        hexInput.autocomplete = 'off';
+        hexInput.maxLength = 7;
+        hexInput.title = 'Color as #RRGGBB';
+        hexInput.setAttribute('aria-label', 'Hex color');
+        hexWrap.appendChild(hexLabel);
+        hexWrap.appendChild(hexInput);
+        const nativeLink = document.createElement('button');
+        nativeLink.type = 'button';
+        nativeLink.className = 'image-color-popup-native';
+        nativeLink.textContent = 'System color dialog…';
+        nativeLink.title = 'Use the browser or OS color picker instead';
+        function sVFromClient(clientX, clientY) {
+            const rect = svCanvas.getBoundingClientRect();
+            const x = (clientX - rect.left) / Math.max(1e-6, rect.width);
+            const y = (clientY - rect.top) / Math.max(1e-6, rect.height);
+            return {
+                s: Math.max(0, Math.min(1, x)),
+                v: Math.max(0, Math.min(1, 1 - y)),
+            };
+        }
+        function drawSvPlane() {
+            const w = svCanvas.width;
+            const h = svCanvas.height;
+            const img = svCtx.createImageData(w, h);
+            const hh = customH;
+            for (let py = 0; py < h; py++) {
+                const vv = 1 - py / Math.max(1, h - 1);
+                for (let px = 0; px < w; px++) {
+                    const ss = px / Math.max(1, w - 1);
+                    const [r, g, b] = hsv01ToRgb(hh, ss, vv);
+                    const i = (py * w + px) * 4;
+                    img.data[i] = r;
+                    img.data[i + 1] = g;
+                    img.data[i + 2] = b;
+                    img.data[i + 3] = 255;
+                }
+            }
+            svCtx.putImageData(img, 0, 0);
+            const mx = customS * (w - 1);
+            const my = (1 - customV) * (h - 1);
+            svCtx.beginPath();
+            svCtx.arc(mx, my, 5, 0, Math.PI * 2);
+            svCtx.strokeStyle = 'rgba(255,255,255,0.95)';
+            svCtx.lineWidth = 2;
+            svCtx.stroke();
+            svCtx.strokeStyle = 'rgba(0,0,0,0.5)';
+            svCtx.lineWidth = 1;
+            svCtx.stroke();
+        }
+        function applyCustomFromHsv(commitRecent) {
+            const [r, g, b] = hsv01ToRgb(customH, customS, customV);
+            const hex = rgbToHex(r, g, b);
+            colorInput.value = hex;
+            hexInput.value = hex;
+            paintAlpha = 1;
+            syncPaintAlphaUI();
+            updateColorPreview();
+            applyColorFromUI();
+            if (commitRecent) pushRecentImageColor(hex);
+        }
+        function syncCustomFromInput() {
+            const rgb = hexToRgbVals(colorInput.value);
+            if (!rgb) return;
+            const o = rgbToHsv01(rgb[0], rgb[1], rgb[2]);
+            customH = o.h;
+            customS = o.s;
+            customV = o.v;
+            hueInput.value = String(Math.round(customH));
+            const n = normalizeImageHex(colorInput.value);
+            if (n) hexInput.value = n;
+            drawSvPlane();
+        }
+        backBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            resetColorPopupToPalette();
+            requestAnimationFrame(() => positionColorPopup());
+        });
         moreBtn.addEventListener('click', (e) => {
             e.preventDefault();
-            closeColorPopup();
+            e.stopPropagation();
+            grid.style.display = 'none';
+            moreBtn.style.display = 'none';
+            customPanel.removeAttribute('hidden');
+            panel.classList.add('image-color-popup-panel--custom');
+            syncCustomFromInput();
+            requestAnimationFrame(() => {
+                positionColorPopup();
+                hueInput.focus();
+            });
+        });
+        hueInput.addEventListener('input', () => {
+            customH = parseFloat(hueInput.value);
+            if (!Number.isFinite(customH)) customH = 0;
+            applyCustomFromHsv(false);
+            drawSvPlane();
+        });
+        hueInput.addEventListener('change', () => {
+            applyCustomFromHsv(true);
+        });
+        hexInput.addEventListener('input', () => {
+            const n = normalizeImageHex(hexInput.value);
+            if (!n) return;
+            const rgb = hexToRgbVals(n);
+            if (!rgb) return;
+            const o = rgbToHsv01(rgb[0], rgb[1], rgb[2]);
+            customH = o.h;
+            customS = o.s;
+            customV = o.v;
+            hueInput.value = String(Math.round(customH));
+            colorInput.value = n;
+            paintAlpha = 1;
+            syncPaintAlphaUI();
+            updateColorPreview();
+            applyColorFromUI();
+            drawSvPlane();
+        });
+        hexInput.addEventListener('change', () => {
+            const n = normalizeImageHex(hexInput.value);
+            if (n) pushRecentImageColor(n);
+        });
+        nativeLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
             requestAnimationFrame(() => {
                 try {
                     if (typeof colorInput.showPicker === 'function') colorInput.showPicker();
@@ -4697,8 +5221,48 @@ function createImagesInterface(container) {
                 }
             });
         });
+        let svDrag = false;
+        svCanvas.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            svDrag = true;
+            try {
+                svCanvas.setPointerCapture(e.pointerId);
+            } catch (_) {}
+            const { s, v } = sVFromClient(e.clientX, e.clientY);
+            customS = s;
+            customV = v;
+            applyCustomFromHsv(false);
+            drawSvPlane();
+        });
+        svCanvas.addEventListener('pointermove', (e) => {
+            if (!svDrag) return;
+            e.preventDefault();
+            const { s, v } = sVFromClient(e.clientX, e.clientY);
+            customS = s;
+            customV = v;
+            applyCustomFromHsv(false);
+            drawSvPlane();
+        });
+        function endSvDrag(e) {
+            if (!svDrag) return;
+            svDrag = false;
+            try {
+                svCanvas.releasePointerCapture(e.pointerId);
+            } catch (_) {}
+            applyCustomFromHsv(true);
+        }
+        svCanvas.addEventListener('pointerup', endSvDrag);
+        svCanvas.addEventListener('pointercancel', endSvDrag);
+        svCanvas.style.touchAction = 'none';
+        customPanel.appendChild(customTop);
+        customPanel.appendChild(svCanvas);
+        customPanel.appendChild(hueInput);
+        customPanel.appendChild(hexWrap);
+        customPanel.appendChild(nativeLink);
         panel.appendChild(grid);
         panel.appendChild(moreBtn);
+        panel.appendChild(customPanel);
         backdrop.addEventListener('click', closeColorPopup);
         colorPopupRoot.appendChild(backdrop);
         colorPopupRoot.appendChild(panel);
@@ -4708,6 +5272,7 @@ function createImagesInterface(container) {
         if (paintAlpha < 0.5) return;
         ensureColorPopup();
         if (colorPopupRoot.classList.contains('is-open')) return;
+        resetColorPopupToPalette();
         document.removeEventListener('keydown', onColorPopupEsc);
         colorPopupRoot.classList.add('is-open');
         colorPopupRoot.setAttribute('aria-hidden', 'false');
@@ -4732,7 +5297,7 @@ function createImagesInterface(container) {
         transparentBtn.setAttribute('aria-pressed', transparent ? 'true' : 'false');
         transparentBtn.title = transparent
             ? 'Opaque color — first click swatch (no picker), then pick color'
-            : 'Transparent (erase) — click to paint with alpha 0';
+            : 'Transparent (erase) — click to toggle, or right-drag on the canvas with the brush';
         colorWrap.classList.toggle('image-color-wrap--transparent', transparent);
         colorWrap.classList.toggle('image-color-wrap--opaque', !transparent);
         swatchUnlockCover.style.display = transparent ? 'flex' : 'none';
@@ -4878,14 +5443,14 @@ function createImagesInterface(container) {
     actionsRow.className = 'images-actions-row';
 
     const addBtn = document.createElement('button');
-    addBtn.className = 'add-image-btn images-action-btn';
+    addBtn.className = 'images-action-btn images-action-btn--primary';
     addBtn.type = 'button';
     setIcon(addBtn, 'plus', '+');
     addBtn.title = 'Add new image';
     addBtn.addEventListener('click', () => createNewImage());
 
     const uploadBtn = document.createElement('button');
-    uploadBtn.className = 'add-image-btn images-action-btn';
+    uploadBtn.className = 'images-action-btn images-action-btn--secondary';
     uploadBtn.type = 'button';
     setIcon(uploadBtn, ['upload', 'upload-cloud'], '↑');
     uploadBtn.title = 'Upload image file';
@@ -4900,98 +5465,32 @@ function createImagesInterface(container) {
     // Right preview area
     const rightPanel = document.createElement('div');
     rightPanel.className = 'images-right-panel';
-    rightPanel.style.cssText = `
-        background: #1a1a1a;
-    `;
 
     // Image preview container
     const previewContainer = document.createElement('div');
     previewContainer.className = 'image-preview-container';
 
-    // Zoom controls (bottom right)
-    const zoomControls = document.createElement('div');
-    zoomControls.className = 'zoom-controls';
-    zoomControls.style.cssText = `
-        position: absolute;
-        bottom: 20px;
-        right: 20px;
-        display: flex;
-        gap: 10px;
-        z-index: 10;
-    `;
+    // Zoom controls — same strip builder as code tab (identical icons + DOM)
+    const { wrap: zoomControls, zoomOutBtn, zoomResetBtn, zoomInBtn } = createZoomControlStrip({
+        onZoomOut: () => zoomImage(0.8),
+        onZoomReset: () => resetZoom(),
+        onZoomIn: () => zoomImage(1.2),
+    });
 
-    const zoomInBtn = document.createElement('button');
-    setIcon(zoomInBtn, ['zoom-in', 'search-plus', 'plus'], '+');
-    zoomInBtn.className = 'zoom-btn';
-    zoomInBtn.title = 'Zoom In';
-    zoomInBtn.style.cssText = `
-        width: 40px;
-        height: 40px;
-        background: #333;
-        border: 1px solid #555;
-        color: #fff;
-        border-radius: 50%;
-        cursor: pointer;
-        font-size: 18px;
-        font-weight: bold;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: background 0.2s;
-    `;
-
-    const zoomOutBtn = document.createElement('button');
-    setIcon(zoomOutBtn, ['zoom-out', 'search-minus', 'minus'], '−');
-    zoomOutBtn.className = 'zoom-btn';
-    zoomOutBtn.title = 'Zoom Out';
-    zoomOutBtn.style.cssText = zoomInBtn.style.cssText;
-
-    const zoomResetBtn = document.createElement('button');
-    setIcon(zoomResetBtn, ['rotate-ccw', 'refresh-ccw', 'rotateCcw'], '=');
-    zoomResetBtn.className = 'zoom-btn';
-    zoomResetBtn.title = 'Reset Zoom';
-    zoomResetBtn.style.cssText = zoomInBtn.style.cssText;
-
-    zoomInBtn.addEventListener('click', () => zoomImage(1.2));
-    zoomOutBtn.addEventListener('click', () => zoomImage(0.8));
-    zoomResetBtn.addEventListener('click', () => resetZoom());
-
-    zoomControls.appendChild(zoomOutBtn);
-    zoomControls.appendChild(zoomResetBtn);
-    zoomControls.appendChild(zoomInBtn);
-
-    // Editor canvas wrapper with checkerboard and 720x720 canvas
+    // Editor canvas wrapper: one inner host gets pan+zoom transform (canvas + overlay share it — avoids double scale() cost when zoomed).
     const canvasWrapper = document.createElement('div');
-    canvasWrapper.style.cssText = `
-        position: relative;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        overflow: hidden;
-        width: 100%;
-        height: 100%;
-    `;
+    canvasWrapper.className = 'image-editor-canvas-wrap';
+    const viewTransformHost = document.createElement('div');
+    viewTransformHost.className = 'image-editor-view';
     const checker = document.createElement('div');
-    checker.style.cssText = `
-        position: absolute;
-        width: 1000px;
-        height: 1000px;
-        background: repeating-conic-gradient(#999 0% 25%, #777 0% 50%) 0 / 20px 20px;
-        opacity: 0.4;
-        pointer-events: none;
-        transform: translateZ(0);
-    `;
+    checker.className = 'image-editor-checker';
     const editorCanvas = document.createElement('canvas');
     editorCanvas.width = 720;
     editorCanvas.height = 720;
-    editorCanvas.style.cssText = `
-        image-rendering: pixelated;
-        box-shadow: 0 0 0 1px #000 inset;
-        transform-origin: center;
-        background: transparent;
-    `;
-    canvasWrapper.appendChild(checker);
-    canvasWrapper.appendChild(editorCanvas);
+    editorCanvas.className = 'image-editor-surface';
+    canvasWrapper.appendChild(viewTransformHost);
+    viewTransformHost.appendChild(checker);
+    viewTransformHost.appendChild(editorCanvas);
 
     previewContainer.appendChild(canvasWrapper);
     previewContainer.appendChild(zoomControls);
@@ -5010,9 +5509,8 @@ function createImagesInterface(container) {
     imageEditor = initializeImageEditor({
         editorCanvas,
         canvasWrapper,
-        zoomInBtn,
-        zoomOutBtn,
-        zoomResetBtn,
+        viewTransformHost,
+        previewContainer,
         setDefaultUI: () => {},
     });
 
@@ -5051,43 +5549,14 @@ function loadImagesFromDirectory(container) {
         const imageItem = document.createElement('div');
         imageItem.className = 'image-thumbnail-item';
         imageItem.dataset.filename = imgInfo.name;
-        imageItem.style.cssText = `
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            margin-bottom: 10px;
-            padding: 6px;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: all 0.2s;
-            border: 1px solid transparent;
-            user-select: none;
-        `;
 
         const thumbnail = document.createElement('img');
         thumbnail.src = imgInfo.src;
         thumbnail.alt = imgInfo.name;
-        thumbnail.style.cssText = `
-            width: 100px;
-            height: 100px;
-            object-fit: cover;
-            border-radius: 4px;
-            margin-bottom: 5px;
-            pointer-events: none;
-        `;
 
         const label = document.createElement('span');
         label.textContent = imgInfo.name;
         label.className = 'image-label';
-        label.style.cssText = `
-            font-size: 10px;
-            color: #ccc;
-            text-align: center;
-            word-break: break-all;
-            max-width: 100px;
-            line-height: 1.2;
-            pointer-events: none;
-        `;
 
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'delete-btn';
@@ -5132,6 +5601,11 @@ function loadImagesFromDirectory(container) {
         imageItem.appendChild(thumbnail);
         imageItem.appendChild(label);
         imageItem.appendChild(deleteBtn);
+
+        imageItem.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            showImageAssetSaveMenu(e.clientX, e.clientY, imgInfo);
+        });
 
         imageItem.addEventListener('click', () => {
             currentImageFilename = imgInfo.name;
@@ -5643,17 +6117,6 @@ function startRenameImage(imageItem, oldFilename) {
     input.type = 'text';
     input.value = oldFilename;
     input.className = 'rename-input';
-    input.style.cssText = `
-        font-size: 10px;
-        color: #fff;
-        background: #444;
-        border: 1px solid #00ffcc;
-        border-radius: 3px;
-        text-align: center;
-        width: 100px;
-        outline: none;
-        padding: 2px 4px;
-    `;
 
     // Replace label with input
     label.parentNode.replaceChild(input, label);
@@ -5692,12 +6155,14 @@ function switchTab(tabName) {
     // Remove active class from all tabs
     document.querySelectorAll('.asset-tab').forEach(tab => {
         tab.classList.remove('active');
+        tab.setAttribute('aria-selected', 'false');
     });
 
     // Add active class to selected tab
     const selectedTab = document.querySelector(`.${tabName}-tab`);
     if (selectedTab) {
         selectedTab.classList.add('active');
+        selectedTab.setAttribute('aria-selected', 'true');
     } else {
         console.warn(`Tab with class .${tabName}-tab not found`);
     }
@@ -5961,17 +6426,6 @@ function startRenameObject(objectId, nameElement) {
     input.type = 'text';
     input.value = currentName;
     input.className = 'object-name-input';
-    input.style.cssText = `
-        width: 100%;
-        padding: 2px 4px;
-        border: 1px solid #00ffcc;
-        border-radius: 3px;
-        background: #333;
-        color: #fff;
-        font-size: 0.9rem;
-        text-align: center;
-        outline: none;
-    `;
 
     // Replace span with input
     container.replaceChild(input, nameElement);
@@ -6046,6 +6500,8 @@ function renderObjectGrid() {
 }
 // Initialize tabs
 function initializeTabs() {
+    if (window.__tabsInitialized) return;
+    window.__tabsInitialized = true;
     // Add event listeners to tabs
     document.querySelectorAll('.asset-tab').forEach(tab => {
         tab.addEventListener('click', (e) => {
@@ -6065,6 +6521,28 @@ function initializeTabs() {
         });
     });
 
+    // Horizontal scroll: wheel over tab strip (narrow toolbars often need this)
+    const tabStrip = document.querySelector('.asset-tabs');
+    if (tabStrip && !tabStrip.__wheelBound) {
+        tabStrip.__wheelBound = true;
+        tabStrip.addEventListener(
+            'wheel',
+            (e) => {
+                if (tabStrip.scrollWidth <= tabStrip.clientWidth) return;
+                const dx = e.deltaX;
+                const dy = e.deltaY;
+                if (Math.abs(dx) > Math.abs(dy)) {
+                    return;
+                }
+                if (dy !== 0) {
+                    e.preventDefault();
+                    tabStrip.scrollLeft += dy;
+                }
+            },
+            { passive: false }
+        );
+    }
+
     // Set default active tab (Code)
     switchTab('code');
 }
@@ -6073,25 +6551,21 @@ function initializeTabs() {
 
 // Simple function to toggle the edit menu (called from HTML onclick)
 function toggleEditMenu() {
-    console.log('🎯 toggleEditMenu called from HTML onclick');
     const editBtn = document.querySelector('.edit-menu-btn');
     const undoMenu = document.getElementById('edit-dropdown');
 
     if (editBtn && undoMenu) {
         const isActive = editBtn.classList.contains('active');
-        console.log('Menu currently active:', isActive);
 
         if (isActive) {
             editBtn.classList.remove('active');
             undoMenu.style.display = 'none';
-            console.log('Menu closed');
+            editBtn.setAttribute('aria-expanded', 'false');
         } else {
             editBtn.classList.add('active');
             undoMenu.style.display = 'block';
-            console.log('Menu opened');
+            editBtn.setAttribute('aria-expanded', 'true');
         }
-    } else {
-        console.log('Elements not found:', { editBtn: !!editBtn, undoMenu: !!undoMenu });
     }
 }
 // Initialize Edit menu dropdown
@@ -6100,53 +6574,23 @@ function initializeEditMenu() {
         return;
     }
     window.__editMenuSetupDone = true;
-    console.log('=== Initializing edit menu ===');
     const editMenuContainer = document.querySelector('.edit-menu-container');
     const editBtn = document.querySelector('.edit-menu-btn');
     const undoMenu = document.getElementById('edit-dropdown');
 
-    console.log('Elements found:', {
-        container: editMenuContainer,
-        button: editBtn,
-        menu: undoMenu
-    });
-
     if (editMenuContainer && editBtn && undoMenu) {
-        console.log('✅ All elements found, setting up additional event listeners');
-
         // Initialize undo menu state
         updateUndoMenu();
 
         // Ensure menu starts hidden
         undoMenu.style.display = 'none';
-        console.log('Menu display set to none initially');
-
-        // Add additional event listeners for better UX
-        editBtn.addEventListener('mouseenter', () => {
-            console.log('🖱️ Mouse entered Edit button');
-        });
-
-        editBtn.addEventListener('mouseleave', () => {
-            console.log('👋 Mouse left Edit button');
-        });
 
         // Close menu when clicking elsewhere (attach once)
         document.addEventListener('click', function(e) {
             if (!editMenuContainer.contains(e.target)) {
-                console.log('Click outside menu, closing...');
                 editBtn.classList.remove('active');
                 undoMenu.style.display = 'none';
             }
-        });
-
-        console.log('✅ Additional event listeners attached');
-
-    } else {
-        console.log('❌ Some elements not found, edit menu initialization failed');
-        console.log('Missing elements:', {
-            container: !editMenuContainer,
-            button: !editBtn,
-            menu: !undoMenu
         });
     }
 }
@@ -6162,9 +6606,11 @@ function toggleFileMenu() {
 	if (isActive) {
 		fileBtn.classList.remove('active');
 		fileMenu.style.display = 'none';
+		fileBtn.setAttribute('aria-expanded', 'false');
 	} else {
 		fileBtn.classList.add('active');
 		fileMenu.style.display = 'block';
+		fileBtn.setAttribute('aria-expanded', 'true');
 	}
 }
 
@@ -6181,6 +6627,7 @@ function initializeFileMenu() {
 		if (!container.contains(e.target)) {
 			btn.classList.remove('active');
 			menu.style.display = 'none';
+			btn.setAttribute('aria-expanded', 'false');
 		}
 	});
 	// Wire file input change
@@ -6377,10 +6824,9 @@ function generateStandaloneHtml(project) {
 	const project = ${safeJson};
 	let objects = project.objects || [];
 	const objectImages = project.images || {};
-	// Match editor default pacing (approx 60 FPS)
-	const LOOP_FRAME_WAIT_MS = 1000 / 60;
 	// Match editor fairness/time budget
 	const TIME_BUDGET_MS = 6;
+	const LOOP_YIELD_MS = 1000 / 60;
 	const MAX_TOTAL_STEPS_PER_FRAME = 2000;
 	let rrInstanceStartIndex = 0;
 	let __stepOnlyInstanceIds = null;
@@ -6447,13 +6893,14 @@ function generateStandaloneHtml(project) {
 	    const code = o.code || [];
 	    if (exec.waitMs>0){ exec.waitMs-=dt; if (exec.waitMs>0) continue; exec.waitMs=0; if(exec.waitingBlockId!=null){ const waitingBlock=code.find(b=>b&&b.id===exec.waitingBlockId); exec.waitingBlockId=null; if(waitingBlock){ exec.pc = (typeof waitingBlock.next_block_a==='number') ? waitingBlock.next_block_a : null; } } }
 	    let steps=0;
+	    outerLoop: while (steps < maxStepsPerObject) {
 	    while (exec.pc!=null && steps++<maxStepsPerObject){
 	      const block = code.find(b=>b&&b.id===exec.pc); if(!block){ exec.pc=null; break; }
 	      const coerceScalarLiteral=(v)=>{ if(typeof v==='number') return v; if(typeof v==='string'){ const s=v.trim(); if(s==='') return ''; const n=Number(s); return Number.isFinite(n)?n:v; } return v; };
 	      const getArrayRef=(varName,instanceOnly)=>{ const name=varName||''; const store=instanceOnly ? (runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={})) : runtimeGlobalVariables; let arr=store[name]; if(!Array.isArray(arr)){ arr=[]; store[name]=arr; } return arr; };
 	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='pixel_is_rgb'){ const c=document.getElementById('game'); if(!c) return 0; const xw=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const yw=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const p=worldToCanvas(xw,yw,c); const px=Math.round(p.x); const py=Math.round(p.y); if(!Number.isFinite(px)||!Number.isFinite(py)) return 0; if(px<0||py<0||px>=c.width||py>=c.height) return 0; const cctx=c.getContext('2d'); if(!cctx) return 0; let data; try{ data=cctx.getImageData(px,py,1,1).data; }catch(_){ return 0; } const r=data[0], g=data[1], b=data[2]; const tr=Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0))); const tg=Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0))); const tb=Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0))); return (r===tr && g===tg && b===tb) ? 1 : 0; } if(node.content==='random_int'){ let a=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const xVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const yVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); switch(node.val_a){ case '+': return xVal + yVal; case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=Number(v)||0; return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=Number(aVal); let B=Number(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const v=runtimeGlobalVariables[varName]; return (typeof v==='number')?v:0; } } if(node.content==='array_get'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); const idxVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const idx=Math.floor(Number(idxVal)); if(!Number.isFinite(idx) || idx<0 || idx>=arr.length) return ''; return arr[idx]; } if(node.content==='array_length'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); return arr.length; } return null; };
 	      if (block.type==='action'){
-	        if (block.content==='move_xy'){ const dx=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const dy=Number(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x += dx; runtimePositions[inst.instanceId].y += dy; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='move_xy'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const y=Number(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x += x; runtimePositions[inst.instanceId].y += y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='move_forward'){ const distance=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const rotDeg=runtimePositions[inst.instanceId].rot || 0; const rotRad=(rotDeg)*Math.PI/180; runtimePositions[inst.instanceId].x += Math.sin(rotRad)*distance; runtimePositions[inst.instanceId].y += Math.cos(rotRad)*distance; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='rotate'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = (runtimePositions[inst.instanceId].rot||0) + Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_rotation'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
@@ -6462,7 +6909,7 @@ function generateStandaloneHtml(project) {
 	        if (block.content==='point_towards'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const pos=runtimePositions[inst.instanceId]; const tx=Number((block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0)); const ty=Number((block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0)); const dx=tx-(typeof pos.x==='number'?pos.x:0); const dy=ty-(typeof pos.y==='number'?pos.y:0); const ang=90 - (Math.atan2(dy,dx)*180/Math.PI); pos.rot = ang; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='change_size'){ const ds=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; const cur=runtimePositions[inst.instanceId].scale||1; runtimePositions[inst.instanceId].scale=Math.max(0,cur+ds); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='wait'){ const seconds=Math.max(0, parseFloat(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds>0){ exec.waitMs = seconds*1000; exec.waitingBlockId = block.id; exec.pc = null; } else { exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; } break; }
-	        if (block.content==='repeat'){ const times=Math.max(0, Number(block.val_a||0)); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = block.id; continue; }
+	        if (block.content==='repeat'){ const times=Math.max(0, Number(block.val_a||0)); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='print'){ const val=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); try{ console.log(val);}catch(_){} exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='if'){ const condVal=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const isTrue = !!condVal; exec.pc = isTrue ? ((typeof block.next_block_b==='number')?block.next_block_b:null) : ((typeof block.next_block_a==='number')?block.next_block_a:null); continue; }
 	        if (block.content==='set_x'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
@@ -6475,14 +6922,30 @@ function generateStandaloneHtml(project) {
 	        if (block.content==='array_append'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const arr=getArrayRef(varName, !!block.var_instance_only); arr.push(value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='array_insert'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const idxVal=(block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0); let idx=Math.floor(Number(idxVal)); if(!Number.isFinite(idx)) idx=0; const arr=getArrayRef(varName, !!block.var_instance_only); idx=Math.max(0, Math.min(arr.length, idx)); arr.splice(idx,0,value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='array_delete'){ const varName=block.var_name||''; const idxVal=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0); const idx=Math.floor(Number(idxVal)); const arr=getArrayRef(varName, !!block.var_instance_only); if(Number.isFinite(idx) && idx>=0 && idx<arr.length){ arr.splice(idx,1); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='forever'){ exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:Infinity, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = block.id; continue; }
+	        if (block.content==='forever'){ exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:Infinity, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	      }
 	      exec.pc = (typeof block.next_block_a==='number') ? block.next_block_a : null;
 	      totalStepsThisFrame += 1;
 	      if (typeof MAX_TOTAL_STEPS_PER_FRAME === 'number' && totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
 	      if (typeof TIME_BUDGET_MS === 'number' && (performance.now() - startTime) >= TIME_BUDGET_MS) break;
 	    }
-	    if (exec.pc==null && exec.repeatStack.length>0){ const frame=exec.repeatStack[exec.repeatStack.length-1]; frame.timesRemaining-=1; if(frame.timesRemaining>0){ const repeatBlock=code.find(b=>b&&b.id===frame.repeatBlockId); exec.pc = repeatBlock && (typeof repeatBlock.next_block_a==='number') ? repeatBlock.next_block_a : null; exec.waitMs = LOOP_FRAME_WAIT_MS; exec.waitingBlockId = repeatBlock ? repeatBlock.id : null; } else { exec.repeatStack.pop(); exec.pc = frame.afterId != null ? frame.afterId : null; } }
+	    if (exec.pc==null && exec.repeatStack.length>0){
+	      const frame=exec.repeatStack[exec.repeatStack.length-1];
+	      frame.timesRemaining-=1;
+	      if(frame.timesRemaining>0){
+	        const repeatBlock=code.find(b=>b&&b.id===frame.repeatBlockId);
+	        exec.pc = repeatBlock && (typeof repeatBlock.next_block_a==='number') ? repeatBlock.next_block_a : null;
+	        if(exec.pc!=null){ continue outerLoop; }
+	        exec.waitMs = LOOP_YIELD_MS;
+	        exec.waitingBlockId = repeatBlock ? repeatBlock.id : null;
+	        break outerLoop;
+	      }
+	      exec.repeatStack.pop();
+	      exec.pc = frame.afterId != null ? frame.afterId : null;
+	      continue outerLoop;
+	    }
+	    break outerLoop;
+	    }
 	  }
 	  if (instancesPendingCreation && instancesPendingCreation.length>0){
 	    const createdIds = [];
@@ -6512,7 +6975,7 @@ function generateStandaloneHtml(project) {
 	canvas.addEventListener('mouseleave',()=>{ runtimeMousePressed=false; });
 	window.addEventListener('mouseup',()=>{ runtimeMousePressed=false; });
 	function normalizeKeyName(k){ if(k===' '||k==='Spacebar') return 'Space'; return k; }
-	document.addEventListener('keydown',(e)=>{ const k=normalizeKeyName(e.key); runtimeKeys[k]=true;});
+	document.addEventListener('keydown',(e)=>{ const k=normalizeKeyName(e.key); if(isPlaying&&k==='Space'){ const t=e.target; const tag=t&&t.tagName?String(t.tagName).toLowerCase():''; if(tag!=='input'&&tag!=='textarea'&&tag!=='select'&&!(t&&t.isContentEditable))e.preventDefault(); } runtimeKeys[k]=true;},true);
 	document.addEventListener('keyup',(e)=>{ const k=normalizeKeyName(e.key); runtimeKeys[k]=false;});
 
 	const imageCache = {};
@@ -6549,17 +7012,23 @@ function generateStandaloneHtml(project) {
 	</body></html>`;
 }
 
-// Initialize tabs after DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
+// Single app bootstrap: deferred scripts see `interactive` (not `loading`), so a naive
+// "else branch" after DOMContentLoaded would double-run tab setup and stack click handlers.
+function initApp() {
+    if (window.__appInitialized) return;
+    window.__appInitialized = true;
+    try {
+        const root = document.documentElement;
+        root.style.overscrollBehavior = 'none';
+        root.style.overscrollBehaviorX = 'none';
+    } catch (_) {}
     console.log('🚀 DOM Content Loaded - Initializing app...');
-    // Seed default blank images so every object starts with image-1
     initializeDefaultImages();
     initializeTabs();
     initializeEditMenu();
     initializeFileMenu();
     setTimeout(() => refreshObjectGridIcons(), 50);
     console.log('✅ App initialization complete');
-    // Wire top-bar play/stop buttons if present, else add overlay fallback
     try {
         const topPlay = document.getElementById('topbar-play');
         if (topPlay && !topPlay.__bound) {
@@ -6577,22 +7046,14 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
         const canvas = document.getElementById('game-window');
-        const wrapper = canvas.parentElement || document.body;
+        const wrapper = canvas && canvas.parentElement ? canvas.parentElement : document.body;
         let playBtn = document.getElementById('__play_btn');
         if (!topPlay && !playBtn) {
             playBtn = document.createElement('button');
             playBtn.id = '__play_btn';
+            playBtn.type = 'button';
             playBtn.textContent = '▶';
-            playBtn.style.position = 'absolute';
-            playBtn.style.top = '12px';
-            playBtn.style.right = '12px';
-            playBtn.style.zIndex = '20';
-            playBtn.style.padding = '8px 12px';
-            playBtn.style.borderRadius = '6px';
-            playBtn.style.border = '1px solid #333';
-            playBtn.style.background = '#00ffcc';
-            playBtn.style.color = '#1a1a1a';
-            playBtn.style.cursor = 'pointer';
+            playBtn.className = 'fallback-play-btn';
             playBtn.addEventListener('click', () => {
                 if (isPlaying) {
                     stopPlay();
@@ -6603,29 +7064,43 @@ document.addEventListener('DOMContentLoaded', () => {
             wrapper.style.position = 'relative';
             wrapper.appendChild(playBtn);
         }
-    } catch {}
-});
-
-// Fallback initialization in case DOMContentLoaded already fired
+    } catch (_) {}
+}
 if (document.readyState === 'loading') {
-    // DOM not yet loaded
+    document.addEventListener('DOMContentLoaded', initApp);
 } else {
-    // DOM already loaded
-    setTimeout(() => {
-        initializeTabs();
-        initializeEditMenu();
-        initializeFileMenu();
-    }, 10); // Small delay to ensure DOM is fully ready
+    initApp();
+}
+
+// Prompt when closing the tab/window (browsers show their own generic wording, not custom text)
+if (!window.__leavePagePromptBound) {
+    window.__leavePagePromptBound = true;
+    window.addEventListener('beforeunload', (e) => {
+        e.preventDefault();
+        e.returnValue = '';
+    });
 }
 
 // Update canvas size on window resize
 window.addEventListener("resize", () => {
     drawConnections();
 });
+/** Coalesce multiple triggers in one frame (e.g. save path) to avoid stacked compositor work. */
+let _gameSpriteRaf = null;
+function scheduleRenderGameWindowSprite() {
+    if (_gameSpriteRaf != null) return;
+    _gameSpriteRaf = requestAnimationFrame(() => {
+        _gameSpriteRaf = null;
+        renderGameWindowSprite();
+    });
+}
+
 // Render runtime instances during play; otherwise show object previews
 function renderGameWindowSprite() {
     const canvas = document.getElementById('game-window');
+    if (!canvas) return;
     const gctx = canvas.getContext('2d');
+    if (!gctx) return;
     // Fit the canvas to right pane size only when changed to avoid expensive reallocation each frame
     const rect = canvas.getBoundingClientRect();
     if (canvas.width !== rect.width || canvas.height !== rect.height) {
@@ -6769,8 +7244,15 @@ function refreshObjectGridIcons() {
 // =========================
 function initializeImageEditor(params) {
     const canvas = params.editorCanvas;
-    const ctx = canvas.getContext('2d');
+    // Default (sync) 2D path: Firefox WebRender + desynchronized:true spiked ASYNC_IMAGE / composite time in profiling.
+    const _editor2dOpts = { alpha: true, willReadFrequently: false };
+    const ctx = canvas.getContext('2d', _editor2dOpts) || canvas.getContext('2d');
+    try { ctx.imageSmoothingEnabled = false; } catch (_) {}
     const wrapper = params.canvasWrapper;
+    /** Pan+zoom applied here only; canvas + overlay are children (single composited scale, not two identical transforms). */
+    const viewTransformHost = params.viewTransformHost || wrapper;
+    /** Whole draw region (checker + canvas + margins); wheel/pan attach here so empty areas and zoom controls behave. */
+    const previewHost = params.previewContainer || wrapper;
 
     const state = {
         tool: 'brush',
@@ -6783,7 +7265,7 @@ function initializeImageEditor(params) {
         startY: 0,
         lastX: 0,
         lastY: 0,
-        selection: null, // { x, y, w, h, layerCanvas, offsetX, offsetY, dragging }
+        selection: null, // { cx, cy, w, h, angle, layerCanvas, ... }
         zoom: 1.0,
         panX: 0, // screen px; positive moves canvas right
         panY: 0, // screen px; positive moves canvas down
@@ -6793,29 +7275,152 @@ function initializeImageEditor(params) {
         _lastPanClientY: 0,
         undoStack: [],
         redoStack: [],
+        /** Right-drag brush: temporarily force erase; restored on pointerup */
+        brushEraseDrag: false,
+        _brushSavedA: 1,
+        _brushErasePointerId: null,
+        /** Cached canvas.getBoundingClientRect() during a brush stroke — avoids layout thrash every pointermove when zoomed */
+        _brushScreenRect: null,
     };
+
+    /** Batched brush: merge pointer samples to one applyBrushPolylineFrame per rAF (fewer GPU texture uploads / ASYNC_IMAGE). */
+    let brushStrokeRaf = null;
+    let brushStrokeAccum = null;
+    function mergeBrushPolylineChunk(accum, pts) {
+        if (!pts || pts.length < 4) return accum;
+        if (!accum || accum.length < 2) return Float64Array.from(pts);
+        const lx = accum[accum.length - 2];
+        const ly = accum[accum.length - 1];
+        let start = 0;
+        if (Math.abs(pts[0] - lx) < 1e-6 && Math.abs(pts[1] - ly) < 1e-6) start = 2;
+        if (start >= pts.length) return accum;
+        const out = new Float64Array(accum.length + pts.length - start);
+        out.set(accum, 0);
+        let o = accum.length;
+        for (let i = start; i < pts.length; i++) out[o++] = pts[i];
+        return out;
+    }
+    function flushBrushStrokeBatch() {
+        brushStrokeRaf = null;
+        const acc = brushStrokeAccum;
+        brushStrokeAccum = null;
+        if (acc && acc.length >= 4) applyBrushPolylineFrame(acc);
+    }
+    function scheduleBrushStrokePolyline(pts) {
+        brushStrokeAccum = mergeBrushPolylineChunk(brushStrokeAccum, pts);
+        if (brushStrokeRaf == null) {
+            brushStrokeRaf = requestAnimationFrame(flushBrushStrokeBatch);
+        }
+    }
+    function flushBrushStrokeNow() {
+        if (brushStrokeRaf != null) {
+            cancelAnimationFrame(brushStrokeRaf);
+            brushStrokeRaf = null;
+        }
+        flushBrushStrokeBatch();
+    }
+
+    /** Logical canvas → bitmap: use DPR only. Zoom is CSS scale on viewTransformHost; overlay bitmap stays logical×DPR. */
+    function overlayViewScale() {
+        return window.devicePixelRatio || 1;
+    }
+
+    function syncOverlayBitmapResolution(overlayEl) {
+        if (!overlayEl || !canvas) return;
+        const s = overlayViewScale();
+        const zw = Math.max(1, Math.round(canvas.width * s));
+        const zh = Math.max(1, Math.round(canvas.height * s));
+        if (overlayEl.width !== zw || overlayEl.height !== zh) {
+            overlayEl.width = zw;
+            overlayEl.height = zh;
+        }
+    }
+
+    /** Map logical canvas coords to overlay bitmap so edges line up with image pixels (avoids drift from round(w*s) vs w*s). */
+    function applyOverlayLogicalTransform(octx) {
+        const el = octx.canvas;
+        const sx = el.width / canvas.width;
+        const sy = el.height / canvas.height;
+        octx.setTransform(sx, 0, 0, sy, 0, 0);
+    }
+
+    /** ~1 device-pixel stroke in both axes (uses average scale when x/y differ slightly). */
+    function overlayHairlineWidth(octx) {
+        const el = octx.canvas;
+        const sx = el.width / canvas.width;
+        const sy = el.height / canvas.height;
+        return 2 / (sx + sy);
+    }
+
+    /** Dashed preview: ~6px / ~4px on screen at any zoom / DPR. */
+    function overlayDashPattern(octx) {
+        const el = octx.canvas;
+        const sx = el.width / canvas.width;
+        return [6 / sx, 4 / sx];
+    }
+
+    /** Snap drag bounds to integer canvas pixels so rect/circle previews align with committed strokes. */
+    function snapPreviewBounds(x0, y0, x1, y1) {
+        const xMin = Math.min(x0, x1);
+        const xMax = Math.max(x0, x1);
+        const yMin = Math.min(y0, y1);
+        const yMax = Math.max(y0, y1);
+        return [
+            Math.floor(xMin),
+            Math.floor(yMin),
+            Math.ceil(xMax),
+            Math.ceil(yMax),
+        ];
+    }
 
     function syncOverlayDomTransform(overlayEl) {
         if (!overlayEl || !canvas) return;
         const w = canvas.width;
         const h = canvas.height;
-        const t = `translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
         overlayEl.style.position = 'absolute';
-        overlayEl.style.left = '50%';
-        overlayEl.style.top = '50%';
+        overlayEl.style.left = '0';
+        overlayEl.style.top = '0';
         overlayEl.style.width = `${w}px`;
         overlayEl.style.height = `${h}px`;
-        overlayEl.style.marginLeft = `${-w / 2}px`;
-        overlayEl.style.marginTop = `${-h / 2}px`;
-        overlayEl.style.transform = t;
+        overlayEl.style.marginLeft = '0';
+        overlayEl.style.marginTop = '0';
+        overlayEl.style.transform = '';
         overlayEl.style.transformOrigin = 'center center';
         overlayEl.style.pointerEvents = 'none';
+        overlayEl.style.zIndex = '2';
+    }
+
+    /** translate3d keeps pan+zoom on one compositor-friendly layer. */
+    function buildViewTransformCss() {
+        const z = state.zoom;
+        return `translate3d(${state.panX}px, ${state.panY}px, 0) scale(${z})`;
+    }
+
+    /** Pan only changes translation — avoid re-writing canvas/overlay styles every move (major win for trackpad + MMB pan). */
+    function applyPanOnlyTransform() {
+        viewTransformHost.style.transform = buildViewTransformCss();
+        state._brushScreenRect = null;
     }
 
     function updateViewTransform() {
-        // Pan in screen pixels (applied after scaling via transform order), then zoom.
-        canvas.style.transform = `translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
-        const overlay = wrapper.querySelector('canvas.__overlay');
+        const z = state.zoom;
+        const w = canvas.width;
+        const h = canvas.height;
+        canvas.style.width = `${w}px`;
+        canvas.style.height = `${h}px`;
+        canvas.style.display = 'block';
+        canvas.style.position = 'relative';
+        canvas.style.margin = '0';
+        canvas.style.transform = '';
+        canvas.style.zIndex = '1';
+        viewTransformHost.style.position = 'relative';
+        viewTransformHost.style.width = `${w}px`;
+        viewTransformHost.style.height = `${h}px`;
+        viewTransformHost.style.flexShrink = '0';
+        viewTransformHost.style.transform = buildViewTransformCss();
+        viewTransformHost.style.transformOrigin = 'center center';
+        state._brushScreenRect = null;
+        const overlay = viewTransformHost.querySelector('canvas.__overlay');
         syncOverlayDomTransform(overlay);
     }
 
@@ -6824,12 +7429,12 @@ function initializeImageEditor(params) {
         return `rgba(${c.r}, ${c.g}, ${c.b}, ${c.a})`;
     }
 
-    function updateGameObjectIcon() {
+    /** Refresh the node grid sprite from the editor canvas. Pass `existingDataUrl` when the caller already encoded (e.g. saveToDisk) to avoid a second toDataURL. */
+    function updateGameObjectIcon(existingDataUrl) {
         // Update the selected object's icon in the grid immediately
         const obj = objects.find(o => o.id == selected_object);
         if (obj && obj.media && obj.media.length > 0) {
-            // Get the current canvas data URL
-            const dataUrl = canvas.toDataURL('image/png');
+            const dataUrl = existingDataUrl != null ? existingDataUrl : canvas.toDataURL('image/png');
 
             // Update the object's media path
             obj.media[0].path = dataUrl;
@@ -6889,13 +7494,14 @@ function initializeImageEditor(params) {
     function setZoom(z) {
         state.zoom = Math.max(0.1, Math.min(8, z));
         updateViewTransform();
-        // Crosshair is automatically scaled with overlay
+        // Coalesce: wheel / pinch can fire many events per frame — one overlay draw per rAF.
+        try { scheduleDrawCrosshair(); } catch (_) {}
     }
     function panBy(dx, dy) {
         // dx/dy are screen pixels to move the canvas by (positive right/down).
         state.panX += dx;
         state.panY += dy;
-        updateViewTransform();
+        applyPanOnlyTransform();
     }
     function zoomAboutClientPoint(clientX, clientY, newZoom) {
         const z0 = state.zoom;
@@ -6905,7 +7511,7 @@ function initializeImageEditor(params) {
         const rect = canvas.getBoundingClientRect();
         const vx = clientX - rect.left - rect.width / 2;
         const vy = clientY - rect.top - rect.height / 2;
-        // Convert to canvas-space offset from center (unclamped).
+        // Canvas-space offset from center (use state.zoom, not rect.width — getBoundingClientRect can be subpixel-tight vs W*zoom).
         const ox = vx / z0;
         const oy = vy / z0;
         // Adjust pan so the same canvas-space point stays under the cursor after zoom.
@@ -6914,12 +7520,14 @@ function initializeImageEditor(params) {
         state.panY += -oy * (z1 - z0);
         state.zoom = z1;
         updateViewTransform();
+        try { scheduleDrawCrosshair(); } catch (_) {}
     }
 
     async function saveToDisk(forceNewName) {
         try {
             // Crosshair is now on overlay, so main canvas is clean
             const dataUrl = canvas.toDataURL('image/png');
+            updateGameObjectIcon(dataUrl);
             let filename = currentImageFilename;
             if (!filename || forceNewName) {
                 filename = `sprite_${Date.now()}.png`;
@@ -6958,11 +7566,12 @@ function initializeImageEditor(params) {
                 else obj.media[0].path = bust;
             }
             // Update game window preview
-            renderGameWindowSprite();
+            scheduleRenderGameWindowSprite();
         } catch (e) {
             // On network or 404, gracefully save locally via dataUrl (static hosting fallback)
             try {
                 const dataUrl = canvas.toDataURL('image/png');
+                updateGameObjectIcon(dataUrl);
                 let filename = currentImageFilename || `sprite_${Date.now()}.png`;
                 currentImageFilename = filename;
                 imageRevision += 1;
@@ -6977,15 +7586,15 @@ function initializeImageEditor(params) {
                     if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
                     else obj.media[0].path = bust;
                 }
-                renderGameWindowSprite();
+                scheduleRenderGameWindowSprite();
                 // Optional: small toast indicating local save
                 try {
                     const old = document.getElementById('__img_save_err');
                     if (old) old.remove();
                     const toast = document.createElement('div');
                     toast.id = '__img_save_err';
+                    toast.className = 'app-toast';
                     toast.textContent = 'Saved locally (no server).';
-                    toast.style.cssText = 'position:fixed;bottom:16px;left:16px;background:#2e7d32;color:#fff;padding:8px 12px;border-radius:6px;font-size:12px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.3)';
                     document.body.appendChild(toast);
                     setTimeout(() => { if (toast && toast.parentNode) toast.parentNode.removeChild(toast); }, 2000);
                 } catch {}
@@ -6998,8 +7607,8 @@ function initializeImageEditor(params) {
     function clear(silent) {
         pushUndo();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        updateGameObjectIcon();
         if (!silent) saveToDisk();
+        else updateGameObjectIcon();
     }
 
     function loadImage(src) {
@@ -7065,90 +7674,242 @@ function initializeImageEditor(params) {
         return rects;
     }
 
-    function applyBrushLineRaw(x0, y0, x1, y1) {
+    /** Integer-aligned 1×1 pixels (avoids antialiased strokes and round-cap bleed from canvas stroke()). */
+    function fillBrushLinePixels(x0, y0, x1, y1) {
+        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.round(v)));
+        let xi = snap(x0, canvas.width);
+        let yi = snap(y0, canvas.height);
+        const x1i = snap(x1, canvas.width);
+        const y1i = snap(y1, canvas.height);
+        const dx = Math.abs(x1i - xi);
+        const dy = Math.abs(y1i - yi);
+        const sx = xi < x1i ? 1 : -1;
+        const sy = yi < y1i ? 1 : -1;
+        let err = dx - dy;
+        ctx.beginPath();
+        for (;;) {
+            ctx.rect(xi, yi, 1, 1);
+            if (xi === x1i && yi === y1i) break;
+            const e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                xi += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                yi += sy;
+            }
+        }
+        ctx.fill();
+    }
+
+    /** Bresenham 1×1 px into current path (caller fills). */
+    function addBresenhamRectsToPath(x0, y0, x1, y1) {
+        const w = canvas.width;
+        const h = canvas.height;
+        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.round(v)));
+        let xi = snap(x0, w);
+        let yi = snap(y0, h);
+        const x1i = snap(x1, w);
+        const y1i = snap(y1, h);
+        const dx = Math.abs(x1i - xi);
+        const dy = Math.abs(y1i - yi);
+        const sx = xi < x1i ? 1 : -1;
+        const sy = yi < y1i ? 1 : -1;
+        let err = dx - dy;
+        for (;;) {
+            ctx.rect(xi, yi, 1, 1);
+            if (xi === x1i && yi === y1i) break;
+            const e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                xi += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                yi += sy;
+            }
+        }
+    }
+
+    function symmetryPolylineCopies(points) {
+        const mx = (x) => (canvas.width - 1) - x;
+        const my = (y) => (canvas.height - 1) - y;
+        if (state.symmetry === 'none') return [points];
+        const out = [points];
+        if (state.symmetry === 'x' || state.symmetry === 'xy') {
+            const copy = new Float64Array(points.length);
+            for (let i = 0; i < points.length; i += 2) {
+                copy[i] = mx(points[i]);
+                copy[i + 1] = points[i + 1];
+            }
+            out.push(copy);
+        }
+        if (state.symmetry === 'y' || state.symmetry === 'xy') {
+            const copy = new Float64Array(points.length);
+            for (let i = 0; i < points.length; i += 2) {
+                copy[i] = points[i];
+                copy[i + 1] = my(points[i + 1]);
+            }
+            out.push(copy);
+        }
+        if (state.symmetry === 'xy') {
+            const copy = new Float64Array(points.length);
+            for (let i = 0; i < points.length; i += 2) {
+                copy[i] = mx(points[i]);
+                copy[i + 1] = my(points[i + 1]);
+            }
+            out.push(copy);
+        }
+        return out;
+    }
+
+    function dedupeConsecutivePolylinePoints(points) {
+        if (points.length < 4) return points;
+        const out = [points[0], points[1]];
+        for (let i = 2; i < points.length; i += 2) {
+            const ox = out[out.length - 2];
+            const oy = out[out.length - 1];
+            if (points[i] !== ox || points[i + 1] !== oy) {
+                out.push(points[i], points[i + 1]);
+            }
+        }
+        return Float64Array.from(out);
+    }
+
+    /** One pointermove worth of samples: one merged stroke per symmetry (fast) vs many applyBrushLine calls. */
+    function applyBrushPolylineFrame(points) {
+        const pts = dedupeConsecutivePolylinePoints(points);
+        if (pts.length < 4) return;
+        const polys = symmetryPolylineCopies(pts);
         ctx.save();
         const isErase = state.color.a <= 0.01;
         ctx.globalCompositeOperation = isErase ? 'destination-out' : 'source-over';
-        ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
-        ctx.lineWidth = state.brushSize;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.beginPath();
-        ctx.moveTo(x0, y0);
-        ctx.lineTo(x1, y1);
-        ctx.stroke();
+        if (state.brushSize === 1) {
+            ctx.fillStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+            for (let pi = 0; pi < polys.length; pi++) {
+                const poly = polys[pi];
+                ctx.beginPath();
+                for (let i = 0; i < poly.length - 2; i += 2) {
+                    addBresenhamRectsToPath(poly[i], poly[i + 1], poly[i + 2], poly[i + 3]);
+                }
+                ctx.fill();
+            }
+        } else {
+            ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+            ctx.lineWidth = state.brushSize;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            for (let pi = 0; pi < polys.length; pi++) {
+                const poly = polys[pi];
+                ctx.beginPath();
+                ctx.moveTo(poly[0], poly[1]);
+                for (let i = 2; i < poly.length; i += 2) {
+                    ctx.lineTo(poly[i], poly[i + 1]);
+                }
+                ctx.stroke();
+            }
+        }
         ctx.restore();
     }
 
     function applyBrushLine(x0, y0, x1, y1) {
         const segs = symmetrySegmentsForLine(x0, y0, x1, y1);
-        segs.forEach(([a,b,c,d]) => applyBrushLineRaw(a,b,c,d));
-        // Crosshair is on overlay, no need to redraw
-        updateGameObjectIcon();
+        ctx.save();
+        const isErase = state.color.a <= 0.01;
+        ctx.globalCompositeOperation = isErase ? 'destination-out' : 'source-over';
+        if (state.brushSize === 1) {
+            ctx.fillStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+            for (let s = 0; s < segs.length; s++) {
+                const [a, b, c, d] = segs[s];
+                fillBrushLinePixels(a, b, c, d);
+            }
+        } else {
+            ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
+            ctx.lineWidth = state.brushSize;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            for (let s = 0; s < segs.length; s++) {
+                const [a, b, c, d] = segs[s];
+                ctx.beginPath();
+                ctx.moveTo(a, b);
+                ctx.lineTo(c, d);
+                ctx.stroke();
+            }
+        }
+        ctx.restore();
+        // Crosshair is on overlay; grid icon updates once in saveToDisk (pointerup), not per segment.
     }
 
     function ensureOverlay() {
-        let overlay = wrapper.querySelector('canvas.__overlay');
+        let overlay = viewTransformHost.querySelector('canvas.__overlay');
         if (!overlay) {
             overlay = document.createElement('canvas');
             overlay.className = '__overlay';
-            overlay.width = canvas.width;
-            overlay.height = canvas.height;
-            wrapper.appendChild(overlay);
+            viewTransformHost.appendChild(overlay);
+            syncOverlayDomTransform(overlay);
         }
-        syncOverlayDomTransform(overlay);
+        syncOverlayBitmapResolution(overlay);
         return overlay;
     }
 
     function clearOverlay() {
-        const overlay = wrapper.querySelector('canvas.__overlay');
+        const overlay = viewTransformHost.querySelector('canvas.__overlay');
         if (overlay) {
-            overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+            const octx = overlay.getContext('2d', _editor2dOpts) || overlay.getContext('2d');
+            octx.setTransform(1, 0, 0, 1, 0, 0);
+            octx.clearRect(0, 0, overlay.width, overlay.height);
             // Redraw crosshair after clearing overlay
-            drawCrosshair();
+            flushDrawCrosshair();
         }
     }
 
     function drawCrosshair() {
         // Draw crosshair on a separate overlay that doesn't affect main canvas
         const overlay = ensureOverlay();
-        const octx = overlay.getContext('2d');
+        const octx = overlay.getContext('2d', _editor2dOpts) || overlay.getContext('2d');
+        try { octx.imageSmoothingEnabled = false; } catch (_) {}
 
+        octx.setTransform(1, 0, 0, 1, 0, 0);
         // If a selection overlay exists, draw it first (so crosshair/axes sit on top).
-        if (state.selection) drawSelectionOverlay();
+        if (state.selection) drawSelectionOverlay(octx);
         else octx.clearRect(0, 0, overlay.width, overlay.height);
 
-        const centerX = overlay.width / 2;
-        const centerY = overlay.height / 2;
+        applyOverlayLogicalTransform(octx);
+        octx.setLineDash([]);
+        octx.shadowBlur = 0;
+        octx.shadowColor = 'transparent';
+
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
         const size = 12; // Smaller size of crosshair arms
+        const hw = overlayHairlineWidth(octx);
 
         octx.save();
         // Symmetry axes (subtle)
         if (state.symmetry === 'x' || state.symmetry === 'xy') {
             octx.strokeStyle = '#00ffcc';
-            octx.lineWidth = 1;
+            octx.lineWidth = hw;
             octx.globalAlpha = 0.22;
             octx.beginPath();
             octx.moveTo(centerX + 0.5, 0);
-            octx.lineTo(centerX + 0.5, overlay.height);
+            octx.lineTo(centerX + 0.5, canvas.height);
             octx.stroke();
         }
         if (state.symmetry === 'y' || state.symmetry === 'xy') {
             octx.strokeStyle = '#00ffcc';
-            octx.lineWidth = 1;
+            octx.lineWidth = hw;
             octx.globalAlpha = 0.22;
             octx.beginPath();
             octx.moveTo(0, centerY + 0.5);
-            octx.lineTo(overlay.width, centerY + 0.5);
+            octx.lineTo(canvas.width, centerY + 0.5);
             octx.stroke();
         }
 
-        // Crosshair center marker
+        // Crosshair center marker (no shadowBlur — that forces an expensive blur pass every redraw)
         octx.strokeStyle = '#ffffff';
-        octx.lineWidth = 1;
-        octx.globalAlpha = 0.7;
-        octx.shadowColor = '#000000';
-        octx.shadowBlur = 1;
+        octx.lineWidth = hw;
+        octx.globalAlpha = 0.85;
 
         // Draw horizontal line
         octx.beginPath();
@@ -7165,14 +7926,32 @@ function initializeImageEditor(params) {
         octx.restore();
     }
 
+    let overlayDrawRaf = null;
+    function scheduleDrawCrosshair() {
+        if (overlayDrawRaf != null) return;
+        overlayDrawRaf = requestAnimationFrame(() => {
+            overlayDrawRaf = null;
+            drawCrosshair();
+        });
+    }
+    function flushDrawCrosshair() {
+        if (overlayDrawRaf != null) {
+            cancelAnimationFrame(overlayDrawRaf);
+            overlayDrawRaf = null;
+        }
+        drawCrosshair();
+    }
+
     function paintPreviewRectOn(octx, x0, y0, x1, y1) {
-        octx.setLineDash([6, 4]);
+        octx.lineJoin = 'miter';
+        octx.lineCap = 'butt';
+        octx.setLineDash(overlayDashPattern(octx));
         octx.strokeStyle = '#00ffcc';
-        octx.lineWidth = 1;
+        octx.lineWidth = overlayHairlineWidth(octx);
         const rw = x1 - x0;
         const rh = y1 - y0;
         if (state.fill) {
-            octx.strokeRect(x0 + 0.5, y0 + 0.5, rw, rh);
+            octx.strokeRect(x0, y0, rw, rh);
         } else {
             const lw = Math.max(1, state.brushSize);
             const iw = Math.max(0, rw - lw);
@@ -7186,9 +7965,11 @@ function initializeImageEditor(params) {
         const ry = (y1 - y0) / 2;
         const cx = x0 + rx;
         const cy = y0 + ry;
-        octx.setLineDash([6, 4]);
+        octx.lineJoin = 'miter';
+        octx.lineCap = 'butt';
+        octx.setLineDash(overlayDashPattern(octx));
         octx.strokeStyle = '#00ffcc';
-        octx.lineWidth = 1;
+        octx.lineWidth = overlayHairlineWidth(octx);
         octx.beginPath();
         if (state.fill) {
             octx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI * 2);
@@ -7204,12 +7985,18 @@ function initializeImageEditor(params) {
     function previewShapeTools(tool, minX, minY, maxX, maxY) {
         const rects = symmetryRectsForBounds(minX, minY, maxX, maxY);
         const overlay = ensureOverlay();
-        const octx = overlay.getContext('2d');
+        const octx = overlay.getContext('2d', _editor2dOpts) || overlay.getContext('2d');
+        try { octx.imageSmoothingEnabled = false; } catch (_) {}
+        octx.setTransform(1, 0, 0, 1, 0, 0);
         octx.clearRect(0, 0, overlay.width, overlay.height);
+        applyOverlayLogicalTransform(octx);
         rects.forEach(([x0, y0, x1, y1]) => {
-            if (tool === 'rect') paintPreviewRectOn(octx, x0, y0, x1, y1);
-            else paintPreviewCircleOn(octx, x0, y0, x1, y1);
+            const [sx0, sy0, sx1, sy1] = snapPreviewBounds(x0, y0, x1, y1);
+            if (sx1 <= sx0 || sy1 <= sy0) return;
+            if (tool === 'rect') paintPreviewRectOn(octx, sx0, sy0, sx1, sy1);
+            else paintPreviewCircleOn(octx, sx0, sy0, sx1, sy1);
         });
+        octx.setLineDash([]);
     }
 
     function commitRect(x0, y0, x1, y1) {
@@ -7269,13 +8056,15 @@ function initializeImageEditor(params) {
 
     function bucketFillAt(x, y) {
         pushUndo();
+        const ix = Math.max(0, Math.min(canvas.width - 1, Math.round(x)));
+        const iy = Math.max(0, Math.min(canvas.height - 1, Math.round(y)));
         const target = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const { data, width, height } = target;
-        const idx = (y * width + x) * 4;
+        const idx = (iy * width + ix) * 4;
         const tr = data[idx], tg = data[idx+1], tb = data[idx+2], ta = data[idx+3];
         const newR = state.color.r, newG = state.color.g, newB = state.color.b, newA = Math.round(state.color.a * 255);
         if (tr === newR && tg === newG && tb === newB && ta === newA) return;
-        const stack = [[x, y]];
+        const stack = [[ix, iy]];
         const match = (i) => data[i] === tr && data[i+1] === tg && data[i+2] === tb && data[i+3] === ta;
         while (stack.length) {
             const [px, py] = stack.pop();
@@ -7289,98 +8078,305 @@ function initializeImageEditor(params) {
             stack.push([px, py-1]);
         }
         ctx.putImageData(target, 0, 0);
-        // Crosshair is on overlay, no need to redraw
-        updateGameObjectIcon();
+        // Crosshair is on overlay, no need to redraw; saveToDisk on bucket pointerup updates grid.
+    }
+
+    /** Handles/tether: constant on-screen size — canvas uses CSS scale(zoom), so logical = screenPx / zoom. */
+    const SEL_HANDLE_SCREEN_PX = 6;
+    const SEL_ROT_OFFSET_SCREEN_PX = 22;
+    function selectionHandleRadiusLogical() {
+        const z = Math.max(0.05, state.zoom);
+        return SEL_HANDLE_SCREEN_PX / z;
+    }
+    function selectionRotOffsetLogical() {
+        const z = Math.max(0.05, state.zoom);
+        return SEL_ROT_OFFSET_SCREEN_PX / z;
+    }
+
+    function worldToLocal(px, py, cx, cy, angle) {
+        const dx = px - cx;
+        const dy = py - cy;
+        const c = Math.cos(-angle);
+        const s = Math.sin(-angle);
+        return { lx: dx * c - dy * s, ly: dx * s + dy * c };
+    }
+
+    function localToWorld(lx, ly, cx, cy, angle) {
+        return {
+            x: cx + lx * Math.cos(angle) - ly * Math.sin(angle),
+            y: cy + lx * Math.sin(angle) + ly * Math.cos(angle),
+        };
+    }
+
+    function cornersWorld(cx, cy, w, h, angle) {
+        const hw = w / 2;
+        const hh = h / 2;
+        const pts = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+        return pts.map(([lx, ly]) => localToWorld(lx, ly, cx, cy, angle));
+    }
+
+    function clampCenterInCanvas(cx, cy, w, h, angle) {
+        let c = { cx, cy };
+        for (let iter = 0; iter < 10; iter++) {
+            const pts = cornersWorld(c.cx, c.cy, w, h, angle);
+            let ox = 0;
+            let oy = 0;
+            for (const p of pts) {
+                if (p.x < 0) ox = Math.max(ox, -p.x);
+                if (p.x > canvas.width) ox = Math.min(ox, canvas.width - p.x);
+                if (p.y < 0) oy = Math.max(oy, -p.y);
+                if (p.y > canvas.height) oy = Math.min(oy, canvas.height - p.y);
+            }
+            if (Math.abs(ox) < 1e-4 && Math.abs(oy) < 1e-4) break;
+            c.cx += ox;
+            c.cy += oy;
+        }
+        return c;
+    }
+
+    function pointInSelection(px, py) {
+        const s = state.selection;
+        if (!s || s.w <= 0 || s.h <= 0) return false;
+        const ang = s.angle || 0;
+        const { lx, ly } = worldToLocal(px, py, s.cx, s.cy, ang);
+        return lx >= -s.w / 2 && lx <= s.w / 2 && ly >= -s.h / 2 && ly <= s.h / 2;
+    }
+
+    function getSelectionHandles() {
+        const s = state.selection;
+        if (!s || s.w <= 0 || s.h <= 0) return [];
+        const ang = s.angle || 0;
+        const hw = s.w / 2;
+        const hh = s.h / 2;
+        const localPts = [
+            { name: 'nw', lx: -hw, ly: -hh },
+            { name: 'n', lx: 0, ly: -hh },
+            { name: 'ne', lx: hw, ly: -hh },
+            { name: 'e', lx: hw, ly: 0 },
+            { name: 'se', lx: hw, ly: hh },
+            { name: 's', lx: 0, ly: hh },
+            { name: 'sw', lx: -hw, ly: hh },
+            { name: 'w', lx: -hw, ly: 0 },
+        ];
+        if (s.layerCanvas) {
+            localPts.push({ name: 'rotate', lx: 0, ly: -hh - selectionRotOffsetLogical() });
+        }
+        const hr = selectionHandleRadiusLogical();
+        return localPts.map((p) => {
+            const wpt = localToWorld(p.lx, p.ly, s.cx, s.cy, ang);
+            return { name: p.name, x: wpt.x, y: wpt.y, r: hr };
+        });
+    }
+
+    function hitTestHandle(px, py) {
+        if (!state.selection) return null;
+        const handles = getSelectionHandles();
+        let best = null;
+        let bestD = Infinity;
+        for (let i = 0; i < handles.length; i++) {
+            const h = handles[i];
+            const dx = px - h.x;
+            const dy = py - h.y;
+            const d = Math.sqrt(dx * dx + dy * dy);
+            if (d <= h.r + 2 && d < bestD) {
+                bestD = d;
+                best = h.name;
+            }
+        }
+        return best;
+    }
+
+    function computeResizeFromLocal(orig, handle, lx, ly, shiftKey) {
+        const w0 = orig.w;
+        const h0 = orig.h;
+        const minSize = 1;
+        const hh = w0 / 2;
+        const hv = h0 / 2;
+        let nxmin;
+        let nxmax;
+        let nymin;
+        let nymax;
+        if (handle === 'nw') {
+            nxmin = Math.min(lx, hh - minSize); nymin = Math.min(ly, hv - minSize);
+            nxmax = hh; nymax = hv;
+        } else if (handle === 'ne') {
+            nxmin = -hh; nxmax = Math.max(lx, -hh + minSize);
+            nymin = ly; nymax = hv;
+        } else if (handle === 'se') {
+            nxmin = -hh; nxmax = Math.max(lx, -hh + minSize);
+            nymin = -hv; nymax = Math.max(ly, -hv + minSize);
+        } else if (handle === 'sw') {
+            nxmin = Math.min(lx, hh - minSize); nxmax = hh;
+            nymin = -hv; nymax = Math.max(ly, -hv + minSize);
+        } else if (handle === 'n') {
+            nxmin = -hh; nxmax = hh; nymin = Math.min(ly, hv - minSize); nymax = hv;
+        } else if (handle === 's') {
+            nxmin = -hh; nxmax = hh; nymin = -hv; nymax = Math.max(ly, -hv + minSize);
+        } else if (handle === 'e') {
+            nxmin = -hh; nxmax = Math.max(lx, -hh + minSize); nymin = -hv; nymax = hv;
+        } else if (handle === 'w') {
+            nxmin = Math.min(lx, hh - minSize); nxmax = hh; nymin = -hv; nymax = hv;
+        } else {
+            return null;
+        }
+        let wNew = nxmax - nxmin;
+        let hNew = nymax - nymin;
+        if (shiftKey && (handle === 'nw' || handle === 'ne' || handle === 'se' || handle === 'sw')) {
+            const size = Math.max(wNew, hNew);
+            if (handle === 'nw') {
+                nxmin = hh - size; nymin = hv - size; nxmax = hh; nymax = hv;
+            } else if (handle === 'ne') {
+                nxmax = -hh + size; nymin = hv - size; nxmin = -hh; nymax = hv;
+            } else if (handle === 'se') {
+                nxmax = -hh + size; nymax = -hv + size; nxmin = -hh; nymin = -hv;
+            } else if (handle === 'sw') {
+                nxmin = hh - size; nymax = -hv + size; nxmax = hh; nymin = -hv;
+            }
+            wNew = nxmax - nxmin;
+            hNew = nymax - nymin;
+        }
+        wNew = Math.max(minSize, wNew);
+        hNew = Math.max(minSize, hNew);
+        const cxLoc = (nxmin + nxmax) / 2;
+        const cyLoc = (nymin + nymax) / 2;
+        const a = orig.angle || 0;
+        return {
+            cx: orig.cx + cxLoc * Math.cos(a) - cyLoc * Math.sin(a),
+            cy: orig.cy + cxLoc * Math.sin(a) + cyLoc * Math.cos(a),
+            w: wNew,
+            h: hNew,
+        };
     }
 
     function beginSelection(x, y) {
         if (state.selection && state.selection.layerCanvas) commitSelection();
-        state.selection = { x, y, w: 0, h: 0, layerCanvas: null, dragging: false, offsetX: 0, offsetY: 0 };
+        state.selection = { cx: x, cy: y, w: 0, h: 0, angle: 0, layerCanvas: null, dragging: false, offsetX: 0, offsetY: 0, resizing: null };
     }
-    function finalizeSelectionRect(x, y) {
+    function finalizeSelectionRect(x, y, shiftKey) {
         if (!state.selection) return;
-        const x0 = Math.min(state.selection.x, x);
-        const y0 = Math.min(state.selection.y, y);
-        const x1 = Math.max(state.selection.x, x);
-        const y1 = Math.max(state.selection.y, y);
-        const w = x1 - x0;
-        const h = y1 - y0;
-        if (w === 0 || h === 0) { state.selection = null; return; }
+        let x0 = Math.min(state.startX, x);
+        let y0 = Math.min(state.startY, y);
+        let x1 = Math.max(state.startX, x);
+        let y1 = Math.max(state.startY, y);
+        if (shiftKey) {
+            const size = Math.max(x1 - x0, y1 - y0);
+            x1 = x0 + size;
+            y1 = y0 + size;
+        }
+        const [bx0, by0, bx1, by1] = snapPreviewBounds(x0, y0, x1, y1);
+        const sx0 = Math.max(0, bx0);
+        const sy0 = Math.max(0, by0);
+        const sx1 = Math.min(canvas.width, bx1);
+        const sy1 = Math.min(canvas.height, by1);
+        const w = sx1 - sx0;
+        const h = sy1 - sy0;
+        if (w === 0 || h === 0) { state.selection = null; drawCrosshair(); return; }
         pushUndo();
         const layer = document.createElement('canvas');
         layer.width = w; layer.height = h;
         const lctx = layer.getContext('2d');
-        const imageData = ctx.getImageData(x0, y0, w, h);
+        const imageData = ctx.getImageData(sx0, sy0, w, h);
         lctx.putImageData(imageData, 0, 0);
-        ctx.clearRect(x0, y0, w, h);
+        ctx.clearRect(sx0, sy0, w, h);
         state.selection = {
-            x: x0, y: y0, w, h,
+            cx: sx0 + w / 2,
+            cy: sy0 + h / 2,
+            w,
+            h,
+            angle: 0,
             layerCanvas: layer,
             dragging: false,
             offsetX: 0,
             offsetY: 0,
             resizing: null,
             _orig: null,
-            _initial: { x: x0, y: y0, w, h },
+            _initial: { x: sx0, y: sy0, w, h },
             _cutFromCanvas: true,
         };
-        drawSelectionOverlay();
+        drawCrosshair();
     }
-    function drawSelectionOverlay() {
+    /** Caller provides octx from drawCrosshair (avoids double ensureOverlay + getContext). */
+    function drawSelectionOverlay(octx) {
         if (!state.selection) return;
-        let overlay = wrapper.querySelector('canvas.__overlay');
-        if (!overlay) {
-            overlay = document.createElement('canvas');
-            overlay.className = '__overlay';
-            overlay.width = canvas.width;
-            overlay.height = canvas.height;
-            wrapper.appendChild(overlay);
+        octx.setTransform(1, 0, 0, 1, 0, 0);
+        octx.clearRect(0, 0, octx.canvas.width, octx.canvas.height);
+        applyOverlayLogicalTransform(octx);
+        const s = state.selection;
+        if (s.w <= 0 || s.h <= 0) return;
+        const cx = s.cx;
+        const cy = s.cy;
+        const w = s.w;
+        const h = s.h;
+        const ang = s.angle || 0;
+        const hw = overlayHairlineWidth(octx);
+        const hr = selectionHandleRadiusLogical();
+        const rotOff = selectionRotOffsetLogical();
+        octx.imageSmoothingEnabled = false;
+        octx.save();
+        octx.translate(cx, cy);
+        octx.rotate(ang);
+        if (s.layerCanvas) {
+            octx.drawImage(s.layerCanvas, -w / 2, -h / 2, w, h);
         } else {
-            overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+            octx.fillStyle = 'rgba(0, 255, 204, 0.09)';
+            octx.fillRect(-w / 2, -h / 2, w, h);
         }
-        syncOverlayDomTransform(overlay);
-        const octx = overlay.getContext('2d');
-        octx.clearRect(0, 0, overlay.width, overlay.height);
-        // draw floating layer if present (scaled to current w/h)
-        if (state.selection.layerCanvas) {
-            octx.drawImage(state.selection.layerCanvas, state.selection.x, state.selection.y, state.selection.w, state.selection.h);
-        }
-        // marching ants bounding box
-        octx.setLineDash([6, 4]);
+        octx.lineJoin = 'miter';
+        octx.lineCap = 'butt';
+        octx.setLineDash(overlayDashPattern(octx));
+        octx.lineDashOffset = 0;
         octx.strokeStyle = '#00ffcc';
-        octx.lineWidth = 1;
-        octx.strokeRect(state.selection.x + 0.5, state.selection.y + 0.5, state.selection.w, state.selection.h);
-        // resize handles
-        const hs = 6; // handle size
-        const handles = getSelectionHandles(hs);
+        octx.lineWidth = hw;
+        octx.strokeRect(-w / 2, -h / 2, w, h);
+        if (s.layerCanvas) {
+            octx.setLineDash([]);
+            octx.strokeStyle = 'rgba(0, 255, 204, 0.55)';
+            octx.lineWidth = hw;
+            octx.beginPath();
+            octx.moveTo(0, -h / 2);
+            octx.lineTo(0, -h / 2 - rotOff);
+            octx.stroke();
+        }
+        octx.restore();
+        const handles = getSelectionHandles();
         octx.setLineDash([]);
-        octx.fillStyle = '#00ffcc';
-        handles.forEach(h => {
-            octx.fillRect(h.x, h.y, h.w, h.h);
-        });
+        for (let i = 0; i < handles.length; i++) {
+            const hd = handles[i];
+            octx.beginPath();
+            octx.arc(hd.x, hd.y, hr, 0, Math.PI * 2);
+            octx.fillStyle = '#00ffcc';
+            octx.fill();
+            octx.strokeStyle = 'rgba(0, 0, 0, 0.42)';
+            octx.lineWidth = hw;
+            octx.stroke();
+        }
     }
     function commitSelection() {
         if (!state.selection || !state.selection.layerCanvas) return;
         // If this selection came from the select tool (cut-out), undo was already pushed when we cleared the canvas.
         if (!state.selection._cutFromCanvas) pushUndo();
-        // Clamp selection position to canvas bounds
-        state.selection.x = Math.max(0, Math.min(canvas.width - state.selection.w, state.selection.x));
-        state.selection.y = Math.max(0, Math.min(canvas.height - state.selection.h, state.selection.y));
-        // draw scaled to current width/height
-        ctx.drawImage(state.selection.layerCanvas, state.selection.x, state.selection.y, state.selection.w, state.selection.h);
+        const s = state.selection;
+        const c = clampCenterInCanvas(s.cx, s.cy, s.w, s.h, s.angle || 0);
+        s.cx = c.cx;
+        s.cy = c.cy;
+        ctx.save();
+        try { ctx.imageSmoothingEnabled = false; } catch (_) {}
+        ctx.translate(s.cx, s.cy);
+        ctx.rotate(s.angle || 0);
+        ctx.drawImage(s.layerCanvas, -s.w / 2, -s.h / 2, s.w, s.h);
+        ctx.restore();
         state.selection = null;
         // Clear selection overlay but keep crosshair/axes visible
         clearOverlay();
-        updateGameObjectIcon();
         saveToDisk();
     }
 
     function cancelSelection() {
         if (!state.selection) return;
+        state.isDrawing = false;
         if (state.selection.layerCanvas && state.selection._cutFromCanvas && state.selection._initial) {
             const init = state.selection._initial;
             ctx.drawImage(state.selection.layerCanvas, init.x, init.y, init.w, init.h);
-            updateGameObjectIcon();
             saveToDisk();
         }
         state.selection = null;
@@ -7393,7 +8389,7 @@ function initializeImageEditor(params) {
         empty.width = Math.max(1, state.selection.layerCanvas.width);
         empty.height = Math.max(1, state.selection.layerCanvas.height);
         state.selection.layerCanvas = empty;
-        drawSelectionOverlay();
+        drawCrosshair();
     }
 
     // Internal clipboard for the image editor (keeps this fast + works without OS clipboard permissions)
@@ -7423,7 +8419,11 @@ function initializeImageEditor(params) {
         const sx = Math.max(0, x0), sy = Math.max(0, y0);
         const sw = Math.min(canvas.width, layer.width), sh = Math.min(canvas.height, layer.height);
         state.selection = {
-            x: sx, y: sy, w: sw, h: sh,
+            cx: sx + sw / 2,
+            cy: sy + sh / 2,
+            w: sw,
+            h: sh,
+            angle: 0,
             layerCanvas: layer,
             dragging: false,
             offsetX: 0,
@@ -7433,7 +8433,6 @@ function initializeImageEditor(params) {
             _initial: { x: sx, y: sy, w: sw, h: sh },
             _cutFromCanvas: false,
         };
-        drawSelectionOverlay();
         drawCrosshair();
     }
     function selectAll() {
@@ -7445,7 +8444,11 @@ function initializeImageEditor(params) {
         layer.getContext('2d').drawImage(canvas, 0, 0);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         state.selection = {
-            x: 0, y: 0, w: canvas.width, h: canvas.height,
+            cx: canvas.width / 2,
+            cy: canvas.height / 2,
+            w: canvas.width,
+            h: canvas.height,
+            angle: 0,
             layerCanvas: layer,
             dragging: false,
             offsetX: 0,
@@ -7455,52 +8458,65 @@ function initializeImageEditor(params) {
             _initial: { x: 0, y: 0, w: canvas.width, h: canvas.height },
             _cutFromCanvas: true,
         };
-        drawSelectionOverlay();
+        drawCrosshair();
     }
-    function getSelectionHandles(handleSize) {
-        const s = state.selection;
-        const hs = handleSize || 6;
-        const half = Math.floor(hs / 2);
-        const x0 = s.x, y0 = s.y, x1 = s.x + s.w, y1 = s.y + s.h;
-        const cx = s.x + Math.floor(s.w / 2), cy = s.y + Math.floor(s.h / 2);
-        return [
-            { name: 'nw', x: x0 - half, y: y0 - half, w: hs, h: hs },
-            { name: 'n',  x: cx - half, y: y0 - half, w: hs, h: hs },
-            { name: 'ne', x: x1 - half, y: y0 - half, w: hs, h: hs },
-            { name: 'e',  x: x1 - half, y: cy - half, w: hs, h: hs },
-            { name: 'se', x: x1 - half, y: y1 - half, w: hs, h: hs },
-            { name: 's',  x: cx - half, y: y1 - half, w: hs, h: hs },
-            { name: 'sw', x: x0 - half, y: y1 - half, w: hs, h: hs },
-            { name: 'w',  x: x0 - half, y: cy - half, w: hs, h: hs },
-        ];
+
+    /** Map client coords to canvas bitmap using a cached getBoundingClientRect (same math as canvasToLocalFromClientRect). */
+    function canvasCoordsFromClientRect(clientX, clientY, rect) {
+        const x = (clientX - rect.left) / (rect.width || 1) * canvas.width;
+        const y = (clientY - rect.top) / (rect.height || 1) * canvas.height;
+        return {
+            x: Math.max(0, Math.min(canvas.width, x)),
+            y: Math.max(0, Math.min(canvas.height, y)),
+        };
     }
-    function hitTestHandle(px, py) {
-        if (!state.selection) return null;
-        const handles = getSelectionHandles(8);
-        for (let i = 0; i < handles.length; i++) {
-            const h = handles[i];
-            if (px >= h.x && px <= h.x + h.w && py >= h.y && py <= h.y + h.h) {
-                return h.name;
-            }
-        }
-        return null;
+
+    /** Map pointer to canvas bitmap coords (zoom is CSS width/height + translate, no transform scale). */
+    function canvasToLocalFromClientRect(evt) {
+        const rect = canvas.getBoundingClientRect();
+        return canvasCoordsFromClientRect(evt.clientX, evt.clientY, rect);
     }
 
     function canvasToLocal(evt) {
-        const rect = canvas.getBoundingClientRect();
-        const cx = evt.clientX - rect.left - rect.width/2;
-        const cy = evt.clientY - rect.top - rect.height/2;
-        const x = Math.round(canvas.width/2 + cx / state.zoom);
-        const y = Math.round(canvas.height/2 + cy / state.zoom);
-        return { x: Math.max(0, Math.min(canvas.width-1, x)), y: Math.max(0, Math.min(canvas.height-1, y)) };
+        const ow = canvas.offsetWidth || canvas.width;
+        const oh = canvas.offsetHeight || canvas.height;
+        const onCanvas = evt.target === canvas;
+        if (onCanvas && Number.isFinite(evt.offsetX) && Number.isFinite(evt.offsetY)) {
+            const x = (evt.offsetX / ow) * canvas.width;
+            const y = (evt.offsetY / oh) * canvas.height;
+            return {
+                x: Math.max(0, Math.min(canvas.width, x)),
+                y: Math.max(0, Math.min(canvas.height, y)),
+            };
+        }
+        return canvasToLocalFromClientRect(evt);
     }
-    function onMouseDown(e) {
-        if (e.button !== 0) return;
+
+    function onPointerDown(e) {
+        const isRightBrushErase = e.button === 2 && state.tool === 'brush';
+        if (e.button !== 0 && !isRightBrushErase) return;
+        if (isRightBrushErase) {
+            e.preventDefault();
+            state.brushEraseDrag = true;
+            state._brushSavedA = state.color.a;
+            state.color.a = 0;
+            state._brushErasePointerId = e.pointerId;
+        } else {
+            if (state.brushEraseDrag) {
+                state.color.a = state._brushSavedA;
+                state.brushEraseDrag = false;
+                state._brushErasePointerId = null;
+            }
+        }
+        try {
+            if (typeof e.pointerId === 'number') canvas.setPointerCapture(e.pointerId);
+        } catch (_) {}
         const p = canvasToLocal(e);
         state.isDrawing = (state.tool !== 'select');
         state.startX = state.lastX = p.x;
         state.startY = state.lastY = p.y;
         if (state.tool === 'brush') {
+            state._brushScreenRect = canvas.getBoundingClientRect();
             pushUndo();
             applyBrushLine(p.x, p.y, p.x, p.y);
         } else if (state.tool === 'bucket') {
@@ -7512,102 +8528,135 @@ function initializeImageEditor(params) {
             if (state.selection) {
                 const handle = hitTestHandle(p.x, p.y);
                 if (handle) {
-                    state.selection.resizing = handle;
-                    state.selection._orig = { x: state.selection.x, y: state.selection.y, w: state.selection.w, h: state.selection.h };
+                    const s = state.selection;
+                    s.resizing = handle;
+                    s._orig = { cx: s.cx, cy: s.cy, w: s.w, h: s.h, angle: s.angle || 0 };
+                    if (handle === 'rotate') {
+                        s._rotateStart = Math.atan2(p.y - s.cy, p.x - s.cx);
+                        s._angleStart = s.angle || 0;
+                    }
                     state.isDrawing = false;
                     return;
                 }
-                if (p.x >= state.selection.x && p.x < state.selection.x + state.selection.w && p.y >= state.selection.y && p.y < state.selection.y + state.selection.h) {
+                if (pointInSelection(p.x, p.y)) {
                     state.selection.dragging = true;
-                    state.selection.offsetX = p.x - state.selection.x;
-                    state.selection.offsetY = p.y - state.selection.y;
+                    state.selection.offsetX = p.x - state.selection.cx;
+                    state.selection.offsetY = p.y - state.selection.cy;
                 } else {
                     beginSelection(p.x, p.y);
+                    state.isDrawing = true;
                 }
             } else {
                 beginSelection(p.x, p.y);
+                state.isDrawing = true;
             }
         } else if (state.tool === 'rect' || state.tool === 'circle') {
             // Prepare overlay preview
             clearOverlay();
         }
     }
-    function onMouseMove(e) {
+    function onPointerMove(e) {
+        if (activeTab !== 'images') {
+            if (!state.isDrawing && !(state.selection && (state.selection.dragging || state.selection.resizing))) return;
+        } else {
+            // Avoid running this handler on every global pointermove while idle on the Images tab.
+            if (!state.isDrawing && !(state.selection && (state.selection.dragging || state.selection.resizing))) {
+                if (!(state.tool === 'select' && e.target === canvas)) return;
+            }
+        }
         if (!state.isDrawing) {
             // Cursor polish for selection tool (handles + move)
-            if (activeTab === 'images' && state.tool === 'select' && state.selection && !state.selection.dragging && !state.selection.resizing) {
-                try {
-                    const p = canvasToLocal(e);
-                    const handle = hitTestHandle(p.x, p.y);
-                    const inside = p.x >= state.selection.x && p.x < state.selection.x + state.selection.w && p.y >= state.selection.y && p.y < state.selection.y + state.selection.h;
-                    const cursors = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize' };
-                    wrapper.style.cursor = handle ? (cursors[handle] || 'default') : (inside ? 'move' : '');
-                } catch (_) {}
+            if (activeTab === 'images' && state.tool === 'select') {
+                if (e.target !== canvas) {
+                    wrapper.style.cursor = '';
+                } else {
+                    try {
+                        const p = canvasToLocal(e);
+                        if (!state.selection) {
+                            wrapper.style.cursor = 'crosshair';
+                        } else if (!state.selection.dragging && !state.selection.resizing) {
+                            const handle = hitTestHandle(p.x, p.y);
+                            const inside = pointInSelection(p.x, p.y);
+                            const cursors = {
+                                nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+                                n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize', rotate: 'grab',
+                            };
+                            wrapper.style.cursor = handle ? (cursors[handle] || 'default') : (inside ? 'move' : 'crosshair');
+                        }
+                    } catch (_) {}
+                }
             }
-            if (state.selection && state.selection.resizing) {
+            if (state.selection && state.selection.resizing === 'rotate') {
                 const p = canvasToLocal(e);
                 const s = state.selection;
-                const minSize = 1;
-                let nx = s.x, ny = s.y, nw = s.w, nh = s.h;
-                const h = s.resizing;
-                const keepSquare = e.shiftKey;
-                const endX = p.x, endY = p.y;
-                const orig = s._orig || { x: s.x, y: s.y, w: s.w, h: s.h };
-                // compute new rect based on handle
-                const right = orig.x + orig.w;
-                const bottom = orig.y + orig.h;
-                if (h === 'nw') { nx = Math.min(endX, right - minSize); ny = Math.min(endY, bottom - minSize); nw = right - nx; nh = bottom - ny; }
-                if (h === 'n')  { ny = Math.min(endY, bottom - minSize); nh = bottom - ny; }
-                if (h === 'ne') { ny = Math.min(endY, bottom - minSize); nw = Math.max(minSize, Math.min(canvas.width - orig.x, endX - orig.x)); nh = bottom - ny; nx = right - nw; }
-                if (h === 'e')  { nw = Math.max(minSize, Math.min(canvas.width - orig.x, endX - orig.x)); nx = orig.x; ny = orig.y; nh = orig.h; }
-                if (h === 'se') { nw = Math.max(minSize, endX - orig.x); nh = Math.max(minSize, endY - orig.y); nx = orig.x; ny = orig.y; }
-                if (h === 's')  { nh = Math.max(minSize, endY - orig.y); nx = orig.x; ny = orig.y; nw = orig.w; }
-                if (h === 'sw') { nx = Math.min(endX, right - minSize); nw = right - nx; nh = Math.max(minSize, endY - orig.y); ny = orig.y; }
-                if (h === 'w')  { nx = Math.min(endX, right - minSize); nw = right - nx; ny = orig.y; nh = orig.h; }
-                if (keepSquare) {
-                    const size = Math.max(nw, nh);
-                    // adjust based on handle anchor
-                    if (h === 'nw') { nx = right - size; ny = bottom - size; }
-                    if (h === 'ne') { ny = bottom - size; }
-                    if (h === 'se') { /* anchored at orig.x,orig.y */ }
-                    if (h === 'sw') { nx = right - size; }
-                    nw = nh = size;
+                const cur = Math.atan2(p.y - s.cy, p.x - s.cx);
+                let ang = s._angleStart + (cur - s._rotateStart);
+                if (e.shiftKey) {
+                    const step = Math.PI / 4;
+                    ang = Math.round(ang / step) * step;
                 }
-                // clamp to canvas bounds
-                nx = Math.max(0, Math.min(canvas.width - minSize, nx));
-                ny = Math.max(0, Math.min(canvas.height - minSize, ny));
-                nw = Math.max(minSize, Math.min(canvas.width - nx, nw));
-                nh = Math.max(minSize, Math.min(canvas.height - ny, nh));
-                s.x = nx; s.y = ny; s.w = nw; s.h = nh;
-                drawSelectionOverlay();
+                s.angle = ang;
+                scheduleDrawCrosshair();
+            } else if (state.selection && state.selection.resizing) {
+                const p = canvasToLocal(e);
+                const s = state.selection;
+                const o = s._orig;
+                const { lx, ly } = worldToLocal(p.x, p.y, o.cx, o.cy, o.angle);
+                const res = computeResizeFromLocal(o, s.resizing, lx, ly, e.shiftKey);
+                if (res) {
+                    const cc = clampCenterInCanvas(res.cx, res.cy, res.w, res.h, o.angle);
+                    s.cx = cc.cx;
+                    s.cy = cc.cy;
+                    s.w = res.w;
+                    s.h = res.h;
+                }
+                scheduleDrawCrosshair();
             } else if (state.selection && state.selection.dragging) {
                 const p = canvasToLocal(e);
-                let nx = Math.max(0, Math.min(canvas.width - state.selection.w, p.x - state.selection.offsetX));
-                let ny = Math.max(0, Math.min(canvas.height - state.selection.h, p.y - state.selection.offsetY));
-                // Snap to canvas center if near
-                const centerX = Math.round((canvas.width - state.selection.w) / 2);
-                const centerY = Math.round((canvas.height - state.selection.h) / 2);
+                const s = state.selection;
+                let ncx = p.x - s.offsetX;
+                let ncy = p.y - s.offsetY;
+                const cc = clampCenterInCanvas(ncx, ncy, s.w, s.h, s.angle || 0);
+                s.cx = cc.cx;
+                s.cy = cc.cy;
                 const snapDist = 8;
-                if (Math.abs(nx - centerX) <= snapDist) nx = centerX;
-                if (Math.abs(ny - centerY) <= snapDist) ny = centerY;
-                state.selection.x = nx;
-                state.selection.y = ny;
-                drawSelectionOverlay();
+                if (Math.abs(s.cx - canvas.width / 2) <= snapDist) s.cx = canvas.width / 2;
+                if (Math.abs(s.cy - canvas.height / 2) <= snapDist) s.cy = canvas.height / 2;
+                scheduleDrawCrosshair();
+            }
+            return;
+        }
+        if (state.tool === 'brush') {
+            // Paint synchronously (rAF deferred ink by ~1+ frames and felt like ~100ms lag).
+            // Read coalesced samples here only — never use PointerEvent after this handler returns.
+            let rect = state._brushScreenRect;
+            if (!rect) {
+                rect = canvas.getBoundingClientRect();
+                state._brushScreenRect = rect;
+            }
+            const shift = e.shiftKey;
+            let events = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
+            if (!events || events.length === 0) events = [e];
+            const pts = [state.lastX, state.lastY];
+            for (let i = 0; i < events.length; i++) {
+                const ev = events[i];
+                let { x: cx, y: cy } = canvasCoordsFromClientRect(ev.clientX, ev.clientY, rect);
+                if (shift) {
+                    const dx = cx - state.startX;
+                    const dy = cy - state.startY;
+                    if (Math.abs(dx) > Math.abs(dy)) cy = state.startY; else cx = state.startX;
+                }
+                pts.push(cx, cy);
+            }
+            const n = pts.length;
+            state.lastX = pts[n - 2];
+            state.lastY = pts[n - 1];
+            if (n >= 4) {
+                scheduleBrushStrokePolyline(pts);
             }
             return;
         }
         const p = canvasToLocal(e);
-        if (state.tool === 'brush') {
-            const shift = e.shiftKey;
-            let cx = p.x, cy = p.y;
-            if (shift) {
-                const dx = p.x - state.startX;
-                const dy = p.y - state.startY;
-                if (Math.abs(dx) > Math.abs(dy)) cy = state.startY; else cx = state.startX;
-            }
-            applyBrushLine(state.lastX, state.lastY, cx, cy);
-            state.lastX = cx; state.lastY = cy;
-        }
         if (state.tool === 'rect' || state.tool === 'circle') {
             let x0 = state.startX, y0 = state.startY, x1 = p.x, y1 = p.y;
             if (e.shiftKey) {
@@ -7617,27 +8666,52 @@ function initializeImageEditor(params) {
             }
             previewShapeTools(state.tool, Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1));
         }
-        if (state.tool === 'select' && state.selection && !state.selection.dragging) {
-            state.selection.w = Math.abs(p.x - state.startX);
-            state.selection.h = Math.abs(p.y - state.startY);
-            state.selection.x = Math.min(state.startX, p.x);
-            state.selection.y = Math.min(state.startY, p.y);
-            drawSelectionOverlay();
+        if (state.tool === 'select' && state.selection && !state.selection.layerCanvas && !state.selection.dragging) {
+            let x0 = state.startX, y0 = state.startY, x1 = p.x, y1 = p.y;
+            if (e.shiftKey) {
+                const size = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+                x1 = x0 + Math.sign(x1 - x0) * size;
+                y1 = y0 + Math.sign(y1 - y0) * size;
+            }
+            let rx0 = Math.min(x0, x1), ry0 = Math.min(y0, y1);
+            let rx1 = Math.max(x0, x1), ry1 = Math.max(y0, y1);
+            rx0 = Math.max(0, rx0); ry0 = Math.max(0, ry0);
+            rx1 = Math.min(canvas.width, rx1); ry1 = Math.min(canvas.height, ry1);
+            const rw = Math.max(0, rx1 - rx0);
+            const rh = Math.max(0, ry1 - ry0);
+            state.selection.cx = rx0 + rw / 2;
+            state.selection.cy = ry0 + rh / 2;
+            state.selection.w = rw;
+            state.selection.h = rh;
+            state.selection.angle = 0;
+            scheduleDrawCrosshair();
         }
     }
-    function onMouseUp(e) {
+    function onPointerUp(e) {
         if (!state.isDrawing) {
+            if (
+                state.brushEraseDrag
+                && (e.type === 'pointercancel' || e.button === 2)
+                && (state._brushErasePointerId == null
+                    || e.pointerId == null
+                    || e.pointerId === state._brushErasePointerId)
+            ) {
+                state.color.a = state._brushSavedA;
+                state.brushEraseDrag = false;
+                state._brushErasePointerId = null;
+            }
             if (state.selection && state.selection.dragging) {
                 state.selection.dragging = false;
-                drawSelectionOverlay();
+                flushDrawCrosshair();
             } else if (state.selection && state.selection.resizing) {
                 state.selection.resizing = null;
                 state.selection._orig = null;
-                drawSelectionOverlay();
+                flushDrawCrosshair();
             }
             return;
         }
         state.isDrawing = false;
+        state._brushScreenRect = null;
         const p = canvasToLocal(e);
         if (state.tool === 'rect') {
             let x0 = state.startX, y0 = state.startY, x1 = p.x, y1 = p.y;
@@ -7646,40 +8720,16 @@ function initializeImageEditor(params) {
                 x1 = x0 + Math.sign(x1 - x0) * size;
                 y1 = y0 + Math.sign(y1 - y0) * size;
             }
-            const rx0 = Math.min(x0,x1), ry0 = Math.min(y0,y1), rx1 = Math.max(x0,x1), ry1 = Math.max(y0,y1);
-            const rw = rx1 - rx0, rh = ry1 - ry0;
-            // Eraser, or symmetry: commit like the brush (mirrored copies); no floating layer.
-            // Offscreen "selection layer" compositing can't erase the destination canvas when later drawn via drawImage.
-            if (state.color.a <= 0.01 || state.symmetry !== 'none') {
-                pushUndo();
-                symmetryRectsForBounds(rx0, ry0, rx1, ry1).forEach(([a, b, c, d]) => commitRect(a, b, c, d));
+            const [bx0, by0, bx1, by1] = snapPreviewBounds(x0, y0, x1, y1);
+            const rw = bx1 - bx0, rh = by1 - by0;
+            if (rw < 1 || rh < 1) {
                 clearOverlay();
-                updateGameObjectIcon();
-                saveToDisk();
                 return;
             }
-            // create floating selection layer with the rect drawn on it
-            const layer = document.createElement('canvas');
-            layer.width = Math.max(1, rw); layer.height = Math.max(1, rh);
-            const lctx = layer.getContext('2d');
-            lctx.save();
-            lctx.globalCompositeOperation = 'source-over';
-            if (state.fill) {
-                lctx.fillStyle = rgbaString();
-                lctx.fillRect(0, 0, rw, rh);
-            } else {
-                const lw = Math.max(1, state.brushSize);
-                lctx.lineWidth = lw;
-                lctx.strokeStyle = rgbaString();
-                const iw = Math.max(0, rw - lw);
-                const ih = Math.max(0, rh - lw);
-                if (iw > 0 && ih > 0) lctx.strokeRect(lw / 2, lw / 2, iw, ih);
-            }
-            lctx.restore();
-            // floating selection (draggable/resizable)
-            state.selection = { x: rx0, y: ry0, w: rw, h: rh, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null, _orig: null, _initial: { x: rx0, y: ry0, w: rw, h: rh }, _cutFromCanvas: false };
-            drawSelectionOverlay();
+            pushUndo();
+            symmetryRectsForBounds(bx0, by0, bx1, by1).forEach(([a, b, c, d]) => commitRect(a, b, c, d));
             clearOverlay();
+            saveToDisk();
         } else if (state.tool === 'circle') {
             let x0 = state.startX, y0 = state.startY, x1 = p.x, y1 = p.y;
             if (e.shiftKey) {
@@ -7687,64 +8737,65 @@ function initializeImageEditor(params) {
                 x1 = x0 + Math.sign(x1 - x0) * size;
                 y1 = y0 + Math.sign(y1 - y0) * size;
             }
-            const cx0 = Math.min(x0,x1), cy0 = Math.min(y0,y1), cx1 = Math.max(x0,x1), cy1 = Math.max(y0,y1);
+            const [cx0, cy0, cx1, cy1] = snapPreviewBounds(x0, y0, x1, y1);
             const cw = cx1 - cx0, ch = cy1 - cy0;
-            if (state.color.a <= 0.01 || state.symmetry !== 'none') {
-                pushUndo();
-                symmetryRectsForBounds(cx0, cy0, cx1, cy1).forEach(([a, b, c, d]) => commitCircle(a, b, c, d));
+            if (cw < 1 || ch < 1) {
                 clearOverlay();
-                updateGameObjectIcon();
-                saveToDisk();
                 return;
             }
-            const layer = document.createElement('canvas');
-            layer.width = Math.max(1, cw); layer.height = Math.max(1, ch);
-            const lctx = layer.getContext('2d');
-            lctx.save();
-            lctx.globalCompositeOperation = 'source-over';
-            if (state.fill) {
-                lctx.beginPath();
-                lctx.ellipse(cw/2, ch/2, Math.abs(cw/2), Math.abs(ch/2), 0, 0, Math.PI * 2);
-                lctx.fillStyle = rgbaString();
-                lctx.fill();
-            } else {
-                const lw = Math.max(1, state.brushSize);
-                lctx.lineWidth = lw;
-                lctx.strokeStyle = rgbaString();
-                const rxIn = Math.max(0, cw / 2 - lw / 2);
-                const ryIn = Math.max(0, ch / 2 - lw / 2);
-                lctx.beginPath();
-                if (rxIn > 0 && ryIn > 0) {
-                    lctx.ellipse(cw / 2, ch / 2, rxIn, ryIn, 0, 0, Math.PI * 2);
-                    lctx.stroke();
-                }
-            }
-            lctx.restore();
-            state.selection = { x: cx0, y: cy0, w: cw, h: ch, layerCanvas: layer, dragging: false, offsetX: 0, offsetY: 0, resizing: null, _orig: null, _initial: { x: cx0, y: cy0, w: cw, h: ch }, _cutFromCanvas: false };
-            drawSelectionOverlay();
+            pushUndo();
+            symmetryRectsForBounds(cx0, cy0, cx1, cy1).forEach(([a, b, c, d]) => commitCircle(a, b, c, d));
             clearOverlay();
+            saveToDisk();
         } else if (state.tool === 'brush') {
+            flushBrushStrokeNow();
             // Persist brush stroke when mouse is released
             saveToDisk();
+            if (
+                state.brushEraseDrag
+                && (state._brushErasePointerId == null
+                    || e.pointerId == null
+                    || e.pointerId === state._brushErasePointerId)
+            ) {
+                state.color.a = state._brushSavedA;
+                state.brushEraseDrag = false;
+                state._brushErasePointerId = null;
+            }
             // Crosshair remains on overlay
         } else if (state.tool === 'select') {
             if (state.selection && !state.selection.layerCanvas) {
-                finalizeSelectionRect(p.x, p.y);
+                const dx = p.x - state.startX;
+                const dy = p.y - state.startY;
+                const MIN_MARQUEE_DRAG = 3;
+                if (Math.hypot(dx, dy) < MIN_MARQUEE_DRAG) {
+                    state.selection = null;
+                    drawCrosshair();
+                } else {
+                    finalizeSelectionRect(p.x, p.y, e.shiftKey);
+                }
             }
         }
     }
-    function onMouseLeave() { if (state.isDrawing) state.isDrawing = false; }
+    function onPointerLeave() {
+        // Intentionally empty: pointerleave still fires while pointer is captured for drawing,
+        // and clearing isDrawing here would skip pointerup — so rect/circle/brush strokes never committed.
+    }
 
-    canvas.addEventListener('mousedown', onMouseDown);
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-    canvas.addEventListener('mouseleave', onMouseLeave);
+    canvas.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerLeave);
+    canvas.addEventListener('contextmenu', (e) => {
+        if (state.tool === 'brush') e.preventDefault();
+    });
     // Commit selection when clicking outside selection on canvas
     canvas.addEventListener('click', (e) => {
         if (!state.selection) return;
         const p = canvasToLocal(e);
-        const inside = p.x >= state.selection.x && p.x < state.selection.x + state.selection.w && p.y >= state.selection.y && p.y < state.selection.y + state.selection.h;
-        if (!inside && !state.isDrawing) {
+        const onHandle = hitTestHandle(p.x, p.y);
+        const inside = pointInSelection(p.x, p.y);
+        if (!inside && !onHandle && !state.isDrawing) {
             commitSelection();
         }
     });
@@ -7769,12 +8820,32 @@ function initializeImageEditor(params) {
         if (ax > 0 && ax < 50) return true;
         return false;
     }
-    wrapper.addEventListener('wheel', (e) => {
+
+    let trackpadPanWheelRaf = null;
+    let trackpadPanAccX = 0;
+    let trackpadPanAccY = 0;
+    function flushPendingTrackpadPan() {
+        if (trackpadPanWheelRaf != null) {
+            cancelAnimationFrame(trackpadPanWheelRaf);
+            trackpadPanWheelRaf = null;
+        }
+        if (trackpadPanAccX !== 0 || trackpadPanAccY !== 0) {
+            state.panX += trackpadPanAccX;
+            state.panY += trackpadPanAccY;
+            trackpadPanAccX = 0;
+            trackpadPanAccY = 0;
+            applyPanOnlyTransform();
+        }
+    }
+
+    previewHost.addEventListener('wheel', (e) => {
         // Keep the editor from scrolling the page/panels while interacting.
         e.preventDefault();
+        e.stopPropagation();
 
         // Pinch zoom (macOS trackpad commonly reports this as wheel with ctrlKey=true)
         if (e.ctrlKey) {
+            flushPendingTrackpadPan();
             // Smooth exponential zoom; deltaY sign: negative -> zoom in, positive -> zoom out
             const factor = Math.exp(-e.deltaY * 0.01);
             zoomAboutClientPoint(e.clientX, e.clientY, state.zoom * factor);
@@ -7782,12 +8853,26 @@ function initializeImageEditor(params) {
             return;
         }
 
-        // Two-finger trackpad pan
+        // Two-finger trackpad pan — accumulate deltas; one transform apply per animation frame.
         if (isLikelyTrackpadWheel(e)) {
-            // Natural scrolling: wheel delta down should move the view down (canvas up), so invert.
-            panBy(-(e.deltaX || 0) * TRACKPAD_PAN_SPEED, -(e.deltaY || 0) * TRACKPAD_PAN_SPEED);
+            trackpadPanAccX += -(e.deltaX || 0) * TRACKPAD_PAN_SPEED;
+            trackpadPanAccY += -(e.deltaY || 0) * TRACKPAD_PAN_SPEED;
+            if (trackpadPanWheelRaf == null) {
+                trackpadPanWheelRaf = requestAnimationFrame(() => {
+                    trackpadPanWheelRaf = null;
+                    if (trackpadPanAccX !== 0 || trackpadPanAccY !== 0) {
+                        state.panX += trackpadPanAccX;
+                        state.panY += trackpadPanAccY;
+                        trackpadPanAccX = 0;
+                        trackpadPanAccY = 0;
+                        applyPanOnlyTransform();
+                    }
+                });
+            }
             return;
         }
+
+        flushPendingTrackpadPan();
 
         // Mouse wheel zoom (discrete)
         const step = e.deltaY < 0 ? MOUSE_WHEEL_ZOOM_STEP_IN : MOUSE_WHEEL_ZOOM_STEP_OUT;
@@ -7801,12 +8886,13 @@ function initializeImageEditor(params) {
         if (e.button !== 1) return;
         e.preventDefault();
         e.stopPropagation();
+        flushPendingTrackpadPan();
         state.isPanning = true;
         state.panPointerId = e.pointerId;
         state._lastPanClientX = e.clientX;
         state._lastPanClientY = e.clientY;
-        try { wrapper.setPointerCapture(e.pointerId); } catch (_) {}
-        wrapper.style.cursor = 'grabbing';
+        try { previewHost.setPointerCapture(e.pointerId); } catch (_) {}
+        previewHost.style.cursor = 'grabbing';
     }
     function onPanPointerMove(e) {
         if (!state.isPanning) return;
@@ -7823,15 +8909,19 @@ function initializeImageEditor(params) {
         if (state.panPointerId != null && e && e.pointerId != null && e.pointerId !== state.panPointerId) return;
         state.isPanning = false;
         state.panPointerId = null;
-        wrapper.style.cursor = '';
+        previewHost.style.cursor = '';
     }
-    wrapper.addEventListener('pointerdown', onPanPointerDown);
-    wrapper.addEventListener('pointermove', onPanPointerMove);
-    wrapper.addEventListener('pointerup', endPan);
-    wrapper.addEventListener('pointercancel', endPan);
+    previewHost.addEventListener('pointerdown', onPanPointerDown);
+    previewHost.addEventListener('pointermove', onPanPointerMove);
+    previewHost.addEventListener('pointerup', endPan);
+    previewHost.addEventListener('pointercancel', endPan);
 
     // Keyboard shortcuts for undo/redo + selection editing
     document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            const ctxMenu = document.getElementById('__image_asset_ctx_menu');
+            if (ctxMenu) { e.preventDefault(); removeImageAssetContextMenu(); return; }
+        }
         if (activeTab !== 'images') return;
         // Don't steal shortcuts while typing in inputs.
         const t = e.target;
@@ -7877,9 +8967,12 @@ function initializeImageEditor(params) {
             if (e.key === 'ArrowDown') dy = step;
             if (e.key === 'ArrowLeft') dx = -step;
             if (e.key === 'ArrowRight') dx = step;
-            state.selection.x = Math.max(0, Math.min(canvas.width - state.selection.w, state.selection.x + dx));
-            state.selection.y = Math.max(0, Math.min(canvas.height - state.selection.h, state.selection.y + dy));
-            drawSelectionOverlay();
+            state.selection.cx += dx;
+            state.selection.cy += dy;
+            const cc = clampCenterInCanvas(state.selection.cx, state.selection.cy, state.selection.w, state.selection.h, state.selection.angle || 0);
+            state.selection.cx = cc.cx;
+            state.selection.cy = cc.cy;
+            drawCrosshair();
             return;
         }
     });
@@ -7899,9 +8992,7 @@ function initializeImageEditor(params) {
         restore(next);
     }
 
-    params.zoomInBtn.addEventListener('click', () => setZoom(state.zoom * 1.2));
-    params.zoomOutBtn.addEventListener('click', () => setZoom(state.zoom * 0.8));
-    params.zoomResetBtn.addEventListener('click', () => setZoom(1));
+    // Zoom buttons are wired in createImagesInterface via createZoomControlStrip (zoomImage / resetZoom → setZoom)
 
     // Public API
     const api = {

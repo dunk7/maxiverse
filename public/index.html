@@ -12,14 +12,15 @@
 <body>
   <div class="container">
     <div class="workspace">
-      <div class="top-bar">
-        <div class="logo">
-          <img src="./images/gear.png" alt="Maxiverse Logo">
-          <span>Maxiverse</span>
-        </div>
-        <div class="menu-bar">
+      <div class="top-bar" role="banner">
+        <div class="top-bar-brand">
+          <div class="logo">
+            <img src="./images/gear.png" alt="">
+            <span>Maxiverse</span>
+          </div>
+          <div class="menu-bar">
           <div class="file-menu-container">
-            <button class="menu-btn file-menu-btn" onclick="toggleFileMenu()">File</button>
+            <button type="button" class="menu-btn file-menu-btn" onclick="toggleFileMenu()" aria-haspopup="true" aria-expanded="false" aria-controls="file-dropdown">File</button>
             <div class="undo-menu" id="file-dropdown">
               <button class="undo-menu-item" onclick="saveProjectToFile()">Save</button>
               <div class="menu-separator"></div>
@@ -30,7 +31,7 @@
             <input id="file-input" type="file" accept=".json,.maxiverse,.app,application/json" style="display:none" />
           </div>
           <div class="edit-menu-container">
-            <button class="menu-btn edit-menu-btn" onclick="toggleEditMenu()" onmouseenter="console.log('Edit button hovered')" onmouseleave="console.log('Edit button left')">Edit</button>
+            <button type="button" class="menu-btn edit-menu-btn" onclick="toggleEditMenu()" aria-haspopup="true" aria-expanded="false" aria-controls="edit-dropdown">Edit</button>
             <div class="undo-menu" id="edit-dropdown">
               <button class="undo-menu-item" onclick="handleEditAction('undo')">Undo</button>
               <div class="menu-separator"></div>
@@ -42,16 +43,17 @@
             </div>
           </div>
         </div>
-        <div class="asset-tabs">
-          <button class="asset-tab code-tab">Code</button>
-          <button class="asset-tab images-tab">Images</button>
-          <button class="asset-tab sound-tab">Sound</button>
-          <button class="asset-tab threed-tab">3D</button>
+        </div>
+        <div class="asset-tabs" role="tablist" aria-label="Editor panels" title="Scroll tabs: mouse wheel here, or drag the bar under the tabs">
+          <button type="button" class="asset-tab code-tab" role="tab" aria-selected="true">Code</button>
+          <button type="button" class="asset-tab images-tab" role="tab" aria-selected="false">Images</button>
+          <button type="button" class="asset-tab sound-tab" role="tab" aria-selected="false">Sound</button>
+          <button type="button" class="asset-tab threed-tab" role="tab" aria-selected="false">3D</button>
         </div>
         <div class="profile-section">
-          <img src="./images/gear.png" alt="Profile Photo" class="profile-photo">
-          <button class="profile-btn">Profile</button>
-          <button class="play-btn" id="topbar-play" title="Play/Stop">▶</button>
+          <img src="./images/gear.png" alt="" class="profile-photo" width="28" height="28">
+          <button type="button" class="profile-btn">Profile</button>
+          <button type="button" class="play-btn" id="topbar-play" title="Play (run) / Stop" aria-label="Play or stop">▶</button>
         </div>
       </div>
       <div id="node-window" tabindex="0"></div>

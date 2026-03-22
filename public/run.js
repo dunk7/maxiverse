@@ -4,18 +4,16 @@ let frame = 0;
 let rafId; // Declare rafId for requestAnimationFrame
 
 let state = {
-
 	object0: {
-		position: (0,0),
+		position: [0, 0],
 		size: 1,
 		rotation: 0,
 		alpha: 1,
-		image: "blue circle"
+		image: "blue circle",
 		variables: {
 			score: 0
-		}
+		},
 		current_node: 0
-
 	}
 };
 
