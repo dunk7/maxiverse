@@ -1301,8 +1301,8 @@ function syncCodeSelectionOwnership(selectedObj) {
         if (!valid.has(id)) selectedCodeBlockIds.delete(id);
     }
 }
-function applyCodeBlockSelectionClasses() {
-    const layer = document.getElementById('code-zoom-layer');
+function applyCodeBlockSelectionClasses(layerOverride) {
+    const layer = layerOverride || document.getElementById('code-zoom-layer');
     if (!layer) return;
     layer.querySelectorAll('.node-block').forEach(el => {
         const id = parseInt(el.dataset.codeId, 10);
@@ -2337,6 +2337,7 @@ function createNodeBlock(codeData, x, y) {
         label.textContent = '';
         label.append('Start Sound (');
         const span = document.createElement('span');
+        span.className = 'node-input-container';
         const select = document.createElement('select');
         const snds = getCurrentObjectSounds();
         snds.forEach((s) => {
@@ -2351,6 +2352,24 @@ function createNodeBlock(codeData, x, y) {
         span.appendChild(select);
         label.appendChild(span);
         label.append(')');
+        const btn = document.createElement('button');
+        btn.className = 'node-plus-btn node-input-plus-btn node-input-plus-btn-a';
+        btn.textContent = '+'; btn.title = 'Add input (A)';
+        btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, 'a', btn); });
+        btn.addEventListener('mousedown', (e) => {
+            e.stopPropagation(); e.preventDefault();
+            if (isConnecting) return;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
+            const nodeWindow = document.getElementById('node-window');
+            if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
+            clearMenuDocHandlers();
+            isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
+            attachConnectDragListeners();
+            drawConnections();
+        });
+        span.appendChild(btn);
+        if (codeData.input_a != null) { select.style.display = 'none'; const connInd = document.createElement('input'); connInd.type = 'text'; connInd.value = '^'; connInd.readOnly = true; span.insertBefore(connInd, btn); }
     } else if (codeData.content === 'instantiate') {
         label.textContent = '';
         label.append('Instantiate (');
@@ -2557,7 +2576,76 @@ function createNodeBlock(codeData, x, y) {
         bIn.value = codeData.rgb_b;
         bIn.addEventListener('change', () => { codeData.rgb_b = Math.max(0, Math.min(255, Math.round(parseNumericInput(bIn.value)))); bIn.value = codeData.rgb_b; });
         colorWrap.appendChild(bIn);
-        colorWrap.append(')');
+        colorWrap.append(') ');
+
+        const colorPickBtn = document.createElement('button');
+        colorPickBtn.type = 'button';
+        colorPickBtn.className = 'node-color-pick-btn';
+        colorPickBtn.title = 'Pick a color';
+        const lucide = window.lucide;
+        if (lucide && lucide.icons) {
+            const iconDef = (lucide.icons.pipette || lucide.icons.eyedropper);
+            if (iconDef && typeof iconDef.toSvg === 'function') {
+                colorPickBtn.innerHTML = iconDef.toSvg({ width: 14, height: 14 });
+            } else {
+                colorPickBtn.textContent = '◐';
+            }
+        } else {
+            colorPickBtn.textContent = '◐';
+        }
+
+        function applyPickedRgb(r, g, b) {
+            codeData.rgb_r = r; codeData.rgb_g = g; codeData.rgb_b = b;
+            rIn.value = r; gIn.value = g; bIn.value = b;
+        }
+
+        colorPickBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (typeof window.EyeDropper === 'function' && window.isSecureContext) {
+                let openPromise;
+                try { openPromise = new EyeDropper().open(); } catch (_) { return; }
+                openPromise.then((result) => {
+                    const hex = result.sRGBHex;
+                    if (!hex) return;
+                    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+                    if (!m) return;
+                    applyPickedRgb(parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16));
+                }).catch(() => {});
+                return;
+            }
+            const canvas = document.querySelector('.image-editor-surface');
+            if (!canvas) return;
+            const prevCursor = canvas.style.cursor;
+            canvas.style.cursor = 'crosshair';
+            const wrapper = canvas.parentElement;
+            if (wrapper) wrapper.style.cursor = 'crosshair';
+
+            function cleanup() {
+                canvas.style.cursor = prevCursor;
+                if (wrapper) wrapper.style.cursor = '';
+                canvas.removeEventListener('pointerdown', onPick, true);
+                document.removeEventListener('keydown', onCancel, true);
+            }
+            function onPick(e) {
+                e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+                cleanup();
+                const rect = canvas.getBoundingClientRect();
+                const x = Math.floor((e.clientX - rect.left) / rect.width * canvas.width);
+                const y = Math.floor((e.clientY - rect.top) / rect.height * canvas.height);
+                if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height) return;
+                let pixel;
+                try { pixel = canvas.getContext('2d').getImageData(x, y, 1, 1).data; } catch (_) { return; }
+                applyPickedRgb(pixel[0], pixel[1], pixel[2]);
+            }
+            function onCancel(e) {
+                if (e.key !== 'Escape') return;
+                cleanup();
+            }
+            canvas.addEventListener('pointerdown', onPick, true);
+            document.addEventListener('keydown', onCancel, true);
+        });
+        colorWrap.appendChild(colorPickBtn);
 
         const syncTouchingVisibility = () => {
             const m = codeData.touching_mode || 'object';
@@ -4055,7 +4143,17 @@ function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn,
             e.preventDefault();
             const selectedObj = objects.find(obj => obj.id == selected_object);
             if (!selectedObj) return;
-            insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey === 'b' ? 'b' : 'a', customPosition);
+            let inputBtnCenterX = null;
+            if (!customPosition && anchorBtn && anchorBlock) {
+                try {
+                    const layer = document.getElementById('code-zoom-layer');
+                    const scale = layer ? getLayerUniformScale(layer) : 1;
+                    const blockRect = anchorBlock.getBoundingClientRect();
+                    const btnRect = anchorBtn.getBoundingClientRect();
+                    inputBtnCenterX = (btnRect.left + btnRect.width / 2 - blockRect.left) / scale;
+                } catch (_) {}
+            }
+            insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey === 'b' ? 'b' : 'a', customPosition, inputBtnCenterX);
             closeAnyAddMenus();
             // Reset and re-arm drag state so subsequent drags work immediately
             cleanupDragState();
@@ -4334,7 +4432,7 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
 }
 
 // Insert a new input block above the given anchor block and connect via input_a/input_b
-function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, customPosition = null) {
+function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, customPosition = null, inputBtnCenterX = null) {
     const existingIds = selectedObj.code.map(b => b.id);
     const newId = (existingIds.length ? Math.max(...existingIds) : 0) + 1;
     const basePosition = customPosition || (anchorCodeData && anchorCodeData.position ? anchorCodeData.position : { x: 20, y: 20 });
@@ -4426,7 +4524,6 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
 
     // For drag-to-create, adjust position to center the block on mouse coordinates
     if (placementPoint) {
-        // Create a temporary block to get its dimensions
         const tempBlock = createNodeBlock(newBlock, 0, 0);
         tempBlock.style.visibility = 'hidden';
         tempBlock.style.position = 'absolute';
@@ -4435,12 +4532,20 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         const blockWidth = tempBlock.offsetWidth;
         const blockHeight = tempBlock.offsetHeight;
 
-        // Center the block on the mouse position
         newBlock.position.x = placementPoint.x - (blockWidth / 2);
         newBlock.position.y = placementPoint.y - (blockHeight / 2);
 
-        // Remove temporary block
         document.body.removeChild(tempBlock);
+    } else if (inputBtnCenterX != null) {
+        const tempBlock = createNodeBlock(newBlock, 0, 0);
+        tempBlock.style.visibility = 'hidden';
+        tempBlock.style.position = 'absolute';
+        document.body.appendChild(tempBlock);
+
+        const blockWidth = tempBlock.offsetWidth;
+        document.body.removeChild(tempBlock);
+
+        newBlock.position.x = basePosition.x + inputBtnCenterX - blockWidth / 2;
     }
 
     // Re-render to reflect caret changes and redraw connections
@@ -4905,6 +5010,25 @@ function handleConnectMouseUp(e) {
             }
         }
 
+        // Fallback: if dropped on a block body (not the tiny input-plus btn),
+        // auto-connect to the first available input slot on that block.
+        if (!foundValidTarget && el && selectedObj) {
+            const blockEl = el.classList && el.classList.contains('node-block') ? el : (el.closest && el.closest('.node-block'));
+            if (blockEl) {
+                const targetId = parseInt(blockEl.dataset.codeId, 10);
+                if (targetId !== connectFromBlockId) {
+                    const target = selectedObj.code.find(c => c.id === targetId);
+                    if (target && blockEl.querySelector('.node-input-plus-btn')) {
+                        const which = (target.input_a == null) ? 'a' : (target.input_b == null && blockEl.querySelector('.node-input-plus-btn-b')) ? 'b' : null;
+                        if (which) {
+                            foundValidTarget = true;
+                            connectProviderToInput(selectedObj, target, which, connectFromBlockId);
+                        }
+                    }
+                }
+            }
+        }
+
         if (!foundValidTarget && connectDragMoved && selectedObj) {
             // No input button found - create new action block at mouse position (only after a real drag)
             const source = selectedObj.code.find(c => c.id === connectFromBlockId);
@@ -4955,6 +5079,21 @@ function handleConnectMouseUp(e) {
                 const providerId = parseInt(providerBlockEl.dataset.codeId, 10);
                 const provider = selectedObj.code.find(c => c.id === providerId);
                 if (provider && provider.type === 'value') {
+                    foundValidTarget = true;
+                    const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
+                    if (target) connectProviderToInput(selectedObj, target, connectFromInput.which, providerId);
+                }
+            }
+        }
+
+        // Fallback: output anchor has pointer-events:none, so elementFromPoint
+        // won't return it directly. Accept drops anywhere on a value block body.
+        if (!foundValidTarget && el) {
+            const blockEl = el.classList && el.classList.contains('node-block') ? el : (el.closest && el.closest('.node-block'));
+            if (blockEl && selectedObj) {
+                const providerId = parseInt(blockEl.dataset.codeId, 10);
+                const provider = selectedObj.code.find(c => c.id === providerId);
+                if (provider && provider.type === 'value' && providerId !== connectFromInput.blockId) {
                     foundValidTarget = true;
                     const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
                     if (target) connectProviderToInput(selectedObj, target, connectFromInput.which, providerId);
@@ -5129,15 +5268,12 @@ function cleanupDragState() {
 function connectProviderToInput(selectedObj, targetBlock, which, providerId) {
     const key = which === 'b' ? 'input_b' : 'input_a';
     targetBlock[key] = providerId;
-    // Mark value fields as caret
-    if (targetBlock.content === 'move_xy') {
-        if (which === 'a') targetBlock.val_a = '^'; else targetBlock.val_b = '^';
-    } else if (targetBlock.content === 'wait' || targetBlock.content === 'repeat' || targetBlock.content === 'rotate' || targetBlock.content === 'set_rotation') {
-        targetBlock.val_a = '^';
-    } else if (targetBlock.content === 'operation') {
+    // Mark value fields as caret so serialized data reflects connected state
+    if (targetBlock.content === 'operation') {
         if (which === 'a') targetBlock.op_x = '^'; else targetBlock.op_y = '^';
-    } else if (targetBlock.content === 'set_variable' || targetBlock.content === 'change_variable') {
-        targetBlock.val_a = '^';
+    } else {
+        if (which === 'a') targetBlock.val_a = '^';
+        else targetBlock.val_b = '^';
     }
     updateWorkspace();
 }
@@ -5828,7 +5964,7 @@ function updateWorkspace() {
             );
             zoomLayer.appendChild(block);
         });
-        applyCodeBlockSelectionClasses();
+        applyCodeBlockSelectionClasses(zoomLayer);
 
         codeViewport.appendChild(sizer);
 
@@ -6310,6 +6446,63 @@ function createImagesInterface(container) {
         if (pal) pal.textContent = text;
         if (cust) cust.textContent = text;
     }
+    let _canvasPickActive = false;
+    function startCanvasColorPick() {
+        if (!editorCanvas || _canvasPickActive) return;
+        _canvasPickActive = true;
+        const prevCursor = editorCanvas.style.cursor;
+        editorCanvas.style.cursor = 'crosshair';
+        const wrapper = editorCanvas.parentElement;
+        if (wrapper) wrapper.style.cursor = 'crosshair';
+
+        function cleanup() {
+            _canvasPickActive = false;
+            editorCanvas.style.cursor = prevCursor;
+            if (wrapper) wrapper.style.cursor = '';
+            editorCanvas.removeEventListener('pointerdown', onPick, true);
+            document.removeEventListener('keydown', onCancel, true);
+        }
+
+        function onPick(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            cleanup();
+            const rect = editorCanvas.getBoundingClientRect();
+            const x = Math.floor((e.clientX - rect.left) / rect.width * editorCanvas.width);
+            const y = Math.floor((e.clientY - rect.top) / rect.height * editorCanvas.height);
+            if (x < 0 || x >= editorCanvas.width || y < 0 || y >= editorCanvas.height) return;
+
+            let pixel;
+            try {
+                pixel = editorCanvas.getContext('2d').getImageData(x, y, 1, 1).data;
+            } catch (_) { return; }
+
+            const hex = '#' + ((1 << 24) | (pixel[0] << 16) | (pixel[1] << 8) | pixel[2]).toString(16).slice(1);
+            const normalized = normalizeImageHex(hex);
+            if (!normalized) return;
+
+            colorInput.value = normalized;
+            paintAlpha = 1;
+            syncPaintAlphaUI();
+            updateColorPreview();
+            applyColorFromUI();
+            pushRecentImageColor(normalized);
+            requestAnimationFrame(() => {
+                openColorPopup();
+                syncRgbReadout();
+            });
+        }
+
+        function onCancel(e) {
+            if (e.key !== 'Escape') return;
+            cleanup();
+        }
+
+        editorCanvas.addEventListener('pointerdown', onPick, true);
+        document.addEventListener('keydown', onCancel, true);
+    }
+
     function ensureColorPopup() {
         if (colorPopupRoot) return;
         colorPopupRoot = document.createElement('div');
@@ -6357,10 +6550,7 @@ function createImagesInterface(container) {
         const eyeDropperAvailable =
             typeof window.EyeDropper === 'function' && window.isSecureContext;
         if (!eyeDropperAvailable) {
-            sampleBtn.disabled = true;
-            sampleBtn.title = !window.isSecureContext
-                ? 'Screen sampling needs HTTPS or localhost (secure context)'
-                : 'Screen sampling is not supported in this browser';
+            sampleBtn.title = 'Pick a color from the canvas';
         }
         const rgbReadoutPalette = document.createElement('span');
         rgbReadoutPalette.className = 'image-color-popup-rgb image-color-popup-rgb--palette';
@@ -6368,32 +6558,36 @@ function createImagesInterface(container) {
         sampleBtn.addEventListener('click', (ev) => {
             ev.preventDefault();
             ev.stopPropagation();
-            if (typeof window.EyeDropper !== 'function' || !window.isSecureContext) return;
-            let openPromise;
-            try {
-                openPromise = new EyeDropper().open();
-            } catch (_) {
+            if (typeof window.EyeDropper === 'function' && window.isSecureContext) {
+                let openPromise;
+                try {
+                    openPromise = new EyeDropper().open();
+                } catch (_) {
+                    return;
+                }
+                closeColorPopup();
+                openPromise
+                    .then((result) => {
+                        const hex = normalizeImageHex(result.sRGBHex);
+                        if (!hex) return;
+                        colorInput.value = hex;
+                        paintAlpha = 1;
+                        syncPaintAlphaUI();
+                        updateColorPreview();
+                        applyColorFromUI();
+                        pushRecentImageColor(hex);
+                        requestAnimationFrame(() => {
+                            openColorPopup();
+                            syncRgbReadout();
+                        });
+                    })
+                    .catch((err) => {
+                        if (err && err.name === 'AbortError') return;
+                    });
                 return;
             }
             closeColorPopup();
-            openPromise
-                .then((result) => {
-                    const hex = normalizeImageHex(result.sRGBHex);
-                    if (!hex) return;
-                    colorInput.value = hex;
-                    paintAlpha = 1;
-                    syncPaintAlphaUI();
-                    updateColorPreview();
-                    applyColorFromUI();
-                    pushRecentImageColor(hex);
-                    requestAnimationFrame(() => {
-                        openColorPopup();
-                        syncRgbReadout();
-                    });
-                })
-                .catch((err) => {
-                    if (err && err.name === 'AbortError') return;
-                });
+            startCanvasColorPick();
         });
         sampleRow.appendChild(sampleBtn);
         sampleRow.appendChild(rgbReadoutPalette);
@@ -8485,13 +8679,11 @@ function loadImagesFromDirectory(container) {
                     return;
                 }
             }
-            if (!selectedImage) {
-                const firstItem = container.children[0];
-                if (firstItem) {
-                    currentImageFilename = images[0].name;
-                    currentImageInfo = images[0];
-                    selectImage(images[0].src, firstItem);
-                }
+            const firstItem = container.children[0];
+            if (firstItem) {
+                currentImageFilename = images[0].name;
+                currentImageInfo = images[0];
+                selectImage(images[0].src, firstItem);
             }
         } else {
             selectedImage = null;
@@ -9794,6 +9986,9 @@ async function loadProjectFromFile(file) {
 					} else if (objects[0]) {
 						selected_object = objects[0].id;
 					}
+					// Clear stale image/sound selection so auto-select picks the loaded project's assets
+					selectedImage = null;
+					lastSelectedImage = '';
 					// Refresh UI
 					try { renderObjectGrid(); } catch {}
 					try { refreshObjectGridIcons(); } catch {}

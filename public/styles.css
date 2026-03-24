@@ -685,6 +685,34 @@ button {
 .node-block.node-block-narrow::before { left: 8px; }
 .node-block.node-block-narrow input[type="number"] { width: 16px; }
 
+.node-color-pick-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: 0 0 0 3px;
+  padding: 0;
+  vertical-align: middle;
+  background: rgba(0, 255, 204, 0.12);
+  border: 1px solid rgba(0, 255, 204, 0.3);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+}
+.node-color-pick-btn:hover {
+  background: rgba(0, 255, 204, 0.22);
+  border-color: rgba(0, 255, 204, 0.45);
+  color: #fff;
+}
+.node-color-pick-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+}
+
 /* Incoming connector anchor */
 .node-block::before {
   content: '';
