@@ -121,14 +121,22 @@ console.warn = function(){};
 
 // Variables
 let selected_object = 0;
-let draggedBlock = null;
 let touchOffsetX = 0;
 let touchOffsetY = 0;
 let dragStartX = 0;
 let dragStartY = 0;
-let blockStartX = 0;
-let blockStartY = 0;
-let isDragging = false;
+/** Multi-block drag: null or array of { el, baseX, baseY } */
+let dragBlockGroup = null;
+/** Before threshold crossed: { entries, clientX, clientY } */
+let pendingDragGroup = null;
+const CODE_DRAG_THRESHOLD_PX = 4;
+/** Selected code block ids (numeric) for the active object’s graph */
+let selectedCodeBlockIds = new Set();
+let codeSelectionOwnerId = null;
+/** Last copied code payload for paste when clipboard is unavailable */
+let codeBlocksClipboard = null;
+/** Marquee rectangle selection state */
+let marqueeSelectState = null;
 
 // Tab system variables
 let activeTab = 'code'; // Default to code tab
@@ -140,6 +148,15 @@ let runtimePositions = {}; // world coords centered at (0,0): { [objectId]: { x,
 let runtimeExecState = {}; // per object execution state
 let runtimeVariables = {}; // per instance variables: { [instanceId]: { [name]: any } }
 let runtimeGlobalVariables = {}; // shared public variables across all instances: { [name]: any }
+/** Shallow copy of globals after controller(s) run; non-controller instances read this for synced frame */
+let frameGlobalReadSnapshot = null;
+
+function syncFrameGlobalReadSnapshotAfterPublicWrite(varName) {
+    if (frameGlobalReadSnapshot == null) return;
+    const v = runtimeGlobalVariables[varName];
+    if (typeof v === 'number') frameGlobalReadSnapshot[varName] = v;
+    else if (Array.isArray(v)) frameGlobalReadSnapshot[varName] = v;
+}
 let lastCreatedVariable = null; // { name: string, isPrivate: boolean }
 let lastCreatedVariableByObject = {}; // { [objectId: number]: { name: string, isPrivate: true } }
 let lastCreatedArrayVariable = null; // { name: string, isPrivate: boolean }
@@ -151,11 +168,11 @@ let lastFrameTime = 0;
 // Cooperative scheduler controls to prevent any single instance from stalling the frame
 const MAX_STEPS_PER_OBJECT = 16;        // quantum per instance per frame
 const MAX_TOTAL_STEPS_PER_FRAME = 5000; // hard cap across all instances per frame
-const TIME_BUDGET_MS = 6;               // soft time budget for interpreter per frame
+const TIME_BUDGET_MS = 6;               // soft time budget per instance (inner loop); do not cap the whole frame here or other instances starve
 const LOOP_YIELD_MS = 1000 / 60;        // yield when repeat/forever has no runnable body (avoids freezing the tab)
 // Outer repeat continuation must not use `steps` — action blocks never increment `steps` (only non-actions do).
 const MAX_REPEAT_OUTER_PASSES = Math.max(MAX_TOTAL_STEPS_PER_FRAME, 50000);
-let rrInstanceStartIndex = 0;           // round-robin start index for fairness
+let rrInstanceStartIndex = 0;           // round-robin start among non-controller instances
 // Mouse and keyboard state for input blocks
 // Optional filter: when set to an array of instanceIds, interpreter will only step those instances
 let __stepOnlyInstanceIds = null;
@@ -167,29 +184,33 @@ const runtimeKeys = {};
 let runtimeInstances = []; // { instanceId, templateId }
 let nextInstanceId = 1;
 let instancesPendingRemoval = new Set();
-let instancesPendingCreation = [];
 // Pool freed instance ids per template to reduce GC/alloc churn when cloning/deleting many instances
 let freeInstancesByTemplate = {};
-// Safety cap for how many instances are fully created per frame; excess are queued to subsequent frames
-const MAX_CREATES_PER_FRAME = 200;
+
+/** When set (from loaded project), game-window buffer size; display size still follows the stage panel (CSS). */
+let projectStageWidth = null;
+let projectStageHeight = null;
+
+function updateRuntimeMouseFromClient(canvas, clientX, clientY) {
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const localX = clientX - rect.left;
+    const localY = clientY - rect.top;
+    const sx = canvas.width / Math.max(1e-6, rect.width);
+    const sy = canvas.height / Math.max(1e-6, rect.height);
+    runtimeMouse.x = Math.round((localX - rect.width / 2) * sx);
+    runtimeMouse.y = Math.round((rect.height / 2 - localY) * sy);
+}
 
 // Track mouse relative to game window center
 const gameCanvas = document.getElementById('game-window');
 if (gameCanvas) {
     gameCanvas.addEventListener('mousemove', (e) => {
-        const rect = gameCanvas.getBoundingClientRect();
-        const localX = e.clientX - rect.left;
-        const localY = e.clientY - rect.top;
-        runtimeMouse.x = Math.round(localX - rect.width / 2);
-        runtimeMouse.y = Math.round(rect.height / 2 - localY);
+        updateRuntimeMouseFromClient(gameCanvas, e.clientX, e.clientY);
     });
     // Also use Pointer Events to ensure pointer updates are received during keyboard input
     gameCanvas.addEventListener('pointermove', (e) => {
-        const rect = gameCanvas.getBoundingClientRect();
-        const localX = e.clientX - rect.left;
-        const localY = e.clientY - rect.top;
-        runtimeMouse.x = Math.round(localX - rect.width / 2);
-        runtimeMouse.y = Math.round(rect.height / 2 - localY);
+        updateRuntimeMouseFromClient(gameCanvas, e.clientX, e.clientY);
     }, { passive: true });
     gameCanvas.addEventListener('pointerdown', () => { runtimeMousePressed = true; });
     gameCanvas.addEventListener('pointerup', () => { runtimeMousePressed = false; });
@@ -228,26 +249,393 @@ function worldToCanvas(x, y, canvas) {
     const cy = canvas.height / 2 - y;
     return { x: cx, y: cy };
 }
+
+let touchingScratchCanvas = null;
+let __touchFrameSerial = 0;
+const __colorScratchCache = { serial: -1, excludeId: null, w: 0, h: 0, fingerprint: 0 };
+
+/** Hash of other instances' poses + paths; used to reuse the off-screen color-touch layer when unchanged. */
+function touchingWorldFingerprint(inst, canvas) {
+    let h = (canvas.width << 16) ^ canvas.height;
+    for (let i = 0; i < runtimeInstances.length; i++) {
+        const o = runtimeInstances[i];
+        if (o.instanceId === inst.instanceId) continue;
+        const p = runtimePositions[o.instanceId] || {};
+        const x = typeof p.x === 'number' ? p.x : 0;
+        const y = typeof p.y === 'number' ? p.y : 0;
+        const rot = typeof p.rot === 'number' ? p.rot : 0;
+        const ly = typeof p.layer === 'number' ? p.layer : 0;
+        const sc = typeof p.scale === 'number' ? p.scale : 1;
+        const al = typeof p.alpha === 'number' ? p.alpha : 1;
+        const sp = p.spritePath != null ? String(p.spritePath) : '';
+        h = Math.imul(h, 0x9e3779b9) + o.instanceId;
+        h = Math.imul(h, 0x9e3779b9) + (x * 1000 | 0);
+        h = Math.imul(h, 0x9e3779b9) + (y * 1000 | 0);
+        h = Math.imul(h, 0x9e3779b9) + (rot * 1000 | 0);
+        h = Math.imul(h, 0x9e3779b9) + ly;
+        h = Math.imul(h, 0x9e3779b9) + (sc * 1000 | 0);
+        h = Math.imul(h, 0x9e3779b9) + (al * 1000 | 0);
+        for (let j = 0; j < sp.length; j++) h = Math.imul(h, 31) + sp.charCodeAt(j);
+    }
+    return h | 0;
+}
+const spriteImageDataForTouching = {};
+
+function getSpriteImageDataForAlpha(path) {
+    const cached = spriteImageDataForTouching[path];
+    if (cached) return cached;
+    const img = imageCache[path];
+    if (!img || !img.complete || img._broken || !(img.naturalWidth > 0)) return null;
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const ctx = c.getContext('2d');
+    try { ctx.drawImage(img, 0, 0); } catch (_) { return null; }
+    let data;
+    try { data = ctx.getImageData(0, 0, c.width, c.height).data; } catch (_) { return null; }
+    const rec = { data, width: c.width, height: c.height };
+    spriteImageDataForTouching[path] = rec;
+    return rec;
+}
+
+function spriteAlphaAtPath(path, x, y) {
+    const g = getSpriteImageDataForAlpha(path);
+    if (!g) return 0;
+    const ix = Math.floor(x);
+    const iy = Math.floor(y);
+    if (ix < 0 || iy < 0 || ix >= g.width || iy >= g.height) return 0;
+    return g.data[(iy * g.width + ix) * 4 + 3];
+}
+
+function getInstanceBoundsForTouching(inst, canvas) {
+    const tmpl = objectById[inst.templateId];
+    if (!tmpl) return null;
+    const perInst = runtimePositions[inst.instanceId] || {};
+    const path = perInst.spritePath || (tmpl.media && tmpl.media[0] && tmpl.media[0].path ? tmpl.media[0].path : null);
+    if (!path) return null;
+    const img = imageCache[path];
+    if (!img || !img.complete || img._broken || !(img.naturalWidth > 0)) return null;
+    const scale = (typeof perInst.scale === 'number') ? Math.max(0, perInst.scale) : 1;
+    const dw = img.width * scale;
+    const dh = img.height * scale;
+    const p = worldToCanvas(perInst.x || 0, perInst.y || 0, canvas);
+    const left = p.x - dw / 2;
+    const top = p.y - dh / 2;
+    return { left, top, right: left + dw, bottom: top + dh, dw, dh, img, path };
+}
+
+/** Axis-aligned canvas bounds that fully contain the sprite quad (supports rotation). */
+function getRotatedSpriteCanvasAABB(bounds, rotDeg) {
+    if (!bounds) return null;
+    const cx = bounds.left + bounds.dw / 2;
+    const cy = bounds.top + bounds.dh / 2;
+    const hw = bounds.dw / 2;
+    const hh = bounds.dh / 2;
+    if (rotDeg == null || rotDeg === 0 || rotDeg === 360 || rotDeg === -360) {
+        return { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom };
+    }
+    const θ = rotDeg * Math.PI / 180;
+    const cos = Math.cos(θ);
+    const sin = Math.sin(θ);
+    const corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < corners.length; i++) {
+        const lx = corners[i][0];
+        const ly = corners[i][1];
+        const px = cx + lx * cos - ly * sin;
+        const py = cy + lx * sin + ly * cos;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+    }
+    return { left: minX, top: minY, right: maxX, bottom: maxY };
+}
+
+/**
+ * Alpha 0–255 at canvas pixel (px,py) from this instance's costume (rotation + scale),
+ * matching renderGameWindowSprite draw order math.
+ */
+function canvasAlphaFromInstanceSprite(inst, px, py, canvas) {
+    const b = getInstanceBoundsForTouching(inst, canvas);
+    if (!b) return 0;
+    const perInst = runtimePositions[inst.instanceId] || {};
+    const rotDeg = typeof perInst.rot === 'number' ? perInst.rot : 0;
+    const θ = rotDeg * Math.PI / 180;
+    const cos = Math.cos(θ);
+    const sin = Math.sin(θ);
+    const cx = b.left + b.dw / 2;
+    const cy = b.top + b.dh / 2;
+    const dx = px - cx;
+    const dy = py - cy;
+    const lx = cos * dx + sin * dy;
+    const ly = -sin * dx + cos * dy;
+    const hw = b.dw / 2;
+    const hh = b.dh / 2;
+    if (lx < -hw || lx > hw || ly < -hh || ly > hh) return 0;
+    const u01 = (lx + hw) / b.dw;
+    const v01 = (ly + hh) / b.dh;
+    if (u01 < 0 || u01 > 1 || v01 < 0 || v01 > 1) return 0;
+    const ix = u01 * b.img.naturalWidth;
+    const iy = v01 * b.img.naturalHeight;
+    const raw = spriteAlphaAtPath(b.path, ix, iy);
+    const g = (typeof perInst.alpha === 'number') ? Math.max(0, Math.min(1, perInst.alpha)) : 1;
+    return Math.round(raw * g);
+}
+
+function evalTouchingColor(inst, node, canvas) {
+    const tr = Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0)));
+    const tg = Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0)));
+    const tb = Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0)));
+    const selfBounds = getInstanceBoundsForTouching(inst, canvas);
+    if (!selfBounds) return 0;
+    const selfRot = (runtimePositions[inst.instanceId] && typeof runtimePositions[inst.instanceId].rot === 'number')
+        ? runtimePositions[inst.instanceId].rot : 0;
+    const selfAabb = getRotatedSpriteCanvasAABB(selfBounds, selfRot);
+    if (!selfAabb) return 0;
+    const scratch = touchingScratchCanvas || (touchingScratchCanvas = document.createElement('canvas'));
+    if (scratch.width !== canvas.width || scratch.height !== canvas.height) {
+        scratch.width = canvas.width;
+        scratch.height = canvas.height;
+    }
+    const sctx = scratch.getContext('2d');
+    const fp = touchingWorldFingerprint(inst, canvas);
+    if (!(__colorScratchCache.serial === __touchFrameSerial
+        && __colorScratchCache.excludeId === inst.instanceId
+        && __colorScratchCache.w === canvas.width
+        && __colorScratchCache.h === canvas.height
+        && __colorScratchCache.fingerprint === fp)) {
+        sctx.fillStyle = '#777';
+        sctx.fillRect(0, 0, canvas.width, canvas.height);
+        sctx.imageSmoothingEnabled = false;
+        const entries = [];
+        for (let i = 0; i < runtimeInstances.length; i++) {
+            const inst2 = runtimeInstances[i];
+            if (inst2.instanceId === inst.instanceId) continue;
+            const tmpl2 = objectById[inst2.templateId];
+            const perInst2 = runtimePositions[inst2.instanceId] || {};
+            const pth = perInst2.spritePath || (tmpl2 && tmpl2.media && tmpl2.media[0] && tmpl2.media[0].path ? tmpl2.media[0].path : null);
+            if (pth) entries.push({ inst: inst2, path: pth });
+        }
+        entries.sort((a, b) => {
+            const la = (runtimePositions[a.inst.instanceId] && typeof runtimePositions[a.inst.instanceId].layer === 'number') ? runtimePositions[a.inst.instanceId].layer : 0;
+            const lb = (runtimePositions[b.inst.instanceId] && typeof runtimePositions[b.inst.instanceId].layer === 'number') ? runtimePositions[b.inst.instanceId].layer : 0;
+            return la - lb;
+        });
+        for (const entry of entries) {
+            let img = imageCache[entry.path];
+            if (!img || !img.complete || img._broken || !(img.naturalWidth > 0)) continue;
+            const perInst = runtimePositions[entry.inst.instanceId] || {};
+            const scale = (typeof perInst.scale === 'number') ? Math.max(0, perInst.scale) : 1;
+            const dw = img.width * scale;
+            const dh = img.height * scale;
+            const p = worldToCanvas(perInst.x || 0, perInst.y || 0, canvas);
+            const drawX = Math.round(p.x - dw / 2);
+            const drawY = Math.round(p.y - dh / 2);
+            if (drawX + dw < 0 || drawY + dh < 0 || drawX > canvas.width || drawY > canvas.height) continue;
+            const alpha = (typeof perInst.alpha === 'number') ? Math.max(0, Math.min(1, perInst.alpha)) : 1;
+            if (typeof perInst.rot === 'number') {
+                const angleRad = (perInst.rot || 0) * Math.PI / 180;
+                sctx.save();
+                sctx.translate(drawX + dw / 2, drawY + dh / 2);
+                sctx.rotate(angleRad);
+                const prev = sctx.globalAlpha;
+                sctx.globalAlpha = alpha;
+                sctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+                sctx.globalAlpha = prev;
+                sctx.restore();
+            } else {
+                const prev = sctx.globalAlpha;
+                sctx.globalAlpha = alpha;
+                sctx.drawImage(img, drawX, drawY, dw, dh);
+                sctx.globalAlpha = prev;
+            }
+        }
+        __colorScratchCache.serial = __touchFrameSerial;
+        __colorScratchCache.excludeId = inst.instanceId;
+        __colorScratchCache.w = canvas.width;
+        __colorScratchCache.h = canvas.height;
+        __colorScratchCache.fingerprint = fp;
+    }
+    const left = Math.max(Math.floor(selfAabb.left), 0);
+    const top = Math.max(Math.floor(selfAabb.top), 0);
+    const right = Math.min(Math.ceil(selfAabb.right), canvas.width);
+    const bottom = Math.min(Math.ceil(selfAabb.bottom), canvas.height);
+    if (right <= left || bottom <= top) return 0;
+    const w = right - left;
+    const h = bottom - top;
+    const area = w * h;
+    const stride = area > 80000 ? 3 : (area > 20000 ? 2 : 1);
+    const ALPHA_THRESHOLD = 32;
+    for (let py = top; py < bottom; py += stride) {
+        const pyFloor = py | 0;
+        if (pyFloor < 0 || pyFloor >= canvas.height) continue;
+        const rowLeft = Math.max(0, left);
+        const rowRight = Math.min(canvas.width, right);
+        const rowW = rowRight - rowLeft;
+        if (rowW <= 0) continue;
+        let rowData;
+        try { rowData = sctx.getImageData(rowLeft, pyFloor, rowW, 1).data; } catch (_) { continue; }
+        for (let px = left; px < right; px += stride) {
+            if (px < 0 || px >= canvas.width) continue;
+            if (canvasAlphaFromInstanceSprite(inst, px + 0.5, py + 0.5, canvas) < ALPHA_THRESHOLD) continue;
+            const ix = (px - rowLeft) * 4;
+            if (rowData[ix] === tr && rowData[ix + 1] === tg && rowData[ix + 2] === tb) return 1;
+        }
+    }
+    return 0;
+}
+
+function evalTouchingObject(inst, node, canvas) {
+    const tid = parseInt(String(node.val_a || '0'), 10);
+    if (!Number.isFinite(tid)) return 0;
+    const selfB = getInstanceBoundsForTouching(inst, canvas);
+    if (!selfB) return 0;
+    const selfRot = (runtimePositions[inst.instanceId] && typeof runtimePositions[inst.instanceId].rot === 'number')
+        ? runtimePositions[inst.instanceId].rot : 0;
+    const selfAabb = getRotatedSpriteCanvasAABB(selfB, selfRot);
+    if (!selfAabb) return 0;
+    const ALPHA_THRESHOLD = 16;
+    for (let i = 0; i < runtimeInstances.length; i++) {
+        const other = runtimeInstances[i];
+        if (other.instanceId === inst.instanceId) continue;
+        if (other.templateId !== tid) continue;
+        const ob = getInstanceBoundsForTouching(other, canvas);
+        if (!ob) continue;
+        const otherRot = (runtimePositions[other.instanceId] && typeof runtimePositions[other.instanceId].rot === 'number')
+            ? runtimePositions[other.instanceId].rot : 0;
+        const otherAabb = getRotatedSpriteCanvasAABB(ob, otherRot);
+        if (!otherAabb) continue;
+        const left = Math.max(selfAabb.left, otherAabb.left, 0);
+        const top = Math.max(selfAabb.top, otherAabb.top, 0);
+        const right = Math.min(selfAabb.right, otherAabb.right, canvas.width);
+        const bottom = Math.min(selfAabb.bottom, otherAabb.bottom, canvas.height);
+        if (right <= left || bottom <= top) continue;
+        const w = right - left;
+        const h = bottom - top;
+        const area = w * h;
+        const stride = area > 80000 ? 3 : (area > 20000 ? 2 : 1);
+        for (let py = Math.floor(top); py < Math.ceil(bottom); py += stride) {
+            for (let px = Math.floor(left); px < Math.ceil(right); px += stride) {
+                const a = canvasAlphaFromInstanceSprite(inst, px + 0.5, py + 0.5, canvas);
+                if (a < ALPHA_THRESHOLD) continue;
+                const bAlpha = canvasAlphaFromInstanceSprite(other, px + 0.5, py + 0.5, canvas);
+                if (bAlpha >= ALPHA_THRESHOLD) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 function resetRuntimePositions() {
     runtimePositions = {};
     runtimeInstances.forEach(inst => {
         runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
     });
 }
+/** Parses block literals and inputs: numbers, optional fraction syntax like 1/60. */
+function parseNumericInput(raw) {
+    if (raw == null || raw === '') return 0;
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : 0;
+    if (typeof raw === 'boolean') return raw ? 1 : 0;
+    if (typeof raw === 'string') {
+        const s = raw.trim();
+        if (s === '') return 0;
+        const m = s.match(/^([+-]?(?:\d*\.?\d+|\d+\.?\d*))\s*\/\s*([+-]?(?:\d*\.?\d+|\d+\.?\d*))$/);
+        if (m) {
+            const a = parseFloat(m[1]);
+            const b = parseFloat(m[2]);
+            if (b !== 0 && Number.isFinite(a) && Number.isFinite(b)) return a / b;
+        }
+        const n = Number(s);
+        if (Number.isFinite(n)) return n;
+        const f = parseFloat(s);
+        return Number.isFinite(f) ? f : 0;
+    }
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+}
+
+function registerRuntimeInstanceFromTemplate(instanceId, templateId) {
+    const template = objectById[templateId];
+    if (!template) return false;
+    runtimeInstances.push({ instanceId, templateId });
+    runtimePositions[instanceId] = { x: 0, y: 0, layer: 0 };
+    runtimeVariables[instanceId] = {};
+    try {
+        const arrs = Array.isArray(template.arrayVariables) ? template.arrayVariables : [];
+        arrs.forEach(name => { runtimeVariables[instanceId][name] = []; });
+    } catch (_) {}
+    const codeT = Array.isArray(template.code) ? template.code : [];
+    const startT = codeT.find(b => b.type === 'start');
+    const pcT = startT && typeof startT.next_block_a === 'number' ? startT.next_block_a : null;
+    runtimeExecState[instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+    return true;
+}
+
+/** Run the new instance's When Created chain before the Instantiate caller's next block runs. */
+function runInstanceStartChainSync(instanceId) {
+    const savedFilter = __stepOnlyInstanceIds;
+    const ITER_GUARD = 100000;
+    let n = 0;
+    try {
+        while (isPlaying && n++ < ITER_GUARD) {
+            const exec = runtimeExecState[instanceId];
+            if (!exec) break;
+            if (exec.waitMs > 0) break;
+            if (exec.pc == null && exec.repeatStack.length === 0) break;
+            __stepOnlyInstanceIds = [instanceId];
+            stepInterpreter(0);
+        }
+    } finally {
+        __stepOnlyInstanceIds = savedFilter;
+    }
+}
+
+function isAppControllerTemplate(o) {
+    return !!(o && (o.type === 'controller' || o.name === 'AppController'));
+}
+
 function stepInterpreter(dtMs) {
     if (!isPlaying) return;
+    frameGlobalReadSnapshot = null;
     // Fair scheduling with round-robin and budgets
-    const startTime = performance.now();
     let totalStepsThisFrame = 0;
     const instanceCount = runtimeInstances.length;
-    for (let offset = 0; offset < instanceCount; offset++) {
-        const inst = runtimeInstances[(rrInstanceStartIndex + offset) % instanceCount];
+    if (instanceCount === 0) return;
+    // AppController runs first every frame so globals (e.g. scroll) update before other instances read them
+    const controllerInstances = [];
+    const otherInstances = [];
+    for (let i = 0; i < instanceCount; i++) {
+        const inst = runtimeInstances[i];
+        const o = objectById[inst.templateId];
+        if (isAppControllerTemplate(o)) controllerInstances.push(inst);
+        else otherInstances.push(inst);
+    }
+    const oLen = otherInstances.length;
+    const orderedInstances = controllerInstances.concat(
+        oLen === 0 ? [] : otherInstances.map((_, j) => otherInstances[(rrInstanceStartIndex + j) % oLen])
+    );
+    for (let offset = 0; offset < orderedInstances.length; offset++) {
+        const inst = orderedInstances[offset];
         if (__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0) {
             if (!__stepOnlyInstanceIds.includes(inst.instanceId)) continue;
         }
         const o = objectById[inst.templateId];
         const exec = runtimeExecState[inst.instanceId];
         if (!o || !exec) continue;
+        if (!isAppControllerTemplate(o) && frameGlobalReadSnapshot === null) {
+            frameGlobalReadSnapshot = {};
+            for (const k of Object.keys(runtimeGlobalVariables)) {
+                const v = runtimeGlobalVariables[k];
+                if (typeof v === 'number') frameGlobalReadSnapshot[k] = v;
+                else if (Array.isArray(v)) frameGlobalReadSnapshot[k] = v;
+            }
+        }
+        const useGlobalReadSnapshot = frameGlobalReadSnapshot !== null && !isAppControllerTemplate(o);
         const code = o.code || [];
         const codeMap = codeMapByTemplateId[o.id] || null;
 
@@ -267,6 +655,7 @@ function stepInterpreter(dtMs) {
 
         let steps = 0;
         let outerPasses = 0;
+        const perInstanceBudgetStart = performance.now();
         outerInstanceLoop: while (isPlaying && outerPasses < MAX_REPEAT_OUTER_PASSES) {
             outerPasses++;
         while (isPlaying && exec.pc != null && steps < MAX_STEPS_PER_OBJECT) {
@@ -277,6 +666,9 @@ function stepInterpreter(dtMs) {
                 if (typeof v === 'string') {
                     const s = v.trim();
                     if (s === '') return '';
+                    if (/^\s*[+-]?(?:\d*\.?\d+|\d+\.?\d*)\s*\/\s*[+-]?(?:\d*\.?\d+|\d+\.?\d*)\s*$/.test(s)) {
+                        return parseNumericInput(s);
+                    }
                     const n = Number(s);
                     return Number.isFinite(n) ? n : v;
                 }
@@ -325,8 +717,8 @@ function stepInterpreter(dtMs) {
                 }
                 if (node.content === 'distance_to') {
                     const pos = runtimePositions[inst.instanceId] || { x: 0, y: 0 };
-                    const tx = Number((node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0));
-                    const ty = Number((node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0));
+                    const tx = parseNumericInput((node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0));
+                    const ty = parseNumericInput((node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0));
                     const dx = (typeof pos.x === 'number' ? pos.x : 0) - tx;
                     const dy = (typeof pos.y === 'number' ? pos.y : 0) - ty;
                     return Math.hypot(dx, dy);
@@ -334,8 +726,8 @@ function stepInterpreter(dtMs) {
                 if (node.content === 'pixel_is_rgb') {
                     const canvas = document.getElementById('game-window');
                     if (!canvas) return 0;
-                    const xw = Number((node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0));
-                    const yw = Number((node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0));
+                    const xw = parseNumericInput((node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0));
+                    const yw = parseNumericInput((node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0));
                     const p = worldToCanvas(xw, yw, canvas);
                     const px = Math.round(p.x);
                     const py = Math.round(p.y);
@@ -351,21 +743,37 @@ function stepInterpreter(dtMs) {
                     const tb = Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0)));
                     return (r === tr && g === tg && b === tb) ? 1 : 0;
                 }
+                if (node.content === 'touching') {
+                    const canvas = document.getElementById('game-window');
+                    if (!canvas) return 0;
+                    const mode = node.touching_mode || 'object';
+                    if (mode === 'object') return evalTouchingObject(inst, node, canvas);
+                    if (mode === 'color') return evalTouchingColor(inst, node, canvas);
+                    return 0;
+                }
                 if (node.content === 'random_int') {
                     const minVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
                     const maxVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
-                    let a = Number(minVal);
-                    let b = Number(maxVal);
+                    let a = parseNumericInput(minVal);
+                    let b = parseNumericInput(maxVal);
                     if (Number.isNaN(a)) a = 0;
                     if (Number.isNaN(b)) b = 0;
                     if (a > b) { const t = a; a = b; b = t; }
                     return Math.floor(Math.random() * (b - a + 1)) + a; // inclusive
                 }
                 if (node.content === 'operation') {
-                    const xVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.op_x ?? 0) : (node.op_x ?? 0);
-                    const yVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.op_y ?? 0) : (node.op_y ?? 0);
-                    switch (node.val_a) {
-                        case '+': return xVal + yVal;
+                    const rawA = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.op_x ?? 0) : (node.op_x ?? 0);
+                    const rawB = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.op_y ?? 0) : (node.op_y ?? 0);
+                    const op = node.val_a || '+';
+                    if (op === '+') {
+                        if (typeof rawA === 'string' || typeof rawB === 'string') {
+                            return String(rawA ?? '') + String(rawB ?? '');
+                        }
+                        return parseNumericInput(rawA) + parseNumericInput(rawB);
+                    }
+                    const xVal = parseNumericInput(rawA);
+                    const yVal = parseNumericInput(rawB);
+                    switch (op) {
                         case '-': return xVal - yVal;
                         case '*': return xVal * yVal;
                         case '/': return yVal === 0 ? 0 : xVal / yVal;
@@ -375,7 +783,7 @@ function stepInterpreter(dtMs) {
                 }
                 if (node.content === 'not') {
                     const v = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
-                    const num = Number(v) || 0;
+                    const num = parseNumericInput(v);
                     return num ? 0 : 1;
                 }
                 if (node.content === 'equals') {
@@ -388,8 +796,8 @@ function stepInterpreter(dtMs) {
                 if (node.content === 'less_than') {
                     const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
                     const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
-                    let A = Number(aVal);
-                    let B = Number(bVal);
+                    let A = parseNumericInput(aVal);
+                    let B = parseNumericInput(bVal);
                     if (Number.isNaN(A)) A = 0;
                     if (Number.isNaN(B)) B = 0;
                     return A < B ? 1 : 0;
@@ -397,15 +805,15 @@ function stepInterpreter(dtMs) {
                 if (node.content === 'and') {
                     const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
                     const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
-                    const A = Number(aVal) || 0;
-                    const B = Number(bVal) || 0;
+                    const A = parseNumericInput(aVal);
+                    const B = parseNumericInput(bVal);
                     return (A !== 0 && B !== 0) ? 1 : 0;
                 }
                 if (node.content === 'or') {
                     const aVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
                     const bVal = (node.input_b != null) ? (resolveInput(node, 'input_b') ?? node.val_b ?? 0) : (node.val_b ?? 0);
-                    const A = Number(aVal) || 0;
-                    const B = Number(bVal) || 0;
+                    const A = parseNumericInput(aVal);
+                    const B = parseNumericInput(bVal);
                     return (A !== 0 || B !== 0) ? 1 : 0;
                 }
                 if (node.content === 'variable') {
@@ -415,14 +823,15 @@ function stepInterpreter(dtMs) {
                         const v = vars[varName];
                         return typeof v === 'number' ? v : 0;
                     } else {
-                        const v = runtimeGlobalVariables[varName];
+                        const store = useGlobalReadSnapshot ? frameGlobalReadSnapshot : runtimeGlobalVariables;
+                        const v = store[varName];
                         return typeof v === 'number' ? v : 0;
                     }
                 }
                 if (node.content === 'array_get') {
                     const arr = getArrayRef(node.var_name || '', !!node.var_instance_only);
                     const idxVal = (node.input_a != null) ? (resolveInput(node, 'input_a') ?? node.val_a ?? 0) : (node.val_a ?? 0);
-                    const idx = Math.floor(Number(idxVal));
+                    const idx = Math.floor(parseNumericInput(idxVal));
                     if (!Number.isFinite(idx) || idx < 0 || idx >= arr.length) return '';
                     return arr[idx];
                 }
@@ -435,8 +844,8 @@ function stepInterpreter(dtMs) {
 
             if (block.type === 'action') {
                 if (block.content === 'move_xy') {
-                    const x = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
-                    const y = Number(resolveInput(block, 'input_b') ?? block.val_b ?? 0);
+                    const x = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const y = parseNumericInput(resolveInput(block, 'input_b') ?? block.val_b ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     runtimePositions[inst.instanceId].x += x;
                     runtimePositions[inst.instanceId].y += y;
@@ -445,7 +854,7 @@ function stepInterpreter(dtMs) {
                 }
                 if (block.content === 'move_forward') {
                     // Move forward by distance in the direction the instance is facing (0° is up)
-                    const distance = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const distance = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     const pos = runtimePositions[inst.instanceId];
                     if (pos.rot === undefined) pos.rot = 0;
@@ -460,20 +869,20 @@ function stepInterpreter(dtMs) {
                     // Store rotation per object; create if absent
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     if (runtimePositions[inst.instanceId].rot === undefined) runtimePositions[inst.instanceId].rot = 0;
-                    runtimePositions[inst.instanceId].rot += Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    runtimePositions[inst.instanceId].rot += parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
                 if (block.content === 'set_rotation') {
                     // Set absolute rotation
-                    const absoluteDeg = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const absoluteDeg = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     runtimePositions[inst.instanceId].rot = absoluteDeg;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
                 if (block.content === 'set_size') {
-                    const s = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
+                    const s = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     if (runtimePositions[inst.instanceId].scale === undefined) runtimePositions[inst.instanceId].scale = 1;
                     runtimePositions[inst.instanceId].scale = Math.max(0, s);
@@ -481,7 +890,7 @@ function stepInterpreter(dtMs) {
                     continue;
                 }
                 if (block.content === 'set_opacity') {
-                    let a = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
+                    let a = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 1);
                     if (Number.isNaN(a)) a = 1;
                     a = Math.max(0, Math.min(1, a));
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
@@ -490,7 +899,7 @@ function stepInterpreter(dtMs) {
                     continue;
                 }
                 if (block.content === 'set_layer') {
-                    const layer = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const layer = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
                     runtimePositions[inst.instanceId].layer = layer;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
@@ -500,8 +909,8 @@ function stepInterpreter(dtMs) {
                     // Compute angle from current position to (x,y) and set rot
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0, layer: 0 };
                     const pos = runtimePositions[inst.instanceId];
-                    const targetX = Number((block.input_a != null ? (resolveInput(block, 'input_a') ?? block.val_a) : block.val_a) ?? 0);
-                    const targetY = Number((block.input_b != null ? (resolveInput(block, 'input_b') ?? block.val_b) : block.val_b) ?? 0);
+                    const targetX = parseNumericInput((block.input_a != null ? (resolveInput(block, 'input_a') ?? block.val_a) : block.val_a) ?? 0);
+                    const targetY = parseNumericInput((block.input_b != null ? (resolveInput(block, 'input_b') ?? block.val_b) : block.val_b) ?? 0);
                     const dx = (typeof pos.x === 'number' ? pos.x : 0) - targetX;
                     const dy = targetY - (typeof pos.y === 'number' ? pos.y : 0);
                     // In our world coord system, +x right, +y up; canvas y inverted elsewhere. Use atan2(dy, dx)
@@ -513,7 +922,7 @@ function stepInterpreter(dtMs) {
                     continue;
                 }
                 if (block.content === 'change_size') {
-                    const ds = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const ds = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     if (runtimePositions[inst.instanceId].scale === undefined) runtimePositions[inst.instanceId].scale = 1;
                     runtimePositions[inst.instanceId].scale = Math.max(0, (runtimePositions[inst.instanceId].scale || 1) + ds);
@@ -521,7 +930,7 @@ function stepInterpreter(dtMs) {
                     continue;
                 }
                 if (block.content === 'wait') {
-                    const seconds = Math.max(0, parseFloat(resolveInput(block, 'input_a') ?? block.val_a ?? 0));
+                    const seconds = Math.max(0, parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0));
                     // Start waiting on first encounter for THIS instance only
                     if (exec.waitMs <= 0 || exec.waitingBlockId !== block.id) {
                         exec.waitMs = seconds * 1000; // supports fractional seconds
@@ -531,7 +940,7 @@ function stepInterpreter(dtMs) {
                     break;
                 }
                 if (block.content === 'repeat') {
-                    const times = Math.max(0, Number(block.val_a || 0));
+                    const times = Math.max(0, Math.floor(parseNumericInput(block.val_a ?? 0)));
                     if (times <= 0) {
                         exec.pc = (typeof block.next_block_b === 'number') ? block.next_block_b : null;
                         continue;
@@ -547,21 +956,21 @@ function stepInterpreter(dtMs) {
                     continue;
                 }
                 if (block.content === 'if') {
-                    const condVal = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const condVal = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     const isTrue = condVal ? true : false;
                     exec.pc = isTrue ? ((typeof block.next_block_b === 'number') ? block.next_block_b : null)
                                      : ((typeof block.next_block_a === 'number') ? block.next_block_a : null);
                     continue;
                 }
                 if (block.content === 'set_x') {
-                    const x = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const x = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     runtimePositions[inst.instanceId].x = x;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
                 if (block.content === 'set_y') {
-                    const y = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const y = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
                     runtimePositions[inst.instanceId].y = y;
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
@@ -585,7 +994,25 @@ function stepInterpreter(dtMs) {
                         runtimePositions[inst.instanceId].spritePath = found.src;
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
-                    renderGameWindowSprite();
+                    continue;
+                }
+                if (block.content === 'play_sound') {
+                    const snds = objectSounds[String(o.id)] || [];
+                    let sfound = null;
+                    if (block.input_a != null) {
+                        const sel = resolveInput(block, 'input_a');
+                        if (typeof sel === 'string') {
+                            sfound = snds.find((s) => s.name === sel);
+                        } else {
+                            sfound = snds.find((s) => String(s.id) === String(sel));
+                        }
+                    } else {
+                        sfound = snds.find((s) => String(s.id) === String(block.val_a));
+                    }
+                    if (sfound && sfound.src) {
+                        playGameSoundFromSrc(sfound.src);
+                    }
+                    exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
                 if (block.content === 'instantiate') {
@@ -599,7 +1026,9 @@ function stepInterpreter(dtMs) {
                         } else {
                             instanceIdToUse = nextInstanceId++;
                         }
-                        instancesPendingCreation.push({ instanceId: instanceIdToUse, templateId: template.id });
+                        if (registerRuntimeInstanceFromTemplate(instanceIdToUse, template.id)) {
+                            runInstanceStartChainSync(instanceIdToUse);
+                        }
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
@@ -612,19 +1041,20 @@ function stepInterpreter(dtMs) {
                 }
                 if (block.content === 'set_variable') {
                     const varName = block.var_name || '';
-                    const value = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const value = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (block.var_instance_only) {
                         if (!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId] = {};
                         runtimeVariables[inst.instanceId][varName] = value;
                     } else {
                         runtimeGlobalVariables[varName] = value;
+                        syncFrameGlobalReadSnapshotAfterPublicWrite(varName);
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
                 }
                 if (block.content === 'change_variable') {
                     const varName = block.var_name || '';
-                    const delta = Number(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
+                    const delta = parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0);
                     if (block.var_instance_only) {
                         if (!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId] = {};
                         const curVal = runtimeVariables[inst.instanceId][varName];
@@ -634,6 +1064,7 @@ function stepInterpreter(dtMs) {
                         const curVal = runtimeGlobalVariables[varName];
                         const current = (typeof curVal === 'number') ? curVal : 0;
                         runtimeGlobalVariables[varName] = current + delta;
+                        syncFrameGlobalReadSnapshotAfterPublicWrite(varName);
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
@@ -652,7 +1083,7 @@ function stepInterpreter(dtMs) {
                     const raw = (block.input_a != null) ? (resolveInput(block, 'input_a') ?? block.val_a ?? '') : (block.val_a ?? '');
                     const value = coerceScalarLiteral(raw);
                     const idxVal = (block.input_b != null) ? (resolveInput(block, 'input_b') ?? block.val_b ?? 0) : (block.val_b ?? 0);
-                    let idx = Math.floor(Number(idxVal));
+                    let idx = Math.floor(parseNumericInput(idxVal));
                     if (!Number.isFinite(idx)) idx = 0;
                     const arr = getArrayRef(varName, !!block.var_instance_only);
                     idx = Math.max(0, Math.min(arr.length, idx));
@@ -663,7 +1094,7 @@ function stepInterpreter(dtMs) {
                 if (block.content === 'array_delete') {
                     const varName = block.var_name || '';
                     const idxVal = (block.input_a != null) ? (resolveInput(block, 'input_a') ?? block.val_a ?? 0) : (block.val_a ?? 0);
-                    const idx = Math.floor(Number(idxVal));
+                    const idx = Math.floor(parseNumericInput(idxVal));
                     const arr = getArrayRef(varName, !!block.var_instance_only);
                     if (Number.isFinite(idx) && idx >= 0 && idx < arr.length) {
                         arr.splice(idx, 1);
@@ -683,7 +1114,7 @@ function stepInterpreter(dtMs) {
             steps += 1;
             totalStepsThisFrame += 1;
             if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
-            if ((performance.now() - startTime) >= TIME_BUDGET_MS) break;
+            if ((performance.now() - perInstanceBudgetStart) >= TIME_BUDGET_MS) break;
         }
 
         // If we reached end of a chain, check repeat stack (may loop same frame)
@@ -692,6 +1123,12 @@ function stepInterpreter(dtMs) {
             frame.timesRemaining -= 1;
             if (frame.timesRemaining > 0) {
                 const repeatBlock = codeMap ? codeMap[frame.repeatBlockId] : code.find(b => b && b.id === frame.repeatBlockId);
+                if (repeatBlock && repeatBlock.content === 'forever') {
+                    exec.waitMs = LOOP_YIELD_MS;
+                    exec.waitingBlockId = repeatBlock.id;
+                    exec.pc = null;
+                    break outerInstanceLoop;
+                }
                 exec.pc = repeatBlock && (typeof repeatBlock.next_block_a === 'number') ? repeatBlock.next_block_a : null;
                 if (exec.pc != null) {
                     continue outerInstanceLoop;
@@ -709,51 +1146,19 @@ function stepInterpreter(dtMs) {
         }
 
         if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) { break; }
-        if ((performance.now() - startTime) >= TIME_BUDGET_MS) { break; }
     }
-    // Advance the round-robin start for next frame to ensure fairness
+    // Advance round-robin among non-controller instances only (controllers always run first)
     if (!(__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0)) {
-        if (runtimeInstances.length > 0) {
-            rrInstanceStartIndex = (rrInstanceStartIndex + 1) % runtimeInstances.length;
+        let nonControllerCount = 0;
+        for (let i = 0; i < runtimeInstances.length; i++) {
+            const o = objectById[runtimeInstances[i].templateId];
+            if (!isAppControllerTemplate(o)) nonControllerCount++;
+        }
+        if (nonControllerCount > 0) {
+            rrInstanceStartIndex = (rrInstanceStartIndex + 1) % nonControllerCount;
         }
     }
-    // Commit any instances that were requested for creation this frame (after all logic)
-    if (instancesPendingCreation && instancesPendingCreation.length > 0) {
-        const createCount = Math.min(MAX_CREATES_PER_FRAME, instancesPendingCreation.length);
-        const createdIds = [];
-        for (let i = 0; i < createCount; i++) {
-            const pending = instancesPendingCreation[i];
-            const template = objectById[pending.templateId];
-            if (!template) continue;
-            runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId });
-            runtimePositions[pending.instanceId] = { x: 0, y: 0, layer: 0 };
-            runtimeVariables[pending.instanceId] = {};
-            // Seed private array variables for this template
-            try {
-                const arrs = Array.isArray(template.arrayVariables) ? template.arrayVariables : [];
-                arrs.forEach(name => { runtimeVariables[pending.instanceId][name] = []; });
-            } catch (_) {}
-            const codeT = Array.isArray(template.code) ? template.code : [];
-            const startT = codeT.find(b => b.type === 'start');
-            const pcT = startT && typeof startT.next_block_a === 'number' ? startT.next_block_a : null;
-            runtimeExecState[pending.instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
-            createdIds.push(pending.instanceId);
-        }
-        // Remove processed items; leave remainder for next frame
-        instancesPendingCreation.splice(0, createCount);
-        // Immediately step newly created instances so their code runs before render
-        if (createdIds.length > 0) {
-            const savedFilter = __stepOnlyInstanceIds;
-            __stepOnlyInstanceIds = createdIds.slice();
-            try {
-                // Run one mini-step without advancing rr pointer
-                const now = performance.now();
-                stepInterpreter(0);
-            } finally {
-                __stepOnlyInstanceIds = savedFilter;
-            }
-        }
-    }
+    // Instantiate is handled synchronously in the Instantiate block (runInstanceStartChainSync).
     // Remove any instances that requested deletion this frame
     if (instancesPendingRemoval && instancesPendingRemoval.size > 0) {
         runtimeInstances = runtimeInstances.filter(inst => {
@@ -770,6 +1175,11 @@ function stepInterpreter(dtMs) {
         });
         instancesPendingRemoval.clear();
     }
+    frameGlobalReadSnapshot = null;
+    const filteredStep = __stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0;
+    if (isPlaying && !filteredStep) {
+        renderGameWindowSprite();
+    }
 }
 function runWhenCreatedChains() {
     // No-op: interpreter now runs chains over time in stepInterpreter
@@ -785,7 +1195,6 @@ function startPlay() {
     runtimeInstances = [];
     runtimeExecState = {};
     instancesPendingRemoval = new Set();
-    instancesPendingCreation = [];
     freeInstancesByTemplate = {};
     runtimeVariables = {};
     runtimeGlobalVariables = {};
@@ -812,26 +1221,451 @@ function startPlay() {
     lastFrameTime = playStartTime;
     const loop = () => {
         if (!isPlaying) return;
+        __touchFrameSerial++;
         const now = performance.now();
         const dt = now - lastFrameTime;
         lastFrameTime = now;
         stepInterpreter(dt);
-        renderGameWindowSprite();
         playLoopHandle = requestAnimationFrame(loop);
     };
     playLoopHandle = requestAnimationFrame(loop);
 }
+/** One-shot sounds during game preview (Play button); stopped when playback stops. */
+const __runtimeGameAudios = new Set();
+function playGameSoundFromSrc(src) {
+    if (!isPlaying || !src || typeof src !== 'string') return;
+    try {
+        const a = new Audio();
+        a.src = src;
+        a.volume = 1;
+        __runtimeGameAudios.add(a);
+        const done = () => {
+            try {
+                __runtimeGameAudios.delete(a);
+            } catch (_) {}
+        };
+        a.addEventListener('ended', done, { once: true });
+        a.addEventListener('error', done, { once: true });
+        a.play().catch(done);
+    } catch (_) {}
+}
+function stopAllGameSounds() {
+    __runtimeGameAudios.forEach((a) => {
+        try {
+            a.pause();
+            a.removeAttribute('src');
+            a.load();
+        } catch (_) {}
+    });
+    __runtimeGameAudios.clear();
+}
+
 function stopPlay() {
     isPlaying = false;
     if (playLoopHandle) cancelAnimationFrame(playLoopHandle);
     playLoopHandle = null;
+    stopAllGameSounds();
     renderGameWindowSprite();
 }
+
+// ---- Code block selection, clipboard, marquee ----
+function clientToScrollContent(clientX, clientY) {
+    const c = getCodeScrollContainer();
+    if (!c) return { x: 0, y: 0 };
+    const r = c.getBoundingClientRect();
+    return { x: (clientX - r.left) + c.scrollLeft, y: (clientY - r.top) + c.scrollTop };
+}
+function clientToLayerLocal(clientX, clientY) {
+    return scrollContentToLayerLocal(clientToScrollContent(clientX, clientY));
+}
+function syncCodeSelectionOwnership(selectedObj) {
+    if (!selectedObj) return;
+    if (codeSelectionOwnerId !== selected_object) {
+        selectedCodeBlockIds.clear();
+        codeSelectionOwnerId = selected_object;
+    }
+    const valid = new Set(selectedObj.code.map(c => c.id));
+    for (const id of [...selectedCodeBlockIds]) {
+        if (!valid.has(id)) selectedCodeBlockIds.delete(id);
+    }
+}
+function applyCodeBlockSelectionClasses() {
+    const layer = document.getElementById('code-zoom-layer');
+    if (!layer) return;
+    layer.querySelectorAll('.node-block').forEach(el => {
+        const id = parseInt(el.dataset.codeId, 10);
+        if (Number.isFinite(id) && selectedCodeBlockIds.has(id)) el.classList.add('node-block-selected');
+        else el.classList.remove('node-block-selected');
+    });
+}
+function removeCodeBlockFromObject(selectedObj, codeIdNum) {
+    const codeData = selectedObj.code.find(c => c.id === codeIdNum);
+    if (!codeData) return;
+    selectedObj.code.forEach(c => {
+        if (c.next_block_a === codeIdNum) {
+            c.next_block_a = (typeof codeData.next_block_a === 'number') ? codeData.next_block_a : null;
+        }
+        if (c.next_block_b === codeIdNum) {
+            c.next_block_b = (typeof codeData.next_block_b === 'number') ? codeData.next_block_b : null;
+        }
+        if (c.input_a === codeIdNum) c.input_a = null;
+        if (c.input_b === codeIdNum) c.input_b = null;
+    });
+    const idx = selectedObj.code.findIndex(c => c.id === codeIdNum);
+    if (idx >= 0) selectedObj.code.splice(idx, 1);
+    selectedCodeBlockIds.delete(codeIdNum);
+}
+function copyCodeBlocksToClipboardInternal() {
+    const selectedObj = objects.find(o => o.id == selected_object);
+    if (!selectedObj || selectedCodeBlockIds.size === 0) return;
+    const blocks = selectedObj.code.filter(b => selectedCodeBlockIds.has(b.id)).map(b => JSON.parse(JSON.stringify(b)));
+    codeBlocksClipboard = { v: 1, blocks };
+    const text = JSON.stringify({ __maxiverse: 'codeblocks-v1', v: 1, blocks });
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+    }
+}
+async function pasteCodeBlocksFromClipboardInternal() {
+    const selectedObj = objects.find(o => o.id == selected_object);
+    if (!selectedObj) return;
+    let payload = codeBlocksClipboard;
+    try {
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            const t = await navigator.clipboard.readText();
+            try {
+                const j = JSON.parse(t);
+                if (j && j.__maxiverse === 'codeblocks-v1' && Array.isArray(j.blocks)) payload = j;
+            } catch (_) {}
+        }
+    } catch (_) {}
+    if (!payload || !Array.isArray(payload.blocks) || payload.blocks.length === 0) return;
+    const hasStart = selectedObj.code.some(b => b.type === 'start');
+    const oldIds = new Set(payload.blocks.map(b => b.id));
+    const idMap = new Map();
+    let maxId = selectedObj.code.length ? Math.max(...selectedObj.code.map(b => b.id)) : 0;
+    for (const b of payload.blocks) {
+        maxId++;
+        idMap.set(b.id, maxId);
+    }
+    const host = getCodeScrollContainer();
+    const hr = host ? host.getBoundingClientRect() : null;
+    const center = hr ? clientToLayerLocal(hr.left + hr.width / 2, hr.top + hr.height / 2) : { x: 200, y: 200 };
+    let sumX = 0;
+    let sumY = 0;
+    let n = 0;
+    payload.blocks.forEach(b => {
+        const p = b.position || { x: 0, y: 0 };
+        sumX += p.x;
+        sumY += p.y;
+        n++;
+    });
+    const cx = n ? sumX / n : 0;
+    const cy = n ? sumY / n : 0;
+    const dx = center.x - cx;
+    const dy = center.y - cy;
+    const refKeys = ['next_block_a', 'next_block_b', 'input_a', 'input_b'];
+    const newBlocks = [];
+    for (const b of payload.blocks) {
+        const nb = JSON.parse(JSON.stringify(b));
+        nb.id = idMap.get(b.id);
+        for (const k of refKeys) {
+            if (typeof nb[k] === 'number') {
+                nb[k] = oldIds.has(nb[k]) ? idMap.get(nb[k]) : null;
+            }
+        }
+        const pos = nb.position || { x: 0, y: 0 };
+        nb.position = { x: pos.x + dx, y: pos.y + dy };
+        if (nb.type === 'start' && hasStart) {
+            nb.type = 'action';
+            nb.content = 'wait';
+            nb.val_a = 0;
+        }
+        newBlocks.push(nb);
+    }
+    selectedObj.code.push(...newBlocks);
+    rebuildCodeMaps();
+    selectedCodeBlockIds.clear();
+    newBlocks.forEach(b => selectedCodeBlockIds.add(b.id));
+    codeSelectionOwnerId = selected_object;
+    updateWorkspace();
+}
+function deleteSelectedCodeBlocks() {
+    const selectedObj = objects.find(o => o.id == selected_object);
+    if (!selectedObj) return;
+    const toDelete = [...selectedCodeBlockIds].filter(id => {
+        const b = selectedObj.code.find(c => c.id === id);
+        return b && b.type !== 'start';
+    });
+    if (toDelete.length === 0) return;
+    toDelete.forEach(id => removeCodeBlockFromObject(selectedObj, id));
+    rebuildCodeMaps();
+    updateWorkspace();
+}
+function selectAllCodeBlocks() {
+    const selectedObj = objects.find(o => o.id == selected_object);
+    if (!selectedObj) return;
+    syncCodeSelectionOwnership(selectedObj);
+    selectedCodeBlockIds.clear();
+    selectedObj.code.forEach(b => selectedCodeBlockIds.add(b.id));
+    applyCodeBlockSelectionClasses();
+}
+function updateMarqueeRectVisual() {
+    if (!marqueeSelectState) return;
+    const { x0, y0, x1, y1, marqueeEl } = marqueeSelectState;
+    const left = Math.min(x0, x1);
+    const top = Math.min(y0, y1);
+    const w = Math.abs(x1 - x0);
+    const h = Math.abs(y1 - y0);
+    marqueeEl.style.left = `${left}px`;
+    marqueeEl.style.top = `${top}px`;
+    marqueeEl.style.width = `${w}px`;
+    marqueeEl.style.height = `${h}px`;
+}
+function onMarqueeMouseMove(e) {
+    if (!marqueeSelectState) return;
+    const p = clientToLayerLocal(e.clientX, e.clientY);
+    marqueeSelectState.x1 = p.x;
+    marqueeSelectState.y1 = p.y;
+    updateMarqueeRectVisual();
+    autoScrollIfNearEdge(e.clientX, e.clientY);
+}
+function onMarqueeMouseUp(e) {
+    document.removeEventListener('mousemove', onMarqueeMouseMove);
+    document.removeEventListener('mouseup', onMarqueeMouseUp, true);
+    stopCodeViewportAutoScroll();
+    if (!marqueeSelectState) return;
+    const { x0, y0, x1, y1, shift, marqueeEl, layer } = marqueeSelectState;
+    if (marqueeEl.parentNode) marqueeEl.parentNode.removeChild(marqueeEl);
+    const left = Math.min(x0, x1);
+    const top = Math.min(y0, y1);
+    const right = Math.max(x0, x1);
+    const bottom = Math.max(y0, y1);
+    const w = right - left;
+    const h = bottom - top;
+    marqueeSelectState = null;
+    const selectedObj = objects.find(obj => obj.id == selected_object);
+    if (!selectedObj) return;
+    syncCodeSelectionOwnership(selectedObj);
+    if (w < 4 && h < 4) {
+        if (!shift) {
+            selectedCodeBlockIds.clear();
+            applyCodeBlockSelectionClasses();
+        }
+        return;
+    }
+    const z = getLayerUniformScale(layer);
+    const layerRect = layer.getBoundingClientRect();
+    const idsInRect = new Set();
+    selectedObj.code.forEach(cd => {
+        const el = layer.querySelector(`[data-code-id="${cd.id}"]`);
+        if (!el) return;
+        const r = getLayerLocalRect(layer, el, layerRect, z);
+        const intersects = !(r.left + r.width < left || r.left > right || r.top + r.height < top || r.top > bottom);
+        if (intersects) idsInRect.add(cd.id);
+    });
+    if (!shift) selectedCodeBlockIds.clear();
+    idsInRect.forEach(id => selectedCodeBlockIds.add(id));
+    applyCodeBlockSelectionClasses();
+}
+function onCodeZoomLayerMouseDown(e) {
+    if (activeTab !== 'code') return;
+    if (e.button !== 0) return;
+    if (isConnecting) return;
+    if (e.target.closest && e.target.closest('.node-block')) return;
+    if (e.target.closest && e.target.closest('.code-zoom-controls')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const nw = document.getElementById('node-window');
+    if (nw) try { nw.focus(); } catch (_) {}
+    const layer = document.getElementById('code-zoom-layer');
+    if (!layer) return;
+    const p0 = clientToLayerLocal(e.clientX, e.clientY);
+    const marqueeEl = document.createElement('div');
+    marqueeEl.className = 'code-marquee-rect';
+    marqueeEl.style.position = 'absolute';
+    marqueeEl.style.pointerEvents = 'none';
+    marqueeEl.style.zIndex = '40';
+    layer.appendChild(marqueeEl);
+    marqueeSelectState = {
+        layer,
+        x0: p0.x,
+        y0: p0.y,
+        x1: p0.x,
+        y1: p0.y,
+        shift: e.shiftKey,
+        marqueeEl
+    };
+    updateMarqueeRectVisual();
+    document.addEventListener('mousemove', onMarqueeMouseMove);
+    document.addEventListener('mouseup', onMarqueeMouseUp, true);
+}
+function handleCodeBlockDragMouseMove(e) {
+    if (!pendingDragGroup && !dragBlockGroup) return;
+    const z = codeZoom || 1;
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+    if (pendingDragGroup && !dragBlockGroup) {
+        if (Math.hypot(dx, dy) < CODE_DRAG_THRESHOLD_PX) return;
+        dragBlockGroup = pendingDragGroup.entries;
+        pendingDragGroup = null;
+        dragBlockGroup.forEach(({ el }) => {
+            el.classList.add('dragging');
+            el.style.transition = 'none';
+        });
+    }
+    if (!dragBlockGroup) return;
+    for (const ent of dragBlockGroup) {
+        const nx = ent.baseX + dx / z;
+        const ny = ent.baseY + dy / z;
+        ent.el.style.left = `${nx}px`;
+        ent.el.style.top = `${ny}px`;
+    }
+    autoScrollIfNearEdge(e.clientX, e.clientY);
+    drawConnections();
+}
+function handleCodeBlockDragMouseUp(e) {
+    document.removeEventListener('mousemove', handleCodeBlockDragMouseMove);
+    document.removeEventListener('mouseup', handleCodeBlockDragMouseUp);
+    if (pendingDragGroup && !dragBlockGroup) {
+        pendingDragGroup = null;
+        return;
+    }
+    if (!dragBlockGroup) return;
+    const z = codeZoom || 1;
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+    const selectedObj = objects.find(obj => obj.id == selected_object);
+    if (selectedObj) {
+        for (const ent of dragBlockGroup) {
+            const finalX = ent.baseX + dx / z;
+            const finalY = ent.baseY + dy / z;
+            ent.el.style.left = `${finalX}px`;
+            ent.el.style.top = `${finalY}px`;
+            const codeId = parseInt(ent.el.dataset.codeId, 10);
+            const codeData = selectedObj.code.find(code => code.id == codeId);
+            if (codeData) codeData.position = { x: finalX, y: finalY };
+            ent.el.classList.remove('dragging');
+            ent.el.style.transition = 'transform 0.1s ease-out';
+        }
+    }
+    dragBlockGroup = null;
+    pendingDragGroup = null;
+    stopCodeViewportAutoScroll();
+    drawConnections();
+    updateSpacerFromBlocks();
+}
+function handleCodeBlockDragTouchMove(e) {
+    if (!pendingDragGroup && !dragBlockGroup) return;
+    e.preventDefault();
+    const touch = e.touches[0];
+    if (!touch) return;
+    const z = codeZoom || 1;
+    const dx = touch.clientX - dragStartX;
+    const dy = touch.clientY - dragStartY;
+    if (pendingDragGroup && !dragBlockGroup) {
+        if (Math.hypot(dx, dy) < CODE_DRAG_THRESHOLD_PX) return;
+        dragBlockGroup = pendingDragGroup.entries;
+        pendingDragGroup = null;
+        dragBlockGroup.forEach(({ el }) => {
+            el.classList.add('dragging');
+            el.style.transition = 'none';
+        });
+    }
+    if (!dragBlockGroup) return;
+    for (const ent of dragBlockGroup) {
+        const nx = ent.baseX + dx / z;
+        const ny = ent.baseY + dy / z;
+        ent.el.style.left = `${nx}px`;
+        ent.el.style.top = `${ny}px`;
+    }
+    autoScrollIfNearEdge(touch.clientX, touch.clientY);
+    drawConnections();
+}
+function handleCodeBlockDragTouchEnd(e) {
+    document.removeEventListener('touchmove', handleCodeBlockDragTouchMove, { passive: false });
+    document.removeEventListener('touchend', handleCodeBlockDragTouchEnd);
+    if (pendingDragGroup && !dragBlockGroup) {
+        pendingDragGroup = null;
+        return;
+    }
+    if (!dragBlockGroup) return;
+    const z = codeZoom || 1;
+    let dx = 0;
+    let dy = 0;
+    if (e.changedTouches && e.changedTouches.length > 0) {
+        const touch = e.changedTouches[0];
+        dx = touch.clientX - dragStartX;
+        dy = touch.clientY - dragStartY;
+    }
+    const selectedObj = objects.find(obj => obj.id == selected_object);
+    if (selectedObj) {
+        for (const ent of dragBlockGroup) {
+            const finalX = ent.baseX + dx / z;
+            const finalY = ent.baseY + dy / z;
+            ent.el.style.left = `${finalX}px`;
+            ent.el.style.top = `${finalY}px`;
+            const codeId = parseInt(ent.el.dataset.codeId, 10);
+            const codeData = selectedObj.code.find(code => code.id == codeId);
+            if (codeData) codeData.position = { x: finalX, y: finalY };
+            ent.el.classList.remove('dragging');
+            ent.el.style.transition = 'transform 0.1s ease-out';
+        }
+    }
+    dragBlockGroup = null;
+    pendingDragGroup = null;
+    stopCodeViewportAutoScroll();
+    drawConnections();
+    updateSpacerFromBlocks();
+}
+function initCodeBlockKeyboardShortcuts() {
+    if (window.__codeBlockKbBound) return;
+    window.__codeBlockKbBound = true;
+    window.addEventListener('keydown', (e) => {
+        if (activeTab !== 'code') return;
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+        const mod = e.ctrlKey || e.metaKey;
+        if (mod && e.key === 'c') {
+            copyCodeBlocksToClipboardInternal();
+            e.preventDefault();
+            return;
+        }
+        if (mod && e.key === 'v') {
+            e.preventDefault();
+            pasteCodeBlocksFromClipboardInternal();
+            return;
+        }
+        if (mod && (e.key === 'a' || e.key === 'A')) {
+            selectAllCodeBlocks();
+            e.preventDefault();
+            return;
+        }
+        if (mod && e.key === 'x') {
+            copyCodeBlocksToClipboardInternal();
+            deleteSelectedCodeBlocks();
+            e.preventDefault();
+            return;
+        }
+        // Delete / Backspace: remove selected blocks (Backspace = "Delete" on many Mac keyboards)
+        if (e.key === 'Delete' || e.key === 'Backspace') {
+            if (selectedCodeBlockIds.size === 0) return;
+            deleteSelectedCodeBlocks();
+            e.preventDefault();
+            return;
+        }
+        if (e.key === 'Escape') {
+            selectedCodeBlockIds.clear();
+            applyCodeBlockSelectionClasses();
+        }
+    });
+}
+
 // Create a node block
 function createNodeBlock(codeData, x, y) {
     const block = document.createElement("div");
     block.className = "node-block";
     if (codeData.type === 'start') block.classList.add('node-block-start');
+    if (codeData.type === 'value') block.classList.add('node-block-value');
     block.dataset.codeId = codeData.id;
     block.style.left = `${x}px`;
     block.style.top = `${y}px`;
@@ -863,7 +1697,7 @@ function createNodeBlock(codeData, x, y) {
         input.step = "1";
         if (typeof codeData.val_a !== 'number') codeData.val_a = 10;
         input.value = codeData.val_a;
-        input.addEventListener("change", () => { codeData.val_a = parseFloat(input.value) || 0; });
+        input.addEventListener("change", () => { codeData.val_a = parseNumericInput(input.value); });
         span.appendChild(input);
         label.appendChild(span);
         label.append(")");
@@ -894,12 +1728,12 @@ function createNodeBlock(codeData, x, y) {
         const waitSpan = document.createElement("span");
         waitSpan.className = 'node-input-container';
         const waitInput = document.createElement("input");
-        waitInput.type = "number";
-        waitInput.min = "0";
-        waitInput.step = "0.1";
+        waitInput.type = "text";
+        waitInput.setAttribute('inputmode', 'decimal');
+        waitInput.autocomplete = 'off';
         waitInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 1);
         waitInput.addEventListener("change", () => {
-            codeData.val_a = parseFloat(waitInput.value) || 0;
+            codeData.val_a = parseNumericInput(waitInput.value);
         });
         waitSpan.appendChild(waitInput);
         label.appendChild(waitSpan);
@@ -917,7 +1751,7 @@ function createNodeBlock(codeData, x, y) {
         repeatInput.step = "1";
         repeatInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 2);
         repeatInput.addEventListener("change", () => {
-            codeData.val_a = parseInt(repeatInput.value) || 1;
+            codeData.val_a = Math.max(1, Math.floor(parseNumericInput(repeatInput.value)));
         });
         repeatSpan.appendChild(repeatInput);
         label.appendChild(repeatSpan);
@@ -933,7 +1767,7 @@ function createNodeBlock(codeData, x, y) {
         condInput.type = 'number'; condInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
         condInput.value = codeData.val_a;
-        condInput.addEventListener('change', () => { codeData.val_a = parseInt(condInput.value) || 0; });
+        condInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(condInput.value); });
         condSpan.appendChild(condInput);
         label.appendChild(condSpan);
         label.append(')');
@@ -982,7 +1816,7 @@ function createNodeBlock(codeData, x, y) {
         rotInput.type = 'number'; rotInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         rotInput.value = codeData.val_a;
-        rotInput.addEventListener('change', () => { codeData.val_a = parseFloat(rotInput.value) || 0; });
+        rotInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(rotInput.value); });
         rotSpan.appendChild(rotInput);
         label.appendChild(rotSpan);
         label.append(')');
@@ -1015,7 +1849,7 @@ function createNodeBlock(codeData, x, y) {
         sizeInput.type = 'number'; sizeInput.step = '0.1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
         sizeInput.value = codeData.val_a;
-        sizeInput.addEventListener('change', () => { codeData.val_a = parseFloat(sizeInput.value) || 1; });
+        sizeInput.addEventListener('change', () => { codeData.val_a = (parseNumericInput(sizeInput.value) || 1); });
         sizeSpan.appendChild(sizeInput);
         label.appendChild(sizeSpan);
         label.append(')');
@@ -1051,7 +1885,7 @@ function createNodeBlock(codeData, x, y) {
         sizeInput.type = 'number'; sizeInput.step = '0.1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0.1;
         sizeInput.value = codeData.val_a;
-        sizeInput.addEventListener('change', () => { codeData.val_a = parseFloat(sizeInput.value) || 0; });
+        sizeInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(sizeInput.value); });
         sizeSpan.appendChild(sizeInput);
         label.appendChild(sizeSpan);
         label.append(')');
@@ -1087,7 +1921,7 @@ function createNodeBlock(codeData, x, y) {
         layerInput.type = 'number'; layerInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         layerInput.value = codeData.val_a;
-        layerInput.addEventListener('change', () => { codeData.val_a = parseFloat(layerInput.value) || 0; });
+        layerInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(layerInput.value); });
         layerSpan.appendChild(layerInput);
         label.appendChild(layerSpan);
         label.append(')');
@@ -1121,7 +1955,7 @@ function createNodeBlock(codeData, x, y) {
         if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
         opInput.value = codeData.val_a;
         opInput.min = '0'; opInput.max = '1';
-        opInput.addEventListener('change', () => { let v = parseFloat(opInput.value); if (isNaN(v)) v = 1; codeData.val_a = Math.max(0, Math.min(1, v)); });
+        opInput.addEventListener('change', () => { let v = parseNumericInput(opInput.value); if (!Number.isFinite(v)) v = 1; codeData.val_a = Math.max(0, Math.min(1, v)); });
         opSpan.appendChild(opInput);
         label.appendChild(opSpan);
         label.append(')');
@@ -1145,16 +1979,44 @@ function createNodeBlock(codeData, x, y) {
         opSpan.appendChild(btn);
         if (codeData.input_a != null) { opInput.value = '^'; opInput.readOnly = true; }
     } else if (codeData.content === 'operation') {
-        // Operation block: ( X [op] Y )
+        // Operation block: ( X [op] Y ) — text fields so + can take strings; other ops coerce to numbers
         label.textContent = '';
         const leftSpan = document.createElement('span');
         leftSpan.className = 'node-input-container';
         const leftInput = document.createElement('input');
-        leftInput.type = 'number';
-        leftInput.step = '1';
-        if (typeof codeData.op_x !== 'number') codeData.op_x = 0;
-        leftInput.value = codeData.op_x;
-        leftInput.addEventListener('change', () => { codeData.op_x = parseFloat(leftInput.value) || 0; });
+        leftInput.className = 'node-op-input';
+        leftInput.type = 'text';
+        leftInput.autocomplete = 'off';
+        leftInput.spellcheck = false;
+        if (codeData.op_x === undefined || codeData.op_x === null) codeData.op_x = 0;
+        const rightSpan = document.createElement('span');
+        rightSpan.className = 'node-input-container';
+        const rightInput = document.createElement('input');
+        rightInput.className = 'node-op-input';
+        rightInput.type = 'text';
+        rightInput.autocomplete = 'off';
+        rightInput.spellcheck = false;
+        if (codeData.op_y === undefined || codeData.op_y === null) codeData.op_y = 0;
+        if (!codeData.val_a) codeData.val_a = '+';
+
+        const applyOpLiteral = (key, inputEl) => {
+            const raw = inputEl.value;
+            if (codeData.val_a === '+') {
+                codeData[key] = raw;
+            } else {
+                codeData[key] = parseNumericInput(raw);
+            }
+        };
+        const refreshOpInputsFromData = () => {
+            const fmt = (v) => (v === undefined || v === null) ? '' : String(v);
+            leftInput.value = codeData.input_a != null ? '^' : fmt(codeData.op_x);
+            rightInput.value = codeData.input_b != null ? '^' : fmt(codeData.op_y);
+            leftInput.readOnly = codeData.input_a != null;
+            rightInput.readOnly = codeData.input_b != null;
+        };
+        refreshOpInputsFromData();
+        leftInput.addEventListener('change', () => { applyOpLiteral('op_x', leftInput); });
+        rightInput.addEventListener('change', () => { applyOpLiteral('op_y', rightInput); });
         leftSpan.appendChild(leftInput);
 
         const opSelect = document.createElement('select');
@@ -1165,18 +2027,21 @@ function createNodeBlock(codeData, x, y) {
             opt.value = sym; opt.textContent = sym;
             opSelect.appendChild(opt);
         });
-        if (!codeData.val_a) codeData.val_a = '+';
         opSelect.value = codeData.val_a;
-        opSelect.addEventListener('change', () => { codeData.val_a = opSelect.value; });
+        opSelect.addEventListener('change', () => {
+            const prev = codeData.val_a;
+            codeData.val_a = opSelect.value;
+            if (prev === '+' && codeData.val_a !== '+') {
+                codeData.op_x = parseNumericInput(String(codeData.op_x));
+                codeData.op_y = parseNumericInput(String(codeData.op_y));
+            } else if (prev !== '+' && codeData.val_a === '+') {
+                /* keep numeric values as readable text */
+                codeData.op_x = String(codeData.op_x);
+                codeData.op_y = String(codeData.op_y);
+            }
+            refreshOpInputsFromData();
+        });
 
-        const rightSpan = document.createElement('span');
-        rightSpan.className = 'node-input-container';
-        const rightInput = document.createElement('input');
-        rightInput.type = 'number';
-        rightInput.step = '1';
-        if (typeof codeData.op_y !== 'number') codeData.op_y = 0;
-        rightInput.value = codeData.op_y;
-        rightInput.addEventListener('change', () => { codeData.op_y = parseFloat(rightInput.value) || 0; });
         rightSpan.appendChild(rightInput);
 
         label.append('(');
@@ -1223,8 +2088,7 @@ function createNodeBlock(codeData, x, y) {
         };
         addOpInputPlus(leftSpan, 'a');
         addOpInputPlus(rightSpan, 'b');
-        if (codeData.input_a != null) { leftInput.value = '^'; leftInput.readOnly = true; }
-        if (codeData.input_b != null) { rightInput.value = '^'; rightInput.readOnly = true; }
+        refreshOpInputsFromData();
 
     } else if (codeData.content === 'mouse_x') {
         label.textContent = 'mouseX';
@@ -1280,7 +2144,7 @@ function createNodeBlock(codeData, x, y) {
         const input = document.createElement('input');
         input.type = 'number'; input.step = '1';
         input.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 0);
-        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        input.addEventListener('change', () => { codeData.val_a = parseNumericInput(input.value); });
         span.appendChild(input);
         label.appendChild(span);
         label.append(')');
@@ -1321,7 +2185,7 @@ function createNodeBlock(codeData, x, y) {
         const input = document.createElement('input');
         input.type = 'number'; input.step = '1';
         input.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 0);
-        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        input.addEventListener('change', () => { codeData.val_a = parseNumericInput(input.value); });
         span.appendChild(input);
         label.appendChild(span);
         label.append(')');
@@ -1367,6 +2231,24 @@ function createNodeBlock(codeData, x, y) {
         span.appendChild(select);
         label.appendChild(span);
         label.append(')');
+    } else if (codeData.content === 'play_sound') {
+        label.textContent = '';
+        label.append('Play Sound (');
+        const span = document.createElement('span');
+        const select = document.createElement('select');
+        const snds = getCurrentObjectSounds();
+        snds.forEach((s) => {
+            const opt = document.createElement('option');
+            opt.value = String(s.id);
+            opt.textContent = s.name;
+            select.appendChild(opt);
+        });
+        if (!codeData.val_a && snds[0]) codeData.val_a = String(snds[0].id);
+        select.value = codeData.val_a || '';
+        select.addEventListener('change', () => { codeData.val_a = select.value; });
+        span.appendChild(select);
+        label.appendChild(span);
+        label.append(')');
     } else if (codeData.content === 'instantiate') {
         label.textContent = '';
         label.append('Instantiate (');
@@ -1392,7 +2274,7 @@ function createNodeBlock(codeData, x, y) {
         aInput.type = 'number'; aInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         aInput.value = codeData.val_a;
-        aInput.addEventListener('change', () => { codeData.val_a = parseFloat(aInput.value) || 0; });
+        aInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(aInput.value); });
         aSpan.appendChild(aInput);
         label.appendChild(aSpan);
         label.append(', ');
@@ -1402,7 +2284,7 @@ function createNodeBlock(codeData, x, y) {
         bInput.type = 'number'; bInput.step = '1';
         if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
         bInput.value = codeData.val_b;
-        bInput.addEventListener('change', () => { codeData.val_b = parseFloat(bInput.value) || 0; });
+        bInput.addEventListener('change', () => { codeData.val_b = parseNumericInput(bInput.value); });
         bSpan.appendChild(bInput);
         label.appendChild(bSpan);
         label.append(')');
@@ -1443,7 +2325,7 @@ function createNodeBlock(codeData, x, y) {
         xInput.type = 'number'; xInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         xInput.value = codeData.val_a;
-        xInput.addEventListener('change', () => { codeData.val_a = parseFloat(xInput.value) || 0; });
+        xInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(xInput.value); });
         xSpan.appendChild(xInput);
         label.appendChild(xSpan);
 
@@ -1455,7 +2337,7 @@ function createNodeBlock(codeData, x, y) {
         yInput.type = 'number'; yInput.step = '1';
         if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
         yInput.value = codeData.val_b;
-        yInput.addEventListener('change', () => { codeData.val_b = parseFloat(yInput.value) || 0; });
+        yInput.addEventListener('change', () => { codeData.val_b = parseNumericInput(yInput.value); });
         ySpan.appendChild(yInput);
         label.appendChild(ySpan);
 
@@ -1467,7 +2349,7 @@ function createNodeBlock(codeData, x, y) {
         rInput.type = 'number'; rInput.step = '1'; rInput.min = '0'; rInput.max = '255';
         if (typeof codeData.rgb_r !== 'number') codeData.rgb_r = 0;
         rInput.value = codeData.rgb_r;
-        rInput.addEventListener('change', () => { codeData.rgb_r = Math.max(0, Math.min(255, Math.round(parseFloat(rInput.value) || 0))); rInput.value = codeData.rgb_r; });
+        rInput.addEventListener('change', () => { codeData.rgb_r = Math.max(0, Math.min(255, Math.round(parseNumericInput(rInput.value)))); rInput.value = codeData.rgb_r; });
         rSpan.appendChild(rInput);
         label.appendChild(rSpan);
 
@@ -1479,7 +2361,7 @@ function createNodeBlock(codeData, x, y) {
         gInput.type = 'number'; gInput.step = '1'; gInput.min = '0'; gInput.max = '255';
         if (typeof codeData.rgb_g !== 'number') codeData.rgb_g = 0;
         gInput.value = codeData.rgb_g;
-        gInput.addEventListener('change', () => { codeData.rgb_g = Math.max(0, Math.min(255, Math.round(parseFloat(gInput.value) || 0))); gInput.value = codeData.rgb_g; });
+        gInput.addEventListener('change', () => { codeData.rgb_g = Math.max(0, Math.min(255, Math.round(parseNumericInput(gInput.value)))); gInput.value = codeData.rgb_g; });
         gSpan.appendChild(gInput);
         label.appendChild(gSpan);
 
@@ -1491,7 +2373,7 @@ function createNodeBlock(codeData, x, y) {
         bInput.type = 'number'; bInput.step = '1'; bInput.min = '0'; bInput.max = '255';
         if (typeof codeData.rgb_b !== 'number') codeData.rgb_b = 0;
         bInput.value = codeData.rgb_b;
-        bInput.addEventListener('change', () => { codeData.rgb_b = Math.max(0, Math.min(255, Math.round(parseFloat(bInput.value) || 0))); bInput.value = codeData.rgb_b; });
+        bInput.addEventListener('change', () => { codeData.rgb_b = Math.max(0, Math.min(255, Math.round(parseNumericInput(bInput.value)))); bInput.value = codeData.rgb_b; });
         bSpan.appendChild(bInput);
         label.appendChild(bSpan);
 
@@ -1522,6 +2404,77 @@ function createNodeBlock(codeData, x, y) {
         addInputPlus(ySpan, 'b');
         if (codeData.input_a != null) { xInput.value = '^'; xInput.readOnly = true; }
         if (codeData.input_b != null) { yInput.value = '^'; yInput.readOnly = true; }
+    } else if (codeData.content === 'touching') {
+        label.textContent = '';
+        label.append('Touching ');
+        const modeSel = document.createElement('select');
+        modeSel.className = 'node-touching-mode-select';
+        const optObj = document.createElement('option');
+        optObj.value = 'object';
+        optObj.textContent = 'Game Object';
+        const optCol = document.createElement('option');
+        optCol.value = 'color';
+        optCol.textContent = 'Color';
+        modeSel.appendChild(optObj);
+        modeSel.appendChild(optCol);
+        if (!codeData.touching_mode) codeData.touching_mode = 'object';
+        modeSel.value = codeData.touching_mode;
+        label.appendChild(modeSel);
+
+        const objectWrap = document.createElement('span');
+        objectWrap.className = 'node-touching-object-wrap';
+        const objSelect = document.createElement('select');
+        const instantiables = objects.filter(o => o.name !== 'AppController');
+        instantiables.forEach(o => {
+            const opt = document.createElement('option');
+            opt.value = String(o.id);
+            opt.textContent = o.name;
+            objSelect.appendChild(opt);
+        });
+        if (!codeData.val_a && instantiables[0]) codeData.val_a = String(instantiables[0].id);
+        objSelect.value = codeData.val_a || '';
+        objSelect.addEventListener('change', () => { codeData.val_a = objSelect.value; });
+        objectWrap.appendChild(objSelect);
+
+        const colorWrap = document.createElement('span');
+        colorWrap.className = 'node-touching-color-wrap';
+        colorWrap.append('rgb(');
+        const rIn = document.createElement('input');
+        rIn.type = 'number'; rIn.step = '1'; rIn.min = '0'; rIn.max = '255';
+        if (typeof codeData.rgb_r !== 'number') codeData.rgb_r = 0;
+        rIn.value = codeData.rgb_r;
+        rIn.addEventListener('change', () => { codeData.rgb_r = Math.max(0, Math.min(255, Math.round(parseNumericInput(rIn.value)))); rIn.value = codeData.rgb_r; });
+        colorWrap.appendChild(rIn);
+        colorWrap.append(', ');
+        const gIn = document.createElement('input');
+        gIn.type = 'number'; gIn.step = '1'; gIn.min = '0'; gIn.max = '255';
+        if (typeof codeData.rgb_g !== 'number') codeData.rgb_g = 0;
+        gIn.value = codeData.rgb_g;
+        gIn.addEventListener('change', () => { codeData.rgb_g = Math.max(0, Math.min(255, Math.round(parseNumericInput(gIn.value)))); gIn.value = codeData.rgb_g; });
+        colorWrap.appendChild(gIn);
+        colorWrap.append(', ');
+        const bIn = document.createElement('input');
+        bIn.type = 'number'; bIn.step = '1'; bIn.min = '0'; bIn.max = '255';
+        if (typeof codeData.rgb_b !== 'number') codeData.rgb_b = 0;
+        bIn.value = codeData.rgb_b;
+        bIn.addEventListener('change', () => { codeData.rgb_b = Math.max(0, Math.min(255, Math.round(parseNumericInput(bIn.value)))); bIn.value = codeData.rgb_b; });
+        colorWrap.appendChild(bIn);
+        colorWrap.append(')');
+
+        const syncTouchingVisibility = () => {
+            const m = codeData.touching_mode || 'object';
+            objectWrap.style.display = m === 'object' ? '' : 'none';
+            colorWrap.style.display = m === 'color' ? '' : 'none';
+        };
+        modeSel.addEventListener('change', () => {
+            codeData.touching_mode = modeSel.value;
+            syncTouchingVisibility();
+        });
+        label.appendChild(objectWrap);
+        label.appendChild(colorWrap);
+        syncTouchingVisibility();
+
+        block.classList.add('node-block-compact');
     } else if (codeData.content === 'set_variable') {
         label.textContent = '';
         label.append('Set ');
@@ -1556,7 +2509,7 @@ function createNodeBlock(codeData, x, y) {
         input.type = 'number'; input.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         input.value = codeData.val_a;
-        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        input.addEventListener('change', () => { codeData.val_a = parseNumericInput(input.value); });
         valSpan.appendChild(input);
         label.appendChild(valSpan);
         label.append(')');
@@ -1612,7 +2565,7 @@ function createNodeBlock(codeData, x, y) {
         input.type = 'number'; input.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 1;
         input.value = codeData.val_a;
-        input.addEventListener('change', () => { codeData.val_a = parseFloat(input.value) || 0; });
+        input.addEventListener('change', () => { codeData.val_a = parseNumericInput(input.value); });
         valSpan.appendChild(input);
         label.appendChild(valSpan);
         label.append(')');
@@ -1742,7 +2695,7 @@ function createNodeBlock(codeData, x, y) {
         idxInput.type = 'number'; idxInput.step = '1';
         if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
         idxInput.value = codeData.val_b;
-        idxInput.addEventListener('change', () => { codeData.val_b = parseFloat(idxInput.value) || 0; });
+        idxInput.addEventListener('change', () => { codeData.val_b = parseNumericInput(idxInput.value); });
         idxSpan.appendChild(idxInput);
         label.appendChild(idxSpan);
         label.append(')');
@@ -1822,7 +2775,7 @@ function createNodeBlock(codeData, x, y) {
         idxInput.type = 'number'; idxInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         idxInput.value = codeData.val_a;
-        idxInput.addEventListener('change', () => { codeData.val_a = parseFloat(idxInput.value) || 0; });
+        idxInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(idxInput.value); });
         idxSpan.appendChild(idxInput);
         label.appendChild(idxSpan);
         label.append(')');
@@ -1906,7 +2859,7 @@ function createNodeBlock(codeData, x, y) {
         idxInput.type = 'number'; idxInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         idxInput.value = codeData.val_a;
-        idxInput.addEventListener('change', () => { codeData.val_a = parseFloat(idxInput.value) || 0; });
+        idxInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(idxInput.value); });
         idxSpan.appendChild(idxInput);
         label.appendChild(idxSpan);
         label.append(']');
@@ -1975,7 +2928,7 @@ function createNodeBlock(codeData, x, y) {
         aInput.type = 'number'; aInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         aInput.value = codeData.val_a;
-        aInput.addEventListener('change', () => { codeData.val_a = parseFloat(aInput.value) || 0; });
+        aInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(aInput.value); });
         aSpan.appendChild(aInput);
         label.appendChild(aSpan);
         const btn = document.createElement('button');
@@ -2012,7 +2965,7 @@ function createNodeBlock(codeData, x, y) {
         aInput.type = 'number'; aInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         aInput.value = codeData.val_a;
-        aInput.addEventListener('change', () => { codeData.val_a = parseFloat(aInput.value) || 0; });
+        aInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(aInput.value); });
         aSpan.appendChild(aInput);
         label.appendChild(aSpan);
         label.append(', ');
@@ -2022,7 +2975,7 @@ function createNodeBlock(codeData, x, y) {
         bInput.type = 'number'; bInput.step = '1';
         if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
         bInput.value = codeData.val_b;
-        bInput.addEventListener('change', () => { codeData.val_b = parseFloat(bInput.value) || 0; });
+        bInput.addEventListener('change', () => { codeData.val_b = parseNumericInput(bInput.value); });
         bSpan.appendChild(bInput);
         label.appendChild(bSpan);
         label.append(')');
@@ -2101,7 +3054,7 @@ function createNodeBlock(codeData, x, y) {
         label.append(
             codeData.content === 'less_than'
                 ? ' < '
-                : (codeData.content === 'equals' ? ' = ' : (codeData.content === 'and' ? ' AND ' : ' OR '))
+                : (codeData.content === 'equals' ? ' = ' : (codeData.content === 'and' ? ' and ' : ' or '))
         );
         const bSpan = document.createElement('span');
         bSpan.className = 'node-input-container';
@@ -2138,6 +3091,65 @@ function createNodeBlock(codeData, x, y) {
         if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
         if (codeData.input_b != null) { bInput.value = '^'; bInput.readOnly = true; }
         block.classList.add('node-block-compact');
+    } else if (codeData.content === 'random_int') {
+        if (codeData.input_a == null && typeof codeData.val_a !== 'number') codeData.val_a = 0;
+        if (codeData.input_b == null && typeof codeData.val_b !== 'number') codeData.val_b = 10;
+        label.textContent = '';
+        label.append('Random int (');
+        const aSpan = document.createElement('span');
+        aSpan.className = 'node-input-container';
+        const aInput = document.createElement('input');
+        aInput.type = 'number';
+        aInput.step = '1';
+        aInput.title = 'Min (inclusive)';
+        aInput.value = codeData.val_a;
+        aInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(aInput.value); });
+        aSpan.appendChild(aInput);
+        label.appendChild(aSpan);
+        label.append(', ');
+        const bSpan = document.createElement('span');
+        bSpan.className = 'node-input-container';
+        const bInput = document.createElement('input');
+        bInput.type = 'number';
+        bInput.step = '1';
+        bInput.title = 'Max (inclusive)';
+        bInput.value = codeData.val_b;
+        bInput.addEventListener('change', () => { codeData.val_b = parseNumericInput(bInput.value); });
+        bSpan.appendChild(bInput);
+        label.appendChild(bSpan);
+        label.append(') inclusive');
+
+        const addInputPlus = (containerEl, which) => {
+            const btn = document.createElement('button');
+            btn.className = `node-plus-btn node-input-plus-btn node-input-plus-btn-${which}`;
+            btn.textContent = '+';
+            btn.title = `Wire ${which === 'b' ? 'max' : 'min'} from another block`;
+            btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); showAddInputBlockMenu(block, codeData, which, btn); });
+            btn.addEventListener('mousedown', (e) => {
+                e.stopPropagation(); e.preventDefault();
+                if (isConnecting) return;
+                const container = document.getElementById('node-window'); if (!container) return;
+                const rect = container.getBoundingClientRect();
+                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                const nodeWindow = document.getElementById('node-window');
+                if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex', '0'); try { nodeWindow.focus(); } catch (_) {} }
+                clearMenuDocHandlers();
+                isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
+                document.addEventListener('mousemove', handleConnectMouseMove);
+                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                drawConnections();
+            });
+            containerEl.appendChild(btn);
+        };
+        addInputPlus(aSpan, 'a');
+        addInputPlus(bSpan, 'b');
+
+        aInput.value = codeData.val_a;
+        bInput.value = codeData.val_b;
+        if (codeData.input_a != null) { aInput.value = '^'; aInput.readOnly = true; }
+        if (codeData.input_b != null) { bInput.value = '^'; bInput.readOnly = true; }
+        block.classList.add('node-block-compact');
+        block.classList.add('node-block-random-int');
     } else {
         label.textContent = codeData.content;
     }
@@ -2153,7 +3165,7 @@ function createNodeBlock(codeData, x, y) {
         xInput.type = 'number'; xInput.step = '1';
         if (typeof codeData.val_a !== 'number') codeData.val_a = 0;
         xInput.value = codeData.val_a;
-        xInput.addEventListener('change', () => { codeData.val_a = parseFloat(xInput.value) || 0; });
+        xInput.addEventListener('change', () => { codeData.val_a = parseNumericInput(xInput.value); });
         xSpan.appendChild(xInput);
         label.appendChild(xSpan);
         label.append(', ');
@@ -2163,7 +3175,7 @@ function createNodeBlock(codeData, x, y) {
         yInput.type = 'number'; yInput.step = '1';
         if (typeof codeData.val_b !== 'number') codeData.val_b = 0;
         yInput.value = codeData.val_b;
-        yInput.addEventListener('change', () => { codeData.val_b = parseFloat(yInput.value) || 0; });
+        yInput.addEventListener('change', () => { codeData.val_b = parseNumericInput(yInput.value); });
         ySpan.appendChild(yInput);
         label.appendChild(ySpan);
         label.append(')');
@@ -2215,29 +3227,8 @@ function createNodeBlock(codeData, x, y) {
             e.preventDefault();
             const selectedObj = objects.find(obj => obj.id == selected_object);
             if (!selectedObj) return;
-            const codeIdNum = codeData.id;
-            // Re-link any predecessors on branch A or B to this block's respective successor
-            selectedObj.code.forEach(c => {
-                if (c.next_block_a === codeIdNum) {
-                    c.next_block_a = (typeof codeData.next_block_a === 'number') ? codeData.next_block_a : null;
-                }
-                if (c.next_block_b === codeIdNum) {
-                    c.next_block_b = (typeof codeData.next_block_b === 'number') ? codeData.next_block_b : null;
-                }
-                // Clear any input references targeting this block
-                if (c.input_a === codeIdNum) {
-                    c.input_a = null;
-                }
-                if (c.input_b === codeIdNum) {
-                    c.input_b = null;
-                }
-            });
-            // Remove this block from the object's code list
-            const idx = selectedObj.code.findIndex(c => c.id === codeIdNum);
-            if (idx >= 0) {
-                selectedObj.code.splice(idx, 1);
-            }
-            // Re-render workspace to refresh plus buttons and connections
+            removeCodeBlockFromObject(selectedObj, codeData.id);
+            rebuildCodeMaps();
             updateWorkspace();
         });
         block.appendChild(closeBtn);
@@ -2317,7 +3308,7 @@ function createNodeBlock(codeData, x, y) {
         xInput.step = "1";
         xInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 0);
         xInput.addEventListener("change", () => {
-            codeData.val_a = parseInt(xInput.value) || 0;
+            codeData.val_a = parseNumericInput(xInput.value);
         });
         label.children[0].appendChild(xInput);
         // Y input
@@ -2326,7 +3317,7 @@ function createNodeBlock(codeData, x, y) {
         yInput.step = "1";
         yInput.value = (typeof codeData.val_b === 'number' ? codeData.val_b : 0);
         yInput.addEventListener("change", () => {
-            codeData.val_b = parseInt(yInput.value) || 0;
+            codeData.val_b = parseNumericInput(yInput.value);
         });
         label.children[1].appendChild(yInput);
 
@@ -2383,7 +3374,7 @@ function createNodeBlock(codeData, x, y) {
         rotInput.step = "1";
         rotInput.value = (typeof codeData.val_a === 'number' ? codeData.val_a : 5);
         rotInput.addEventListener("change", () => {
-            codeData.val_a = parseFloat(rotInput.value) || 0;
+            codeData.val_a = parseNumericInput(rotInput.value);
         });
         label.children[0].appendChild(rotInput);
         if (codeData.input_a != null) { rotInput.value = '^'; rotInput.readOnly = true; }
@@ -2753,53 +3744,89 @@ function createNodeBlock(codeData, x, y) {
         }
     }
 
-    // Desktop mouse events
+    // Desktop mouse events — selection, multi-drag, drag threshold
     block.addEventListener("mousedown", (e) => {
-        // Avoid starting a drag when interacting with inputs/selects/buttons inside the block
         const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
         if (tag === 'select' || tag === 'input' || tag === 'button' || e.target.closest('select') || e.target.closest('button')) {
             return;
         }
+        if (codeData.type === 'value' && e.target.closest && e.target.closest('.node-output-anchor')) {
+            return;
+        }
         e.preventDefault();
-        draggedBlock = block;
-        isDragging = true;
-        block.classList.add("dragging");
-        block.style.transition = 'none';
-
-        // Record starting positions
+        e.stopPropagation();
+        const selectedObj = objects.find(obj => obj.id == selected_object);
+        if (!selectedObj) return;
+        syncCodeSelectionOwnership(selectedObj);
+        const id = codeData.id;
+        if (e.shiftKey) {
+            if (selectedCodeBlockIds.has(id)) selectedCodeBlockIds.delete(id);
+            else selectedCodeBlockIds.add(id);
+            applyCodeBlockSelectionClasses();
+            return;
+        }
+        if (!selectedCodeBlockIds.has(id)) {
+            selectedCodeBlockIds.clear();
+            selectedCodeBlockIds.add(id);
+            applyCodeBlockSelectionClasses();
+        }
+        const layer = document.getElementById('code-zoom-layer');
+        const entries = [];
+        for (const cid of selectedCodeBlockIds) {
+            const el = layer ? layer.querySelector(`[data-code-id="${cid}"]`) : null;
+            if (!el) continue;
+            entries.push({
+                el,
+                baseX: parseFloat(el.style.left) || 0,
+                baseY: parseFloat(el.style.top) || 0
+            });
+        }
+        if (entries.length === 0) return;
+        pendingDragGroup = { entries, clientX: e.clientX, clientY: e.clientY };
         dragStartX = e.clientX;
         dragStartY = e.clientY;
-        blockStartX = parseFloat(block.style.left) || 0;
-        blockStartY = parseFloat(block.style.top) || 0;
-
-        // Add global mouse move and up listeners
-        document.addEventListener("mousemove", handleMouseMove);
-        document.addEventListener("mouseup", handleMouseUp);
+        document.addEventListener("mousemove", handleCodeBlockDragMouseMove);
+        document.addEventListener("mouseup", handleCodeBlockDragMouseUp);
     });
 
     // Mobile touch events
     block.addEventListener("touchstart", (e) => {
-        // Avoid starting a drag when interacting with inputs/selects/buttons inside the block
         const t = e.target;
         const tag = (t && t.tagName) ? t.tagName.toLowerCase() : '';
         if (tag === 'select' || tag === 'input' || tag === 'button' || t.closest('select') || t.closest('button')) {
             return;
         }
+        if (codeData.type === 'value' && t.closest && t.closest('.node-output-anchor')) {
+            return;
+        }
         e.preventDefault();
-        draggedBlock = block;
-        isDragging = true;
-        block.classList.add("dragging");
-        block.style.transition = 'none';
-
+        e.stopPropagation();
+        const selectedObj = objects.find(obj => obj.id == selected_object);
+        if (!selectedObj) return;
+        syncCodeSelectionOwnership(selectedObj);
+        if (!selectedCodeBlockIds.has(codeData.id)) {
+            selectedCodeBlockIds.clear();
+            selectedCodeBlockIds.add(id);
+            applyCodeBlockSelectionClasses();
+        }
+        const layer = document.getElementById('code-zoom-layer');
+        const entries = [];
+        for (const cid of selectedCodeBlockIds) {
+            const el = layer ? layer.querySelector(`[data-code-id="${cid}"]`) : null;
+            if (!el) continue;
+            entries.push({
+                el,
+                baseX: parseFloat(el.style.left) || 0,
+                baseY: parseFloat(el.style.top) || 0
+            });
+        }
+        if (entries.length === 0) return;
         const touch = e.touches[0];
+        pendingDragGroup = { entries, clientX: touch.clientX, clientY: touch.clientY };
         dragStartX = touch.clientX;
         dragStartY = touch.clientY;
-        blockStartX = parseFloat(block.style.left) || 0;
-        blockStartY = parseFloat(block.style.top) || 0;
-
-        // Add global touch move and end listeners
-        document.addEventListener("touchmove", handleTouchMove, { passive: false });
-        document.addEventListener("touchend", handleTouchEnd);
+        document.addEventListener("touchmove", handleCodeBlockDragTouchMove, { passive: false });
+        document.addEventListener("touchend", handleCodeBlockDragTouchEnd);
     });
 
     // Start drag-to-connect when mousedown on value block output anchor
@@ -2890,6 +3917,7 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
     addItem('Point Towards (x, y)', 'point_towards');
     // Looks / appearance
     addItem('Switch Image', 'switch_image');
+    addItem('Play Sound', 'play_sound');
     addItem('Set Size', 'set_size');
     addItem('Change Size By', 'change_size');
     addItem('Set Opacity', 'set_opacity');
@@ -2990,34 +4018,31 @@ function showAddInputBlockMenu(anchorBlock, anchorCodeData, inputKey, anchorBtn,
         });
         menu.appendChild(btn);
     };
-    // Organized, consistently named inputs
-    // Operators
+    // Organized: math & data → logic → input → object → sensing
     addItem('Operation (+, -, *, /)', 'operation');
+    addItem('Variable', 'variable');
+    addItem('Random int', 'random_int');
+    addItem('Array Get Item', 'array_get');
+    addItem('Array Length', 'array_length');
     addItem('Equals', 'equals');
     addItem('Less Than', 'less_than');
-    addItem('And', 'and');
-    addItem('Or', 'or');
+    addItem('and', 'and');
+    addItem('or', 'or');
     addItem('Not', 'not');
-    // Mouse and keyboard
     addItem('Mouse X', 'mouse_x');
     addItem('Mouse Y', 'mouse_y');
     addItem('Window Width', 'window_width');
     addItem('Window Height', 'window_height');
     addItem('Mouse Down?', 'mouse_pressed');
     addItem('Key Pressed?', 'key_pressed');
-    // Object properties
     addItem('Object X', 'object_x');
     addItem('Object Y', 'object_y');
     addItem('Rotation', 'rotation');
     addItem('Size', 'size');
-    // Values
-    addItem('Variable', 'variable');
-    addItem('Array Get Item', 'array_get');
-    addItem('Array Length', 'array_length');
-    addItem('Random Integer', 'random_int');
     addItem('Image Name', 'image_name');
     addItem('Distance To (x, y)', 'distance_to');
     addItem('Pixel is RGB at (x, y)', 'pixel_is_rgb');
+    addItem('Touching', 'touching');
     // Position menu above the specific button if available; else above block
     if (customPosition) {
         // For drag-opened: we'll place via fixed positioning after creation below
@@ -3170,6 +4195,9 @@ function insertBlockAfter(selectedObj, anchorCodeData, typeKey, branch, customPo
         newBlock.val_a = '';
         // Allow input to name/id provider
         newBlock.input_a = null;
+    } else if (typeKey === 'play_sound') {
+        newBlock.val_a = '';
+        newBlock.input_a = null;
     } else if (typeKey === 'instantiate') {
         newBlock.val_a = '';
     } else if (typeKey === 'delete_instance') {
@@ -3302,6 +4330,16 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         newBlock.rgb_r = 0;
         newBlock.rgb_g = 0;
         newBlock.rgb_b = 0;
+    } else if (typeKey === 'touching') {
+        newBlock.touching_mode = 'object';
+        const instList = objects.filter(o => o.name !== 'AppController');
+        newBlock.val_a = instList[0] ? String(instList[0].id) : '';
+        newBlock.rgb_r = 0;
+        newBlock.rgb_g = 0;
+        newBlock.rgb_b = 0;
+    } else if (typeKey === 'random_int') {
+        newBlock.val_a = 0;
+        newBlock.val_b = 10;
     }
 
     // Connect anchor block's input
@@ -3327,6 +4365,9 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
         anchorCodeData.val_a = '^';
     } else if (anchorCodeData.content === 'array_get') {
         anchorCodeData.val_a = '^';
+    } else if (anchorCodeData.content === 'distance_to' || anchorCodeData.content === 'random_int') {
+        if (inputKey === 'a') anchorCodeData.val_a = '^';
+        if (inputKey === 'b') anchorCodeData.val_b = '^';
     }
 
     selectedObj.code.push(newBlock);
@@ -3353,112 +4394,6 @@ function insertInputBlockAbove(selectedObj, anchorCodeData, typeKey, inputKey, c
     // Re-render to reflect caret changes and redraw connections
     updateWorkspace();
 }
-// Global drag handlers
-function handleMouseMove(e) {
-    if (!isDragging || !draggedBlock) return;
-
-    const dx = e.clientX - dragStartX;
-    const dy = e.clientY - dragStartY;
-    const z = codeZoom || 1;
-
-    const newX = blockStartX + dx / z;
-    const newY = blockStartY + dy / z;
-
-    draggedBlock.style.left = `${newX}px`;
-    draggedBlock.style.top = `${newY}px`;
-    autoScrollIfNearEdge(e.clientX, e.clientY);
-    drawConnections();
-}
-
-function handleMouseUp(e) {
-    if (!isDragging || !draggedBlock) return;
-
-    const dx = e.clientX - dragStartX;
-    const dy = e.clientY - dragStartY;
-    const z = codeZoom || 1;
-
-    const finalX = blockStartX + dx / z;
-    const finalY = blockStartY + dy / z;
-
-    draggedBlock.style.left = `${finalX}px`;
-    draggedBlock.style.top = `${finalY}px`;
-
-    // Update the code data position
-    const codeId = draggedBlock.dataset.codeId;
-    const selectedObj = objects.find(obj => obj.id == selected_object);
-    const codeData = selectedObj.code.find(code => code.id == codeId);
-    codeData.position = { x: finalX, y: finalY };
-
-    // Clean up
-    draggedBlock.classList.remove("dragging");
-    draggedBlock.style.transition = 'transform 0.1s ease-out';
-    draggedBlock = null;
-    isDragging = false;
-
-    // Remove global listeners
-    document.removeEventListener("mousemove", handleMouseMove);
-    document.removeEventListener("mouseup", handleMouseUp);
-
-    drawConnections();
-    updateSpacerFromBlocks();
-}
-
-function handleTouchMove(e) {
-    if (!isDragging || !draggedBlock) return;
-    e.preventDefault();
-
-    const touch = e.touches[0];
-    const dx = touch.clientX - dragStartX;
-    const dy = touch.clientY - dragStartY;
-    const z = codeZoom || 1;
-
-    const newX = blockStartX + dx / z;
-    const newY = blockStartY + dy / z;
-
-    draggedBlock.style.left = `${newX}px`;
-    draggedBlock.style.top = `${newY}px`;
-    autoScrollIfNearEdge(touch.clientX, touch.clientY);
-    drawConnections();
-}
-
-function handleTouchEnd(e) {
-    if (!isDragging || !draggedBlock) return;
-
-    let finalX = blockStartX;
-    let finalY = blockStartY;
-
-    if (e.changedTouches && e.changedTouches.length > 0) {
-        const touch = e.changedTouches[0];
-        const dx = touch.clientX - dragStartX;
-        const dy = touch.clientY - dragStartY;
-        const z = codeZoom || 1;
-        finalX = blockStartX + dx / z;
-        finalY = blockStartY + dy / z;
-    }
-
-    draggedBlock.style.left = `${finalX}px`;
-    draggedBlock.style.top = `${finalY}px`;
-
-    // Update the code data position
-    const codeId = draggedBlock.dataset.codeId;
-    const selectedObj = objects.find(obj => obj.id == selected_object);
-    const codeData = selectedObj.code.find(code => code.id == codeId);
-    codeData.position = { x: finalX, y: finalY };
-
-    // Clean up
-    draggedBlock.classList.remove("dragging");
-    draggedBlock.style.transition = 'transform 0.1s ease-out';
-    draggedBlock = null;
-    isDragging = false;
-
-    // Remove global listeners
-    document.removeEventListener("touchmove", handleTouchMove);
-    document.removeEventListener("touchend", handleTouchEnd);
-
-    drawConnections();
-    updateSpacerFromBlocks();
-}
-
 // Canvas lives inside #code-zoom-layer (same scroll + transform as blocks) so wires stay aligned when panning.
 const connectionCanvas = document.createElement("canvas");
 connectionCanvas.style.position = "absolute";
@@ -3494,7 +4429,8 @@ function setCodeZoom(z) {
     drawConnections();
 }
 
-function setCodeZoomBtnIcon(btn, iconNameOrNames, fallbackText) {
+function setCodeZoomBtnIcon(btn, iconNameOrNames, fallbackText, iconSizePx) {
+    const size = iconSizePx != null ? iconSizePx : 18;
     const names = Array.isArray(iconNameOrNames) ? iconNameOrNames : [iconNameOrNames];
     const primary = names[0];
     const lucide = window.lucide;
@@ -3503,7 +4439,7 @@ function setCodeZoomBtnIcon(btn, iconNameOrNames, fallbackText) {
         const found = names.find(n => lucide.icons && lucide.icons[n]);
         const iconDef = found ? lucide.icons[found] : null;
         if (iconDef && typeof iconDef.toSvg === 'function') {
-            btn.innerHTML = `${iconDef.toSvg({ width: 18, height: 18 })}<span class="icon-fallback">${safeFallback}</span>`;
+            btn.innerHTML = `${iconDef.toSvg({ width: size, height: size })}<span class="icon-fallback">${safeFallback}</span>`;
             return;
         }
     }
@@ -3512,6 +4448,12 @@ function setCodeZoomBtnIcon(btn, iconNameOrNames, fallbackText) {
         return;
     }
     btn.textContent = safeFallback;
+}
+
+/** Top bar play/stop — Lucide `play` when idle, `square` while running (CSS fills the rect for a solid stop). */
+function setPlayStopButtonIcon(btn, playing) {
+    setCodeZoomBtnIcon(btn, playing ? ['square'] : ['play'], playing ? '■' : '▶', 16);
+    try { window.lucide && window.lucide.createIcons && window.lucide.createIcons(); } catch (_) {}
 }
 
 /**
@@ -3578,6 +4520,16 @@ function autoScrollIfNearEdge(clientX, clientY) {
         autoScrollRAF = requestAnimationFrame(step);
     }
     if (dx === 0 && dy === 0 && autoScrollRAF != null) {
+        cancelAnimationFrame(autoScrollRAF);
+        autoScrollRAF = null;
+    }
+}
+
+/** Stops edge auto-scroll when a drag/marquee/connect ends; otherwise RAF keeps applying the last dx/dy. */
+function stopCodeViewportAutoScroll() {
+    autoScrollTarget.dx = 0;
+    autoScrollTarget.dy = 0;
+    if (autoScrollRAF != null) {
         cancelAnimationFrame(autoScrollRAF);
         autoScrollRAF = null;
     }
@@ -4104,6 +5056,7 @@ function handleConnectMouseUp(e) {
 
 function cleanupDragState() {
     console.log('cleanupDragState called');
+    stopCodeViewportAutoScroll();
     isConnecting = false;
     connectStartTime = 0;
     connectFromBlockId = null;
@@ -4189,8 +5142,8 @@ function drawConnections() {
         const rectB = plusB ? getLayerLocalRect(layer, plusB, lrCached, scale) : null;
         const startX_A = rectA ? rectA.cx : st.left + st.width * 0.45;
         const startX_B = rectB ? rectB.cx : st.left + st.width * 0.55;
-        const startY_A = rectA ? rectA.bottom : st.top + st.height;
-        const startY_B = rectB ? rectB.bottom : st.top + st.height;
+        const startY_A = rectA ? rectA.cy : st.top + st.height;
+        const startY_B = rectB ? rectB.cy : st.top + st.height;
 
         const drawArrow = (targetId, color, useB) => {
             if (targetId === null || typeof targetId === 'undefined') return;
@@ -4217,7 +5170,7 @@ function drawConnections() {
         const getInputStart = (btnEl) => {
             if (!btnEl) return null;
             const r = getLayerLocalRect(layer, btnEl, lrCached, scale);
-            return { x: r.cx, y: r.top };
+            return { x: r.cx, y: r.cy };
         };
         const drawInputArrow = (targetId, btnEl, color) => {
             if (targetId === null || typeof targetId === 'undefined' || !btnEl) return;
@@ -4287,7 +5240,7 @@ function drawConnections() {
                 if (btnEl) {
                     const br = getLayerLocalRect(layer, btnEl, lrCached, scale);
                     const sx = br.cx;
-                    const sy = br.bottom;
+                    const sy = br.cy;
                     connectionCtx.beginPath();
                     connectionCtx.moveTo(sx, sy);
                     const p = contentToViewport(scrollHost, connectMouse);
@@ -4327,6 +5280,261 @@ function setLastSelectedImageForObject(objectId, imagePath) {
 const deletedImagesMap = {};
 // Per-object image lists stored in-memory: { [objectId]: Array<{ id, name, src }> }
 const objectImages = {};
+
+// Per-object sound clips: { [objectId]: Array<{ id, name, src }> }
+const objectSounds = {};
+const deletedSoundsMap = {};
+let selectedSoundSrc = null;
+let currentSoundFilename = null;
+let currentSoundInfo = null;
+let soundRevision = 0;
+let soundTabAudio = null;
+/** Set while Sound tab UI is mounted; used by global `selectSound`. */
+let soundSelectionHandler = null;
+
+function lastSelectedSoundKeyForObject(objectId) {
+    return `lastSelectedSound:${String(objectId)}`;
+}
+function getLastSelectedSoundForObject(objectId) {
+    try { return localStorage.getItem(lastSelectedSoundKeyForObject(objectId)) || ''; } catch (_) { return ''; }
+}
+function setLastSelectedSoundForObject(objectId, soundPath) {
+    try {
+        const k = lastSelectedSoundKeyForObject(objectId);
+        if (soundPath) localStorage.setItem(k, soundPath);
+        else localStorage.removeItem(k);
+    } catch (_) {}
+}
+
+/** HTTP(S) cache-bust only — never append ? to data:/blob: URLs (breaks Audio + fetch). */
+function soundSrcForPlayback(src) {
+    if (!src || typeof src !== 'string') return src;
+    if (src.startsWith('data:') || src.startsWith('blob:')) return src;
+    if (src.indexOf('?') >= 0) return src;
+    return `${src}?r=${soundRevision}`;
+}
+
+function uint8ToBase64(bytes) {
+    let binary = '';
+    const len = bytes.byteLength;
+    const chunk = 0x8000;
+    for (let i = 0; i < len; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, len)));
+    }
+    return btoa(binary);
+}
+
+/** Short silent WAV (PCM) as a data URL — default clip for new objects. */
+function generateSilentWavDataUrl(durationSec = 0.2) {
+    const sampleRate = 44100;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const numSamples = Math.max(1, Math.floor(sampleRate * durationSec));
+    const blockAlign = numChannels * bitsPerSample / 8;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = numSamples * blockAlign;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const v = new DataView(buffer);
+    const writeStr = (off, s) => {
+        for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+    };
+    writeStr(0, 'RIFF');
+    v.setUint32(4, 36 + dataSize, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);
+    v.setUint16(22, numChannels, true);
+    v.setUint32(24, sampleRate, true);
+    v.setUint32(28, byteRate, true);
+    v.setUint16(32, blockAlign, true);
+    v.setUint16(34, bitsPerSample, true);
+    writeStr(36, 'data');
+    v.setUint32(40, dataSize, true);
+    const bytes = new Uint8Array(buffer);
+    return `data:audio/wav;base64,${uint8ToBase64(bytes)}`;
+}
+
+/** Encode any decoded AudioBuffer as 16-bit PCM WAV data URL (for trim/crop export). */
+function encodeAudioBufferToWavDataUrl(audioBuffer) {
+    const numCh = audioBuffer.numberOfChannels;
+    const sr = audioBuffer.sampleRate;
+    const len = audioBuffer.length;
+    const bitsPerSample = 16;
+    const blockAlign = numCh * (bitsPerSample / 8);
+    const byteRate = sr * blockAlign;
+    const dataSize = len * blockAlign;
+    const buf = new ArrayBuffer(44 + dataSize);
+    const v = new DataView(buf);
+    const writeStr = (off, s) => {
+        for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+    };
+    writeStr(0, 'RIFF');
+    v.setUint32(4, 36 + dataSize, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);
+    v.setUint16(22, numCh, true);
+    v.setUint32(24, sr, true);
+    v.setUint32(28, byteRate, true);
+    v.setUint16(32, blockAlign, true);
+    v.setUint16(34, bitsPerSample, true);
+    writeStr(36, 'data');
+    v.setUint32(40, dataSize, true);
+    let o = 44;
+    for (let i = 0; i < len; i++) {
+        for (let c = 0; c < numCh; c++) {
+            const s = Math.max(-1, Math.min(1, audioBuffer.getChannelData(c)[i]));
+            const int16 = Math.round(s < 0 ? s * 0x8000 : s * 0x7fff);
+            v.setInt16(o, int16, true);
+            o += 2;
+        }
+    }
+    return `data:audio/wav;base64,${uint8ToBase64(new Uint8Array(buf))}`;
+}
+
+async function cropSoundSrcToWavDataUrl(src, startSec, endSec) {
+    const ctx = getSoundAudioContext();
+    if (!ctx) throw new Error('AudioContext unavailable');
+    try {
+        await ctx.resume();
+    } catch (_) {}
+    let ab;
+    if (typeof src === 'string' && (src.startsWith('data:') || src.startsWith('blob:'))) {
+        ab = await (await fetch(src)).arrayBuffer();
+    } else {
+        const bust = typeof src === 'string' && src.indexOf('?') >= 0 ? src : `${src}?r=${soundRevision}`;
+        const res = await fetch(bust, { credentials: 'same-origin' });
+        ab = await res.arrayBuffer();
+    }
+    const decoded = await ctx.decodeAudioData(ab.slice(0));
+    const dur = decoded.duration;
+    const t0 = Math.max(0, Math.min(startSec, dur));
+    const t1 = Math.max(t0 + 1 / decoded.sampleRate, Math.min(endSec, dur));
+    const sr = decoded.sampleRate;
+    const ch = decoded.numberOfChannels;
+    const i0 = Math.floor(t0 * sr);
+    const i1 = Math.floor(t1 * sr);
+    const newLen = Math.max(1, i1 - i0);
+    const out = ctx.createBuffer(ch, newLen, sr);
+    for (let c = 0; c < ch; c++) {
+        out.getChannelData(c).set(decoded.getChannelData(c).subarray(i0, i1));
+    }
+    return encodeAudioBufferToWavDataUrl(out);
+}
+
+/** Remove the time range [startSec, endSec] and concatenate head + tail into one clip. */
+async function cutSoundRemoveMiddleToWavDataUrl(src, startSec, endSec) {
+    const ctx = getSoundAudioContext();
+    if (!ctx) throw new Error('AudioContext unavailable');
+    try {
+        await ctx.resume();
+    } catch (_) {}
+    let ab;
+    if (typeof src === 'string' && (src.startsWith('data:') || src.startsWith('blob:'))) {
+        ab = await (await fetch(src)).arrayBuffer();
+    } else {
+        const bust = typeof src === 'string' && src.indexOf('?') >= 0 ? src : `${src}?r=${soundRevision}`;
+        const res = await fetch(bust, { credentials: 'same-origin' });
+        ab = await res.arrayBuffer();
+    }
+    const decoded = await ctx.decodeAudioData(ab.slice(0));
+    const dur = decoded.duration;
+    const sr = decoded.sampleRate;
+    const ch = decoded.numberOfChannels;
+    const t0 = Math.max(0, Math.min(startSec, dur));
+    const t1 = Math.max(t0 + 1 / decoded.sampleRate, Math.min(endSec, dur));
+    const i0 = Math.floor(t0 * sr);
+    const i1 = Math.floor(t1 * sr);
+    const iDur = decoded.length;
+    const lenA = Math.max(0, i0);
+    const lenB = Math.max(0, iDur - i1);
+    const newLen = lenA + lenB;
+    if (newLen < 1) throw new Error('Nothing left after cut');
+    const out = ctx.createBuffer(ch, newLen, sr);
+    for (let c = 0; c < ch; c++) {
+        const srcCh = decoded.getChannelData(c);
+        const dstCh = out.getChannelData(c);
+        if (lenA > 0) dstCh.set(srcCh.subarray(0, lenA), 0);
+        if (lenB > 0) dstCh.set(srcCh.subarray(i1), lenA);
+    }
+    return encodeAudioBufferToWavDataUrl(out);
+}
+
+function getNextSoundNumber() {
+    const key = String(selected_object);
+    if (!objectSounds[key]) objectSounds[key] = [];
+    const existingNumbers = new Set();
+    objectSounds[key].forEach((s) => {
+        const match = String(s.name).match(/^sound-(\d+)/);
+        if (match) existingNumbers.add(parseInt(match[1], 10));
+    });
+    let num = 1;
+    while (existingNumbers.has(num)) num++;
+    return num;
+}
+
+function soundFilenameForNum(num, ext) {
+    const e = (ext && /^\.?[a-z0-9]+$/i.test(ext.replace(/^\./, '')))
+        ? (ext.startsWith('.') ? ext : `.${ext}`)
+        : '.wav';
+    return `sound-${num}${e}`;
+}
+
+function syncMediaSoundEntry(obj, src) {
+    if (!obj || !src) return;
+    if (!obj.media) obj.media = [];
+    const idx = obj.media.findIndex((m) => m && m.type === 'sound');
+    if (idx >= 0) obj.media[idx].path = src;
+    else obj.media.push({ id: Date.now(), name: 'sound', type: 'sound', path: src });
+}
+
+function ensureDefaultSoundForObject(obj) {
+    const key = String(obj.id);
+    if (!objectSounds[key]) objectSounds[key] = [];
+    if (objectSounds[key].length === 0) {
+        if ((deletedSoundsMap[key] || []).length > 0) return;
+        const silent = generateSilentWavDataUrl();
+        const row = { id: Date.now(), name: 'sound-1.wav', src: silent };
+        objectSounds[key].push(row);
+        syncMediaSoundEntry(obj, silent);
+    }
+}
+
+function initializeDefaultSounds() {
+    objects.forEach((o) => ensureDefaultSoundForObject(o));
+}
+
+function getCurrentObjectSounds() {
+    const key = String(selected_object);
+    if (!objectSounds[key]) objectSounds[key] = [];
+    if (objectSounds[key].length === 0) {
+        const obj = objects.find((o) => o.id == selected_object);
+        if (obj) ensureDefaultSoundForObject(obj);
+    }
+    return objectSounds[key];
+}
+
+function stopSoundTabPlayback() {
+    if (soundTabAudio) {
+        try {
+            soundTabAudio.pause();
+            soundTabAudio.removeAttribute('src');
+            soundTabAudio.load();
+        } catch (_) {}
+        soundTabAudio = null;
+    }
+}
+
+let __soundAudioContext = null;
+function getSoundAudioContext() {
+    if (!__soundAudioContext) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) __soundAudioContext = new AC();
+    }
+    return __soundAudioContext;
+}
 
 function generateBlankImageDataUrl(width = 128, height = 128) {
     const c = document.createElement('canvas');
@@ -4402,8 +5610,10 @@ function reorderImages(draggedImageName, targetImageName) {
     // Remove dragged image from array
     const [draggedImage] = images.splice(draggedIndex, 1);
 
-    // Insert dragged image at target position
-    images.splice(targetIndex, 0, draggedImage);
+    // Insert at target slot (indices shift after removal when dragging downward)
+    let insertAt = targetIndex;
+    if (draggedIndex < targetIndex) insertAt = targetIndex - 1;
+    images.splice(insertAt, 0, draggedImage);
 
     // Refresh the thumbnail display
     const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
@@ -4483,6 +5693,17 @@ function showImageAssetSaveMenu(clientX, clientY, imgInfo) {
     menu.id = '__image_asset_ctx_menu';
     menu.setAttribute('role', 'menu');
     menu.className = 'ctx-menu';
+    const dupBtn = document.createElement('button');
+    dupBtn.type = 'button';
+    dupBtn.textContent = 'Duplicate';
+    dupBtn.setAttribute('role', 'menuitem');
+    dupBtn.className = 'ctx-menu-item';
+    dupBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        removeImageAssetContextMenu();
+        duplicateObjectImage(imgInfo).catch((e) => console.warn('Duplicate image failed', e));
+    });
+    menu.appendChild(dupBtn);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = 'Save image';
@@ -4513,6 +5734,8 @@ function updateWorkspace() {
     const prevScrollLeft = scrollHostBefore ? scrollHostBefore.scrollLeft : 0;
     const prevScrollTop = scrollHostBefore ? scrollHostBefore.scrollTop : 0;
 
+    stopSoundTabPlayback();
+    soundSelectionHandler = null;
     nodeWindow.innerHTML = '';
 
     if (activeTab === 'code') {
@@ -4535,6 +5758,9 @@ function updateWorkspace() {
         const selectedObj = objects.find(obj => obj.id == selected_object);
         if (!selectedObj) return;
 
+        syncCodeSelectionOwnership(selectedObj);
+        zoomLayer.addEventListener('mousedown', onCodeZoomLayerMouseDown);
+
         selectedObj.code.forEach(codeData => {
             const block = createNodeBlock(
                 codeData,
@@ -4543,6 +5769,7 @@ function updateWorkspace() {
             );
             zoomLayer.appendChild(block);
         });
+        applyCodeBlockSelectionClasses();
 
         codeViewport.appendChild(sizer);
 
@@ -4576,6 +5803,10 @@ function updateWorkspace() {
         if (imageEditor) {
             setTimeout(() => imageEditor.drawCrosshair && imageEditor.drawCrosshair(), 100);
         }
+    } else if (activeTab === 'sound') {
+        nodeWindow.classList.remove('code-tab-active');
+        nodeWindow.style.overflow = '';
+        createSoundInterface(nodeWindow);
     } else {
         nodeWindow.classList.remove('code-tab-active');
         nodeWindow.style.overflow = '';
@@ -4634,7 +5865,7 @@ function createImagesInterface(container) {
 
     const toolNames = [
         { id: 'brush', icon: ['brush', 'paintbrush'], fallback: 'B', title: 'Brush' },
-        { id: 'rect', icon: ['square', 'square-dashed'], fallback: '▭', title: 'Rectangle' },
+        { id: 'rect', icon: ['square'], fallback: '▭', title: 'Rectangle' },
         { id: 'circle', icon: ['circle'], fallback: '◯', title: 'Circle' },
         { id: 'bucket', icon: ['paint-bucket', 'bucket'], fallback: 'F', title: 'Fill (Bucket)' },
         {
@@ -4653,7 +5884,7 @@ function createImagesInterface(container) {
         if (rectBtn) {
             rectBtn.classList.toggle('shape-fill', fill);
             rectBtn.classList.toggle('shape-outline', !fill);
-            setIcon(rectBtn, fill ? ['square'] : ['square-dashed', 'square'], '▭');
+            setIcon(rectBtn, ['square'], '▭');
             rectBtn.title = fill
                 ? 'Rectangle (filled) — click again for outline'
                 : 'Rectangle (outline) — click again for fill';
@@ -5347,12 +6578,12 @@ function createImagesInterface(container) {
 
     // Undo / Redo
     const undoBtn = document.createElement('button');
-    setIcon(undoBtn, ['undo-2', 'undo2', 'undo'], '↩');
+    setIcon(undoBtn, ['undo', 'undo-2', 'undo2'], '↩');
     undoBtn.className = 'image-edit-tool';
     undoBtn.title = 'Undo';
     undoBtn.addEventListener('click', () => imageEditor && imageEditor.undo());
     const redoBtn = document.createElement('button');
-    setIcon(redoBtn, ['redo-2', 'redo2', 'redo'], '↪');
+    setIcon(redoBtn, ['redo', 'redo-2', 'redo2'], '↪');
     redoBtn.className = 'image-edit-tool';
     redoBtn.title = 'Redo';
     redoBtn.addEventListener('click', () => imageEditor && imageEditor.redo());
@@ -5470,6 +6701,156 @@ function createImagesInterface(container) {
     const previewContainer = document.createElement('div');
     previewContainer.className = 'image-preview-container';
 
+    // Canvas size: fixed top-right of preview (outside pan/zoom drawing area)
+    const dimW = document.createElement('input');
+    dimW.type = 'number';
+    dimW.min = '1';
+    dimW.max = '4096';
+    dimW.id = '__image_canvas_resize_w';
+    dimW.className = 'image-value-input image-canvas-resize-input';
+    dimW.title = 'Canvas width (pixels)';
+    dimW.setAttribute('aria-label', 'Canvas width');
+    const dimSep = document.createElement('span');
+    dimSep.className = 'image-canvas-resize-sep';
+    dimSep.textContent = '\u00d7';
+    dimSep.setAttribute('aria-hidden', 'true');
+    const dimH = document.createElement('input');
+    dimH.type = 'number';
+    dimH.min = '1';
+    dimH.max = '4096';
+    dimH.id = '__image_canvas_resize_h';
+    dimH.className = 'image-value-input image-canvas-resize-input';
+    dimH.title = 'Canvas height (pixels)';
+    dimH.setAttribute('aria-label', 'Canvas height');
+
+    function syncCanvasDimensionsUI() {
+        if (!imageEditor || typeof imageEditor.getCanvasSize !== 'function') return;
+        const sz = imageEditor.getCanvasSize();
+        dimW.value = String(sz.width);
+        dimH.value = String(sz.height);
+    }
+    function applyCanvasDimensionsFromUI() {
+        if (!imageEditor || typeof imageEditor.setCanvasSize !== 'function') return;
+        const w = parseInt(dimW.value, 10);
+        const h = parseInt(dimH.value, 10);
+        if (!Number.isFinite(w) || !Number.isFinite(h)) {
+            syncCanvasDimensionsUI();
+            return;
+        }
+        imageEditor.setCanvasSize(w, h);
+    }
+    dimW.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            applyCanvasDimensionsFromUI();
+            dimW.blur();
+        }
+    });
+    dimH.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            applyCanvasDimensionsFromUI();
+            dimH.blur();
+        }
+    });
+
+    const resizeFlyout = document.createElement('div');
+    resizeFlyout.className = 'image-canvas-resize-flyout';
+
+    const resizeToggleBtn = document.createElement('button');
+    resizeToggleBtn.type = 'button';
+    resizeToggleBtn.className = 'image-canvas-resize-toggle';
+    resizeToggleBtn.title = 'Canvas size (px)';
+    resizeToggleBtn.setAttribute('aria-label', 'Canvas size — width and height in pixels');
+    resizeToggleBtn.setAttribute('aria-expanded', 'false');
+    resizeToggleBtn.setAttribute('aria-controls', '__image_canvas_resize_panel');
+    const resizeToggleIcon = document.createElement('span');
+    resizeToggleIcon.className = 'image-canvas-resize-toggle-icon';
+    setIcon(resizeToggleIcon, ['maximize-2', 'expand'], '⛶');
+    resizeToggleBtn.appendChild(resizeToggleIcon);
+
+    const resizeBody = document.createElement('div');
+    resizeBody.className = 'image-canvas-resize-body';
+    resizeBody.id = '__image_canvas_resize_panel';
+    resizeBody.hidden = true;
+    resizeBody.setAttribute('role', 'region');
+    resizeBody.setAttribute('aria-label', 'Canvas dimensions');
+
+    const resizeFieldsRow = document.createElement('div');
+    resizeFieldsRow.className = 'image-canvas-resize-fields';
+
+    const lblW = document.createElement('label');
+    lblW.className = 'image-canvas-resize-field-label';
+    lblW.htmlFor = dimW.id;
+    lblW.textContent = 'Width';
+    const lblMid = document.createElement('span');
+    lblMid.className = 'image-canvas-resize-label-spacer';
+    lblMid.setAttribute('aria-hidden', 'true');
+    const lblH = document.createElement('label');
+    lblH.className = 'image-canvas-resize-field-label';
+    lblH.htmlFor = dimH.id;
+    lblH.textContent = 'Height';
+
+    resizeFieldsRow.appendChild(lblW);
+    resizeFieldsRow.appendChild(lblMid);
+    resizeFieldsRow.appendChild(lblH);
+    resizeFieldsRow.appendChild(dimW);
+    resizeFieldsRow.appendChild(dimSep);
+    resizeFieldsRow.appendChild(dimH);
+
+    const resizeFooter = document.createElement('div');
+    resizeFooter.className = 'image-canvas-resize-footer';
+    const resizeApplyBtn = document.createElement('button');
+    resizeApplyBtn.type = 'button';
+    resizeApplyBtn.className = 'image-canvas-resize-apply';
+    resizeApplyBtn.textContent = 'Apply';
+    resizeApplyBtn.title = 'Apply size';
+    resizeApplyBtn.setAttribute('aria-label', 'Apply canvas size');
+    resizeApplyBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        applyCanvasDimensionsFromUI();
+    });
+    resizeFooter.appendChild(resizeApplyBtn);
+
+    resizeBody.appendChild(resizeFieldsRow);
+    resizeBody.appendChild(resizeFooter);
+    resizeFlyout.appendChild(resizeToggleBtn);
+    resizeFlyout.appendChild(resizeBody);
+
+    function setResizePanelOpen(open) {
+        resizeFlyout.classList.toggle('image-canvas-resize-flyout--open', open);
+        resizeBody.hidden = !open;
+        resizeToggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) {
+            syncCanvasDimensionsUI();
+            requestAnimationFrame(() => {
+                try { dimW.focus(); dimW.select(); } catch (_) {}
+            });
+        } else {
+            syncCanvasDimensionsUI();
+        }
+    }
+
+    resizeToggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setResizePanelOpen(!resizeFlyout.classList.contains('image-canvas-resize-flyout--open'));
+    });
+
+    document.addEventListener(
+        'pointerdown',
+        (e) => {
+            if (activeTab !== 'images') return;
+            if (!resizeFlyout.classList.contains('image-canvas-resize-flyout--open')) return;
+            if (resizeFlyout.contains(e.target)) return;
+            setResizePanelOpen(false);
+        },
+        true
+    );
+
+    ['pointerdown', 'wheel', 'dblclick', 'contextmenu'].forEach((evt) => {
+        resizeFlyout.addEventListener(evt, (e) => e.stopPropagation(), { passive: evt === 'wheel' });
+    });
+
     // Zoom controls — same strip builder as code tab (identical icons + DOM)
     const { wrap: zoomControls, zoomOutBtn, zoomResetBtn, zoomInBtn } = createZoomControlStrip({
         onZoomOut: () => zoomImage(0.8),
@@ -5488,9 +6869,12 @@ function createImagesInterface(container) {
     editorCanvas.width = 720;
     editorCanvas.height = 720;
     editorCanvas.className = 'image-editor-surface';
+    editorCanvas.tabIndex = -1;
+    editorCanvas.setAttribute('aria-label', 'Image editor');
     canvasWrapper.appendChild(viewTransformHost);
     viewTransformHost.appendChild(checker);
     viewTransformHost.appendChild(editorCanvas);
+    viewTransformHost.appendChild(resizeFlyout);
 
     previewContainer.appendChild(canvasWrapper);
     previewContainer.appendChild(zoomControls);
@@ -5512,7 +6896,9 @@ function createImagesInterface(container) {
         viewTransformHost,
         previewContainer,
         setDefaultUI: () => {},
+        onCanvasSizeChange: syncCanvasDimensionsUI,
     });
+    syncCanvasDimensionsUI();
 
     // Defaults for toolbar state
     toolButtons.brush && toolButtons.brush.classList.add('active');
@@ -5540,6 +6926,1268 @@ function createImagesInterface(container) {
     }, 50);
 }
 
+function computePeaksFromBuffer(audioBuffer, width) {
+    const ch0 = audioBuffer.getChannelData(0);
+    const ch1 = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : null;
+    const len = ch0.length;
+    const peaks = new Float32Array(width);
+    const block = Math.max(1, Math.floor(len / width));
+    for (let i = 0; i < width; i++) {
+        const start = i * block;
+        const end = Math.min(start + block, len);
+        let m = 0;
+        for (let j = start; j < end; j++) {
+            const v = ch1 ? (Math.abs(ch0[j]) + Math.abs(ch1[j])) * 0.5 : Math.abs(ch0[j]);
+            m = Math.max(m, v);
+        }
+        peaks[i] = m;
+    }
+    return peaks;
+}
+
+function drawWaveformPeaks(canvas, peaks, progress01, trimOpt) {
+    const ctx = canvas.getContext('2d');
+    if (!ctx || !peaks || !peaks.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    let cssW = Math.max(1, rect.width);
+    let cssH = Math.max(1, rect.height);
+    if (cssW <= 1 && canvas.parentElement) {
+        const pr = canvas.parentElement.getBoundingClientRect();
+        cssW = Math.max(1, pr.width);
+    }
+    if (cssH <= 1 && canvas.parentElement) {
+        const pr = canvas.parentElement.getBoundingClientRect();
+        cssH = Math.max(120, pr.height);
+    }
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const w = cssW;
+    const h = cssH;
+    const mid = h / 2;
+    const n = peaks.length;
+    const step = w / n;
+    const prog = Math.max(0, Math.min(1, progress01 || 0));
+    const splitX = w * prog;
+
+    ctx.clearRect(0, 0, w, h);
+    const bg = ctx.createLinearGradient(0, 0, w, h);
+    bg.addColorStop(0, 'rgba(0,0,0,0.45)');
+    bg.addColorStop(1, 'rgba(0,0,0,0.22)');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.beginPath();
+    ctx.moveTo(0, mid);
+    for (let i = 0; i < n; i++) {
+        const amp = peaks[i] * (h * 0.42);
+        const x = i * step + step * 0.5;
+        ctx.lineTo(x, mid - amp);
+    }
+    for (let i = n - 1; i >= 0; i--) {
+        const amp = peaks[i] * (h * 0.42);
+        const x = i * step + step * 0.5;
+        ctx.lineTo(x, mid + amp);
+    }
+    ctx.closePath();
+    const wf = ctx.createLinearGradient(0, 0, w, 0);
+    wf.addColorStop(0, 'rgba(0, 255, 204, 0.28)');
+    wf.addColorStop(1, 'rgba(0, 255, 204, 0.12)');
+    ctx.fillStyle = wf;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0, 255, 204, 0.75)';
+    ctx.lineWidth = 1.35;
+    ctx.stroke();
+
+    let trimA = 0;
+    let trimB = 1;
+    if (trimOpt && typeof trimOpt.start01 === 'number' && typeof trimOpt.end01 === 'number') {
+        trimA = Math.max(0, Math.min(1, trimOpt.start01));
+        trimB = Math.max(trimA, Math.min(1, trimOpt.end01));
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.fillRect(0, 0, w * trimA, h);
+        ctx.fillRect(w * trimB, 0, w * (1 - trimB), h);
+        ctx.strokeStyle = 'rgba(255, 200, 90, 0.95)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(w * trimA, 0);
+        ctx.lineTo(w * trimA, h);
+        ctx.moveTo(w * trimB, 0);
+        ctx.lineTo(w * trimB, h);
+        ctx.stroke();
+    }
+
+    if (prog < 1) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+        ctx.fillRect(splitX, 0, w - splitX, h);
+    }
+
+    ctx.strokeStyle = 'rgba(0, 255, 204, 0.55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(splitX, 0);
+    ctx.lineTo(splitX, h);
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, mid);
+    ctx.lineTo(w, mid);
+    ctx.stroke();
+}
+
+function drawMiniWaveform(canvas, peaks) {
+    const ctx = canvas.getContext('2d');
+    if (!ctx || !peaks || !peaks.length) return;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, w, h);
+    const mid = h / 2;
+    const n = peaks.length;
+    const step = w / n;
+    ctx.beginPath();
+    ctx.moveTo(0, mid);
+    for (let i = 0; i < n; i++) {
+        const amp = peaks[i] * (h * 0.4);
+        const x = i * step + step * 0.5;
+        ctx.lineTo(x, mid - amp);
+    }
+    for (let i = n - 1; i >= 0; i--) {
+        const amp = peaks[i] * (h * 0.4);
+        const x = i * step + step * 0.5;
+        ctx.lineTo(x, mid + amp);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0, 255, 204, 0.22)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0, 255, 204, 0.75)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+}
+
+async function fetchDecodePeaks(src, peakWidth) {
+    const ctx = getSoundAudioContext();
+    if (!ctx) return null;
+    try {
+        await ctx.resume();
+    } catch (_) {}
+    try {
+        let ab;
+        if (typeof src === 'string' && (src.startsWith('data:') || src.startsWith('blob:'))) {
+            const res = await fetch(src);
+            ab = await res.arrayBuffer();
+        } else {
+            const bust = src.indexOf('?') >= 0 ? src : `${src}?r=${soundRevision}`;
+            const res = await fetch(bust, { credentials: 'same-origin' });
+            ab = await res.arrayBuffer();
+        }
+        const buf = await ctx.decodeAudioData(ab.slice(0));
+        return computePeaksFromBuffer(buf, peakWidth);
+    } catch (e) {
+        console.warn('decode peaks failed', e);
+        return null;
+    }
+}
+
+function createSoundInterface(container) {
+    const root = document.createElement('div');
+    root.className = 'sounds-container';
+
+    const editingPanel = document.createElement('div');
+    editingPanel.className = 'sound-editing-panel';
+
+    function setIcon(el, iconNameOrNames, fallbackText) {
+        const names = Array.isArray(iconNameOrNames) ? iconNameOrNames : [iconNameOrNames];
+        const primary = names[0];
+        const lucide = window.lucide;
+        const safeFallback = fallbackText == null ? '' : String(fallbackText);
+        if (lucide && lucide.icons) {
+            const found = names.find((n) => lucide.icons && lucide.icons[n]);
+            const iconDef = found ? lucide.icons[found] : null;
+            if (iconDef && typeof iconDef.toSvg === 'function') {
+                el.innerHTML = `${iconDef.toSvg({ width: 18, height: 18 })}<span class="icon-fallback">${safeFallback}</span>`;
+                return;
+            }
+        }
+        if (lucide && typeof lucide.createIcons === 'function') {
+            el.innerHTML = `<i data-lucide="${primary}"></i><span class="icon-fallback">${safeFallback}</span>`;
+            return;
+        }
+        el.textContent = safeFallback;
+    }
+    function refreshLucideIcons() {
+        try {
+            window.lucide && window.lucide.createIcons && window.lucide.createIcons();
+        } catch (_) {}
+    }
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'sounds-toolbar';
+
+    const cropToolBtn = document.createElement('button');
+    cropToolBtn.type = 'button';
+    cropToolBtn.className = 'sound-tool-btn';
+    cropToolBtn.title = 'Trim — drag the end handles, then Crop or Cut';
+    cropToolBtn.setAttribute('aria-pressed', 'false');
+    cropToolBtn.setAttribute('aria-label', 'Trim clip');
+    setIcon(cropToolBtn, ['square-dashed-mouse-pointer', 'crop'], '▭');
+    toolbar.appendChild(cropToolBtn);
+
+    const playBtn = document.createElement('button');
+    playBtn.type = 'button';
+    playBtn.className = 'sound-tool-btn sound-tool-btn--play';
+    playBtn.title = 'Play / Pause';
+    setIcon(playBtn, ['play', 'circle-play'], '▶');
+    toolbar.appendChild(playBtn);
+
+    const stopBtn = document.createElement('button');
+    stopBtn.type = 'button';
+    stopBtn.className = 'sound-tool-btn';
+    stopBtn.title = 'Stop';
+    setIcon(stopBtn, ['square'], '■');
+    toolbar.appendChild(stopBtn);
+
+    const loopBtn = document.createElement('button');
+    loopBtn.type = 'button';
+    loopBtn.className = 'sound-tool-btn';
+    loopBtn.title = 'Loop playback';
+    setIcon(loopBtn, ['repeat'], '↻');
+    toolbar.appendChild(loopBtn);
+
+    const sep0 = document.createElement('div');
+    sep0.className = 'sound-toolbar-separator';
+    toolbar.appendChild(sep0);
+
+    const volRange = document.createElement('input');
+    volRange.type = 'range';
+    volRange.min = '0';
+    volRange.max = '100';
+    volRange.value = '90';
+    volRange.className = 'sound-volume-range';
+    volRange.title = 'Volume';
+    toolbar.appendChild(volRange);
+
+    const sep1 = document.createElement('div');
+    sep1.className = 'sound-toolbar-separator';
+    toolbar.appendChild(sep1);
+
+    const dupBtn = document.createElement('button');
+    dupBtn.type = 'button';
+    dupBtn.className = 'sound-tool-btn';
+    dupBtn.title = 'Duplicate selected';
+    setIcon(dupBtn, ['copy', 'copy-plus'], '⎘');
+    toolbar.appendChild(dupBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'sound-tool-btn sound-tool-btn--danger';
+    delBtn.title = 'Delete selected';
+    setIcon(delBtn, ['trash-2', 'trash'], '×');
+    toolbar.appendChild(delBtn);
+
+    editingPanel.appendChild(toolbar);
+
+    const contentArea = document.createElement('div');
+    contentArea.className = 'sounds-content';
+
+    const leftPanel = document.createElement('div');
+    leftPanel.className = 'images-left-panel';
+
+    const thumbnailsContainer = document.createElement('div');
+    thumbnailsContainer.className = 'sounds-thumbnails-scroll';
+
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'images-actions-row';
+    const bottomImport = document.createElement('button');
+    bottomImport.type = 'button';
+    bottomImport.className = 'images-action-btn images-action-btn--secondary';
+    setIcon(bottomImport, ['upload', 'upload-cloud'], '↑');
+    bottomImport.title = 'Upload audio file';
+    const bottomAdd = document.createElement('button');
+    bottomAdd.type = 'button';
+    bottomAdd.className = 'images-action-btn images-action-btn--primary';
+    setIcon(bottomAdd, 'plus', '+');
+    bottomAdd.title = 'Add new sound clip';
+    actionsRow.appendChild(bottomAdd);
+    actionsRow.appendChild(bottomImport);
+
+    leftPanel.appendChild(thumbnailsContainer);
+    leftPanel.appendChild(actionsRow);
+
+    const rightPanel = document.createElement('div');
+    rightPanel.className = 'sounds-right-panel';
+
+    const previewContainer = document.createElement('div');
+    previewContainer.className = 'sound-preview-container';
+
+    const metaRow = document.createElement('div');
+    metaRow.className = 'sound-meta-row';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'sound-meta-name';
+    nameEl.textContent = '—';
+    const timeEl = document.createElement('div');
+    timeEl.className = 'sound-meta-time';
+    timeEl.textContent = '0:00 / 0:00';
+    metaRow.appendChild(nameEl);
+    metaRow.appendChild(timeEl);
+
+    const waveformWorkspace = document.createElement('div');
+    waveformWorkspace.className = 'sound-waveform-workspace';
+    const waveformStack = document.createElement('div');
+    waveformStack.className = 'sound-waveform-stack';
+    const waveformCanvas = document.createElement('canvas');
+    waveformCanvas.className = 'sound-waveform-canvas';
+    waveformCanvas.setAttribute('aria-label', 'Waveform');
+    waveformCanvas.height = 120;
+    const trimOverlay = document.createElement('div');
+    trimOverlay.className = 'sound-trim-overlay';
+    trimOverlay.setAttribute('aria-hidden', 'true');
+    const handleStart = document.createElement('button');
+    handleStart.type = 'button';
+    handleStart.className = 'sound-trim-handle sound-trim-handle--start';
+    handleStart.setAttribute('aria-label', 'Trim start');
+    handleStart.title = 'Drag inward from the start';
+    const handleEnd = document.createElement('button');
+    handleEnd.type = 'button';
+    handleEnd.className = 'sound-trim-handle sound-trim-handle--end';
+    handleEnd.setAttribute('aria-label', 'Trim end');
+    handleEnd.title = 'Drag inward from the end';
+    trimOverlay.appendChild(handleStart);
+    trimOverlay.appendChild(handleEnd);
+    waveformStack.appendChild(waveformCanvas);
+    waveformStack.appendChild(trimOverlay);
+    waveformWorkspace.appendChild(waveformStack);
+
+    const scrubBar = document.createElement('div');
+    scrubBar.className = 'sound-scrub-bar';
+    const scrubFill = document.createElement('div');
+    scrubFill.className = 'sound-scrub-fill';
+    scrubBar.appendChild(scrubFill);
+
+    const cropRow = document.createElement('div');
+    cropRow.className = 'sound-crop-row';
+    const cropRangeEl = document.createElement('div');
+    cropRangeEl.className = 'sound-crop-range';
+    cropRangeEl.setAttribute('aria-live', 'polite');
+    cropRangeEl.setAttribute('aria-label', 'Selected range');
+    const cropResetBtn = document.createElement('button');
+    cropResetBtn.type = 'button';
+    cropResetBtn.className = 'sound-tool-btn sound-crop-reset';
+    cropResetBtn.title = 'Reset selection to full clip';
+    setIcon(cropResetBtn, ['rotate-ccw'], '↺');
+    const cropApplyBtn = document.createElement('button');
+    cropApplyBtn.type = 'button';
+    cropApplyBtn.className = 'sound-crop-text-btn sound-crop-text-btn--primary';
+    cropApplyBtn.textContent = 'Crop';
+    cropApplyBtn.title = 'Keep only the selected range';
+    const cutApplyBtn = document.createElement('button');
+    cutApplyBtn.type = 'button';
+    cutApplyBtn.className = 'sound-crop-text-btn';
+    cutApplyBtn.textContent = 'Cut';
+    cutApplyBtn.title = 'Remove the selected range (join the rest)';
+    const cropActions = document.createElement('div');
+    cropActions.className = 'sound-crop-row-actions';
+    cropActions.appendChild(cropResetBtn);
+    cropActions.appendChild(cropApplyBtn);
+    cropActions.appendChild(cutApplyBtn);
+    cropRow.appendChild(cropRangeEl);
+    cropRow.appendChild(cropActions);
+
+    previewContainer.appendChild(metaRow);
+    previewContainer.appendChild(waveformWorkspace);
+    previewContainer.appendChild(scrubBar);
+    previewContainer.appendChild(cropRow);
+
+    rightPanel.appendChild(previewContainer);
+
+    contentArea.appendChild(leftPanel);
+    contentArea.appendChild(rightPanel);
+
+    root.appendChild(editingPanel);
+    root.appendChild(contentArea);
+    container.appendChild(root);
+
+    let mainPeaks = null;
+    let progressRaf = null;
+    let isLooping = false;
+    let clipDurationSec = 0;
+    /** Crop region in seconds (replaces former number inputs). `trimEndSec === null` means full length until metadata sync. */
+    let trimStartSec = 0;
+    let trimEndSec = null;
+    let cropToolActive = false;
+
+    function getDurationFromUi() {
+        const d = clipDurationSec || (soundTabAudio && Number.isFinite(soundTabAudio.duration) ? soundTabAudio.duration : 0);
+        return Number.isFinite(d) && d > 0 ? d : 0;
+    }
+
+    function clientXToTime01(clientX) {
+        const rect = waveformStack.getBoundingClientRect();
+        const rw = rect.width || 1;
+        return Math.max(0, Math.min(1, (clientX - rect.left) / rw));
+    }
+
+    function minTrimGapSec(d) {
+        return Math.min(0.05, Math.max(0.001, d * 0.004));
+    }
+
+    function setCropToolUiActive(on) {
+        cropToolActive = !!on;
+        cropToolBtn.classList.toggle('sound-tool-btn--crop-active', cropToolActive);
+        cropToolBtn.setAttribute('aria-pressed', cropToolActive ? 'true' : 'false');
+        waveformWorkspace.classList.toggle('sound-waveform-workspace--crop-tool', cropToolActive);
+        previewContainer.classList.toggle('sound-preview-container--crop-tool', cropToolActive);
+        updateCropRangeDisplay();
+        updateTrimHandlePositions();
+    }
+
+    function formatCropTime(sec) {
+        if (!Number.isFinite(sec) || sec < 0) return '0:00.00';
+        const m = Math.floor(sec / 60);
+        const sRem = sec - m * 60;
+        const whole = Math.floor(sRem);
+        let cent = Math.round((sRem - whole) * 100);
+        let w = whole;
+        if (cent >= 100) {
+            w += 1;
+            cent = 0;
+        }
+        return `${m}:${String(w).padStart(2, '0')}.${String(cent).padStart(2, '0')}`;
+    }
+
+    function updateCropRangeDisplay() {
+        const d = getDurationFromUi();
+        const a = Number.isFinite(trimStartSec) ? trimStartSec : 0;
+        const b = trimEndSec != null && Number.isFinite(trimEndSec) ? trimEndSec : d;
+        if (!d || d <= 0) {
+            cropRangeEl.textContent = '—';
+            return;
+        }
+        const span = Math.max(0, b - a);
+        cropRangeEl.textContent = `${formatCropTime(a)}–${formatCropTime(b)} (${formatCropTime(span)})`;
+    }
+
+    function updateTrimHandlePositions() {
+        const d = getDurationFromUi();
+        const tr = getTrimNormalized();
+        const show = cropToolActive && d > 0 && tr;
+        trimOverlay.classList.toggle('sound-trim-overlay--active', !!show);
+        if (!show || !tr) {
+            handleStart.style.visibility = 'hidden';
+            handleEnd.style.visibility = 'hidden';
+            return;
+        }
+        handleStart.style.visibility = 'visible';
+        handleEnd.style.visibility = 'visible';
+        const a = tr.start01 * 100;
+        const b = tr.end01 * 100;
+        handleStart.style.left = `${a}%`;
+        handleEnd.style.left = `${b}%`;
+    }
+
+    function applyTrimSeconds(t0, t1) {
+        const d = getDurationFromUi();
+        if (!d) return;
+        const gap = minTrimGapSec(d);
+        let a = t0;
+        let b = t1;
+        a = Math.max(0, Math.min(a, d));
+        b = Math.max(a + gap, Math.min(b, d));
+        trimStartSec = Math.round(a * 1000) / 1000;
+        trimEndSec = Math.round(b * 1000) / 1000;
+        updateCropRangeDisplay();
+        redrawMainWave();
+    }
+
+    function dragTrimEdge(which, ev) {
+        if (!cropToolActive) return;
+        const d = getDurationFromUi();
+        if (!d) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const capId = ev.pointerId;
+        try {
+            (which === 'start' ? handleStart : handleEnd).setPointerCapture(capId);
+        } catch (_) {}
+        const onMove = (e) => {
+            const t = clientXToTime01(e.clientX) * d;
+            let t0 = trimStartSec;
+            let t1 = trimEndSec;
+            if (!Number.isFinite(t0)) t0 = 0;
+            if (!Number.isFinite(t1)) t1 = d;
+            const gap = minTrimGapSec(d);
+            if (which === 'start') {
+                t0 = Math.max(0, Math.min(t, t1 - gap));
+            } else {
+                t1 = Math.min(d, Math.max(t, t0 + gap));
+            }
+            trimStartSec = Math.round(t0 * 1000) / 1000;
+            trimEndSec = Math.round(t1 * 1000) / 1000;
+            updateCropRangeDisplay();
+            redrawMainWave();
+        };
+        const onUp = () => {
+            try {
+                (which === 'start' ? handleStart : handleEnd).releasePointerCapture(capId);
+            } catch (_) {}
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            window.removeEventListener('pointercancel', onUp);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+    }
+
+    handleStart.addEventListener('pointerdown', (e) => dragTrimEdge('start', e));
+    handleEnd.addEventListener('pointerdown', (e) => dragTrimEdge('end', e));
+
+    cropToolBtn.addEventListener('click', () => {
+        setCropToolUiActive(!cropToolActive);
+        refreshLucideIcons();
+    });
+
+    function onEscapeCropTool(e) {
+        if (e.key !== 'Escape' || activeTab !== 'sound' || !cropToolActive) return;
+        e.preventDefault();
+        setCropToolUiActive(false);
+        refreshLucideIcons();
+    }
+    window.addEventListener('keydown', onEscapeCropTool);
+
+    function syncTrimInputsFromDuration(d) {
+        clipDurationSec = Number.isFinite(d) && d > 0 ? d : 0;
+        if (!clipDurationSec) return;
+        const a = Math.max(0, Math.min(Number.isFinite(trimStartSec) ? trimStartSec : 0, clipDurationSec));
+        const bRaw = trimEndSec != null && Number.isFinite(trimEndSec) ? trimEndSec : clipDurationSec;
+        const b = Math.max(a, Math.min(bRaw, clipDurationSec));
+        trimStartSec = Math.round(a * 1000) / 1000;
+        trimEndSec = Math.round(b * 1000) / 1000;
+        updateCropRangeDisplay();
+    }
+
+    function getTrimNormalized() {
+        const d = clipDurationSec || (soundTabAudio && Number.isFinite(soundTabAudio.duration) ? soundTabAudio.duration : 0);
+        if (!d || d <= 0) return null;
+        let a = trimStartSec;
+        let b = trimEndSec != null && Number.isFinite(trimEndSec) ? trimEndSec : d;
+        if (!Number.isFinite(a)) a = 0;
+        if (!Number.isFinite(b)) b = d;
+        a = Math.max(0, Math.min(a, d));
+        b = Math.max(a + 1e-6, Math.min(b, d));
+        return { start01: a / d, end01: b / d };
+    }
+
+    function formatTime(sec) {
+        if (!Number.isFinite(sec) || sec < 0) return '0:00';
+        const m = Math.floor(sec / 60);
+        const s = Math.floor(sec % 60);
+        return `${m}:${String(s).padStart(2, '0')}`;
+    }
+
+    function updatePlayIcon(playing) {
+        setIcon(playBtn, playing ? ['pause', 'circle-pause'] : ['play', 'circle-play'], playing ? '❚❚' : '▶');
+        refreshLucideIcons();
+    }
+
+    function setScrub(p) {
+        const x = Math.max(0, Math.min(100, p * 100));
+        scrubFill.style.width = `${x}%`;
+    }
+
+    function redrawMainWave() {
+        if (!mainPeaks) {
+            const ctx = waveformCanvas.getContext('2d');
+            if (ctx) {
+                const rect = waveformCanvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                waveformCanvas.width = Math.floor(Math.max(1, rect.width) * dpr);
+                waveformCanvas.height = Math.floor(Math.max(1, rect.height) * dpr);
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                ctx.clearRect(0, 0, rect.width, rect.height);
+                ctx.fillStyle = 'rgba(255,255,255,0.04)';
+                ctx.fillRect(0, 0, rect.width, rect.height);
+            }
+            updateTrimHandlePositions();
+            return;
+        }
+        const dur = soundTabAudio && soundTabAudio.duration ? soundTabAudio.duration : 0;
+        const t = soundTabAudio && !soundTabAudio.paused ? soundTabAudio.currentTime : (soundTabAudio ? soundTabAudio.currentTime : 0);
+        const prog = dur > 0 ? t / dur : 0;
+        const trim = getTrimNormalized();
+        drawWaveformPeaks(waveformCanvas, mainPeaks, prog, trim || undefined);
+        setScrub(prog);
+        timeEl.textContent = `${formatTime(t)} / ${formatTime(dur)}`;
+        updateTrimHandlePositions();
+    }
+
+    function tickPlayback() {
+        redrawMainWave();
+        if (soundTabAudio && !soundTabAudio.paused) {
+            progressRaf = requestAnimationFrame(tickPlayback);
+        }
+    }
+
+    function attachAudioListeners() {
+        if (!soundTabAudio) return;
+        soundTabAudio.onplay = () => {
+            updatePlayIcon(true);
+            if (progressRaf) cancelAnimationFrame(progressRaf);
+            progressRaf = requestAnimationFrame(tickPlayback);
+        };
+        soundTabAudio.onpause = () => {
+            updatePlayIcon(false);
+            if (progressRaf) cancelAnimationFrame(progressRaf);
+            redrawMainWave();
+        };
+        soundTabAudio.onended = () => {
+            updatePlayIcon(false);
+            if (!isLooping) setScrub(0);
+            redrawMainWave();
+        };
+        soundTabAudio.ontimeupdate = () => {
+            if (!soundTabAudio || soundTabAudio.paused) redrawMainWave();
+        };
+        soundTabAudio.onloadeddata = () => {
+            redrawMainWave();
+        };
+    }
+
+    async function loadMainPeaksForSrc(src) {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        let px = waveformCanvas.getBoundingClientRect().width || waveformCanvas.clientWidth;
+        if (px < 2 && waveformWorkspace) {
+            px = waveformWorkspace.getBoundingClientRect().width;
+        }
+        if (px < 2) px = Math.max(320, previewContainer.clientWidth - 40);
+        const peakCount = Math.min(640, Math.max(96, Math.floor(px / 2) || 256));
+        mainPeaks = await fetchDecodePeaks(src, peakCount);
+        if (!mainPeaks) {
+            const pw = Math.min(200, Math.max(48, peakCount));
+            mainPeaks = new Float32Array(pw);
+            mainPeaks.fill(0.02);
+        }
+        redrawMainWave();
+    }
+
+    try {
+        const ro = new ResizeObserver(() => {
+            if (activeTab === 'sound') redrawMainWave();
+        });
+        ro.observe(previewContainer);
+        ro.observe(waveformWorkspace);
+        ro.observe(waveformStack);
+    } catch (_) {}
+
+    function applySoundSelection(src, itemEl, info) {
+        const list = document.querySelectorAll('.sound-thumbnail-item');
+        list.forEach((n) => n.classList.remove('selected'));
+        if (itemEl) itemEl.classList.add('selected');
+        soundRevision++;
+        const playbackUrl = soundSrcForPlayback(src);
+        selectedSoundSrc = src;
+        currentSoundFilename = info ? info.name : null;
+        currentSoundInfo = info || null;
+        try {
+            localStorage.setItem('lastSelectedSound', (src || '').split('?')[0]);
+        } catch (_) {}
+        setLastSelectedSoundForObject(selected_object, (src || '').split('?')[0]);
+        stopSoundTabPlayback();
+        clipDurationSec = 0;
+        trimStartSec = 0;
+        trimEndSec = null;
+        updateCropRangeDisplay();
+        soundTabAudio = new Audio(playbackUrl);
+        setCropToolUiActive(false);
+        soundTabAudio.volume = parseInt(volRange.value, 10) / 100;
+        soundTabAudio.loop = isLooping;
+        attachAudioListeners();
+        nameEl.textContent = info ? info.name : 'Sound';
+        const obj = objects.find((o) => o.id == selected_object);
+        if (obj && info) syncMediaSoundEntry(obj, info.src);
+        loadMainPeaksForSrc(src).catch(() => redrawMainWave());
+        updatePlayIcon(false);
+        timeEl.textContent = '0:00 / 0:00';
+        soundTabAudio.addEventListener(
+            'loadedmetadata',
+            () => {
+                const d = soundTabAudio.duration;
+                timeEl.textContent = `0:00 / ${formatTime(d)}`;
+                syncTrimInputsFromDuration(d);
+                redrawMainWave();
+            },
+            { once: true }
+        );
+    }
+    soundSelectionHandler = applySoundSelection;
+
+    cropResetBtn.addEventListener('click', () => {
+        const d = (soundTabAudio && Number.isFinite(soundTabAudio.duration) ? soundTabAudio.duration : 0) || clipDurationSec;
+        if (d > 0) {
+            trimStartSec = 0;
+            trimEndSec = Math.round(d * 1000) / 1000;
+            syncTrimInputsFromDuration(d);
+        }
+        redrawMainWave();
+    });
+    cropApplyBtn.addEventListener('click', async () => {
+        if (!currentSoundInfo || !selectedSoundSrc) return;
+        const d = clipDurationSec || (soundTabAudio && soundTabAudio.duration) || 0;
+        let t0 = trimStartSec;
+        let t1 = trimEndSec != null && Number.isFinite(trimEndSec) ? trimEndSec : d;
+        if (!Number.isFinite(t0)) t0 = 0;
+        if (!Number.isFinite(t1)) t1 = d;
+        if (d > 0) {
+            t0 = Math.max(0, Math.min(t0, d));
+            t1 = Math.max(t0 + 0.001, Math.min(t1, d));
+        } else {
+            return;
+        }
+        try {
+            cropApplyBtn.disabled = true;
+            cutApplyBtn.disabled = true;
+            const newUrl = await cropSoundSrcToWavDataUrl(selectedSoundSrc, t0, t1);
+            soundRevision++;
+            const list = getCurrentObjectSounds();
+            const found = list.find((x) => x.id === currentSoundInfo.id);
+            if (found) {
+                found.src = newUrl;
+                if (/\.(mp3|m4a|aac|ogg|flac)$/i.test(found.name)) {
+                    found.name = found.name.replace(/\.[^.]+$/, '.wav');
+                }
+            }
+            const obj = objects.find((o) => o.id == selected_object);
+            if (obj && found) syncMediaSoundEntry(obj, newUrl);
+            loadSoundsFromDirectory(thumbnailsContainer);
+            const el2 = Array.from(thumbnailsContainer.querySelectorAll('.sound-thumbnail-item')).find(
+                (x) => found && x.dataset.filename === found.name
+            );
+            if (el2 && found) applySoundSelection(newUrl, el2, found);
+        } catch (e) {
+            console.warn('Crop failed', e);
+        } finally {
+            cropApplyBtn.disabled = false;
+            cutApplyBtn.disabled = false;
+        }
+    });
+
+    cutApplyBtn.addEventListener('click', async () => {
+        if (!currentSoundInfo || !selectedSoundSrc) return;
+        const d = clipDurationSec || (soundTabAudio && soundTabAudio.duration) || 0;
+        let t0 = trimStartSec;
+        let t1 = trimEndSec != null && Number.isFinite(trimEndSec) ? trimEndSec : d;
+        if (!Number.isFinite(t0)) t0 = 0;
+        if (!Number.isFinite(t1)) t1 = d;
+        if (d > 0) {
+            t0 = Math.max(0, Math.min(t0, d));
+            t1 = Math.max(t0 + 0.001, Math.min(t1, d));
+        } else {
+            return;
+        }
+        if (t0 <= 0 && t1 >= d - 1e-6) {
+            console.warn('Cut: select a range to remove');
+            return;
+        }
+        try {
+            cropApplyBtn.disabled = true;
+            cutApplyBtn.disabled = true;
+            const newUrl = await cutSoundRemoveMiddleToWavDataUrl(selectedSoundSrc, t0, t1);
+            soundRevision++;
+            const list = getCurrentObjectSounds();
+            const found = list.find((x) => x.id === currentSoundInfo.id);
+            if (found) {
+                found.src = newUrl;
+                if (/\.(mp3|m4a|aac|ogg|flac)$/i.test(found.name)) {
+                    found.name = found.name.replace(/\.[^.]+$/, '.wav');
+                }
+            }
+            const obj = objects.find((o) => o.id == selected_object);
+            if (obj && found) syncMediaSoundEntry(obj, newUrl);
+            loadSoundsFromDirectory(thumbnailsContainer);
+            const el2 = Array.from(thumbnailsContainer.querySelectorAll('.sound-thumbnail-item')).find(
+                (x) => found && x.dataset.filename === found.name
+            );
+            if (el2 && found) applySoundSelection(newUrl, el2, found);
+        } catch (e) {
+            console.warn('Cut failed', e);
+        } finally {
+            cropApplyBtn.disabled = false;
+            cutApplyBtn.disabled = false;
+        }
+    });
+
+    playBtn.addEventListener('click', async () => {
+        if (!selectedSoundSrc) return;
+        if (!soundTabAudio) {
+            let el = thumbnailsContainer.querySelector('.sound-thumbnail-item.selected');
+            if (!el) el = thumbnailsContainer.firstElementChild;
+            const fn = el && el.dataset.filename;
+            const s = fn && getCurrentObjectSounds().find((x) => x.name === fn);
+            if (s) applySoundSelection(s.src, el, s);
+        }
+        if (!soundTabAudio) return;
+        try {
+            const ctx = getSoundAudioContext();
+            if (ctx) await ctx.resume();
+        } catch (_) {}
+        if (soundTabAudio.paused) {
+            const p = soundTabAudio.play();
+            if (p && typeof p.catch === 'function') p.catch((e) => console.warn('play failed', e));
+        } else {
+            soundTabAudio.pause();
+        }
+    });
+
+    stopBtn.addEventListener('click', () => {
+        if (!soundTabAudio) return;
+        soundTabAudio.pause();
+        soundTabAudio.currentTime = 0;
+        redrawMainWave();
+    });
+
+    loopBtn.addEventListener('click', () => {
+        isLooping = !isLooping;
+        loopBtn.classList.toggle('active', isLooping);
+        if (soundTabAudio) soundTabAudio.loop = isLooping;
+    });
+
+    volRange.addEventListener('input', () => {
+        if (soundTabAudio) soundTabAudio.volume = parseInt(volRange.value, 10) / 100;
+    });
+
+    dupBtn.addEventListener('click', () => {
+        if (currentSoundInfo) duplicateObjectSound(currentSoundInfo).catch((e) => console.warn(e));
+    });
+    delBtn.addEventListener('click', () => {
+        if (!currentSoundInfo) return;
+        const el = Array.from(thumbnailsContainer.querySelectorAll('.sound-thumbnail-item')).find(
+            (x) => x.dataset.filename === currentSoundInfo.name
+        );
+        if (el) deleteSound(el, currentSoundInfo.name, currentSoundInfo);
+    });
+
+    bottomImport.addEventListener('click', () => triggerUploadSound());
+    bottomAdd.addEventListener('click', () => createNewSound());
+
+    function seekFromClientX(clientX) {
+        if (!soundTabAudio) return;
+        const dur = soundTabAudio.duration;
+        if (!Number.isFinite(dur) || dur <= 0) return;
+        const rect = waveformCanvas.getBoundingClientRect();
+        const rw = rect.width || 1;
+        const x = Math.max(0, Math.min(1, (clientX - rect.left) / rw));
+        soundTabAudio.currentTime = x * dur;
+        setScrub(x);
+        redrawMainWave();
+    }
+
+    waveformCanvas.addEventListener('click', (e) => seekFromClientX(e.clientX));
+
+    scrubBar.addEventListener('click', (e) => seekFromClientX(e.clientX));
+
+    loadSoundsFromDirectory(thumbnailsContainer);
+
+    bottomAdd.addEventListener('keydown', (e) => {
+        if (e.key === ' ' || e.code === 'Space') e.preventDefault();
+    });
+
+    setTimeout(() => {
+        refreshLucideIcons();
+        if (selectedSoundSrc && currentSoundInfo) {
+            const el = Array.from(thumbnailsContainer.querySelectorAll('.sound-thumbnail-item')).find(
+                (x) => x.dataset.filename === currentSoundInfo.name
+            );
+            if (el) applySoundSelection(selectedSoundSrc, el, currentSoundInfo);
+            else if (thumbnailsContainer.firstElementChild) {
+                const fe = thumbnailsContainer.firstElementChild;
+                const fn = fe.dataset.filename;
+                const s = getCurrentObjectSounds().find((x) => x.name === fn);
+                if (s) applySoundSelection(s.src, fe, s);
+            }
+        } else if (thumbnailsContainer.firstElementChild) {
+            const fe = thumbnailsContainer.firstElementChild;
+            const fn = fe.dataset.filename;
+            const s = getCurrentObjectSounds().find((x) => x.name === fn);
+            if (s) applySoundSelection(s.src, fe, s);
+        }
+    }, 40);
+}
+
+function selectSound(src, thumbnailElement, soundInfo) {
+    if (soundSelectionHandler) {
+        soundSelectionHandler(src, thumbnailElement, soundInfo);
+    } else {
+        selectedSoundSrc = src;
+        currentSoundInfo = soundInfo || null;
+        currentSoundFilename = soundInfo ? soundInfo.name : null;
+        if (soundInfo) setLastSelectedSoundForObject(selected_object, (src || '').split('?')[0]);
+    }
+}
+
+function loadSoundsFromDirectory(container) {
+    const sounds = getCurrentObjectSounds();
+    container.innerHTML = '';
+
+    sounds.forEach((soundInfo) => {
+        const item = document.createElement('div');
+        item.className = 'sound-thumbnail-item';
+        item.dataset.filename = soundInfo.name;
+
+        const thumbWrap = document.createElement('div');
+        thumbWrap.className = 'sound-thumb-wrap';
+
+        const waveMini = document.createElement('canvas');
+        waveMini.className = 'sound-thumb-wave';
+        waveMini.width = 108;
+        waveMini.height = 36;
+        waveMini.setAttribute('aria-hidden', 'true');
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'object-delete-btn sound-thumb-delete';
+        deleteBtn.textContent = '×';
+        deleteBtn.title = 'Delete clip';
+        deleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteSound(item, soundInfo.name, soundInfo);
+        });
+
+        thumbWrap.appendChild(waveMini);
+        thumbWrap.appendChild(deleteBtn);
+
+        const label = document.createElement('span');
+        label.className = 'sound-label';
+        label.textContent = soundInfo.name;
+        label.title = 'Double-click to rename';
+
+        item.appendChild(thumbWrap);
+        item.appendChild(label);
+
+        item.addEventListener('click', () => {
+            selectSound(soundInfo.src, item, soundInfo);
+        });
+
+        label.addEventListener('dblclick', (e) => {
+            e.stopPropagation();
+            startRenameSound(item, soundInfo.name);
+        });
+
+        item.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            showSoundAssetSaveMenu(e.clientX, e.clientY, soundInfo);
+        });
+
+        fetchDecodePeaks(soundInfo.src, 48).then((peaks) => {
+            if (peaks) drawMiniWaveform(waveMini, peaks);
+        });
+
+        container.appendChild(item);
+    });
+}
+
+function deleteSound(itemEl, filename, soundInfo) {
+    const objectId = String(selected_object);
+    if (!deletedSoundsMap[objectId]) deletedSoundsMap[objectId] = [];
+    const wasSelected = itemEl.classList.contains('selected');
+    deletedSoundsMap[objectId].push({
+        filename,
+        src: soundInfo ? soundInfo.src : '',
+        wasSelected,
+    });
+
+    const list = getCurrentObjectSounds();
+    const idx = list.findIndex((x) => x.name === filename);
+    if (idx >= 0) list.splice(idx, 1);
+    itemEl.remove();
+
+    if (soundInfo && currentSoundInfo && currentSoundInfo.name === filename) {
+        selectedSoundSrc = null;
+        currentSoundInfo = null;
+        currentSoundFilename = null;
+        setLastSelectedSoundForObject(selected_object, '');
+    }
+
+    const tc = document.querySelector('.sounds-thumbnails-scroll');
+    if (wasSelected && tc && tc.firstElementChild) {
+        const first = tc.firstElementChild;
+        const fn = first.dataset.filename;
+        const s = getCurrentObjectSounds().find((x) => x.name === fn);
+        if (s) selectSound(s.src, first, s);
+    } else if (wasSelected) {
+        stopSoundTabPlayback();
+    }
+    setTimeout(() => updateUndoMenu(), 50);
+}
+
+function undoSoundDeletion() {
+    const objectId = String(selected_object);
+    const stack = deletedSoundsMap[objectId] || [];
+    if (stack.length === 0) return;
+    const last = stack.pop();
+    const key = String(selected_object);
+    if (!objectSounds[key]) objectSounds[key] = [];
+    objectSounds[key].unshift({ id: Date.now(), name: last.filename, src: last.src });
+    const tc = document.querySelector('.sounds-thumbnails-scroll');
+    if (tc) loadSoundsFromDirectory(tc);
+    setTimeout(() => {
+        if (last.wasSelected && tc) {
+            const el = Array.from(tc.querySelectorAll('.sound-thumbnail-item')).find((x) => x.dataset.filename === last.filename);
+            if (el) {
+                const s = getCurrentObjectSounds().find((x) => x.name === last.filename);
+                if (s) selectSound(s.src, el, s);
+            }
+        }
+        updateUndoMenu();
+    }, 40);
+}
+
+function hasPendingSoundDeletionUndo() {
+    const objectId = String(selected_object);
+    return (deletedSoundsMap[objectId] || []).length > 0;
+}
+
+function tryUndoSoundDeletion() {
+    if (!hasPendingSoundDeletionUndo()) return false;
+    undoSoundDeletion();
+    return true;
+}
+
+function createNewSound() {
+    const silent = generateSilentWavDataUrl();
+    const nextNum = getNextSoundNumber();
+    const name = soundFilenameForNum(nextNum, '.wav');
+    const list = getCurrentObjectSounds();
+    const newInfo = { id: Date.now(), name, src: silent };
+    list.push(newInfo);
+    currentSoundInfo = newInfo;
+    const tc = document.querySelector('.sounds-thumbnails-scroll');
+    if (tc) {
+        loadSoundsFromDirectory(tc);
+        setTimeout(() => {
+            const el = Array.from(tc.querySelectorAll('.sound-thumbnail-item')).find((x) => x.dataset.filename === name);
+            if (el) selectSound(silent, el, newInfo);
+        }, 30);
+    }
+}
+
+function triggerUploadSound() {
+    try {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'audio/*,.wav,.mp3,.ogg,.m4a,.aac,.flac,.webm';
+        input.style.display = 'none';
+        document.body.appendChild(input);
+        input.addEventListener('change', async () => {
+            const file = input.files && input.files[0];
+            if (!file) {
+                document.body.removeChild(input);
+                return;
+            }
+            try {
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onerror = reject;
+                    reader.onload = () => resolve(String(reader.result || ''));
+                    reader.readAsDataURL(file);
+                });
+                const ext = (file.name && file.name.indexOf('.') >= 0) ? file.name.slice(file.name.lastIndexOf('.')) : '.wav';
+                const nextNum = getNextSoundNumber();
+                const name = soundFilenameForNum(nextNum, ext);
+                const list = getCurrentObjectSounds();
+                const newInfo = { id: Date.now(), name, src: dataUrl };
+                list.push(newInfo);
+                const tc = document.querySelector('.sounds-thumbnails-scroll');
+                if (tc) {
+                    loadSoundsFromDirectory(tc);
+                    setTimeout(() => {
+                        const el = Array.from(tc.querySelectorAll('.sound-thumbnail-item')).find((x) => x.dataset.filename === name);
+                        if (el) selectSound(dataUrl, el, newInfo);
+                    }, 30);
+                }
+            } catch (e) {
+                console.warn('Sound import failed', e);
+            } finally {
+                document.body.removeChild(input);
+            }
+        });
+        input.click();
+    } catch (e) {
+        console.warn('Unable to open file dialog', e);
+    }
+}
+
+async function duplicateObjectSound(soundInfo) {
+    if (!soundInfo || !soundInfo.name) return;
+    let srcCopy;
+    try {
+        const src = soundInfo.src;
+        if (!src) {
+            srcCopy = generateSilentWavDataUrl();
+        } else if (typeof src === 'string' && src.startsWith('data:')) {
+            srcCopy = src;
+        } else {
+            const clean = src.split('?')[0];
+            const res = await fetch(clean, { credentials: 'same-origin' });
+            if (!res.ok) throw new Error('fetch failed');
+            const blob = await res.blob();
+            srcCopy = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(String(fr.result || ''));
+                fr.onerror = () => reject(new Error('read failed'));
+                fr.readAsDataURL(blob);
+            });
+        }
+    } catch (e) {
+        console.warn('Duplicate sound: using silent clip', e);
+        srcCopy = generateSilentWavDataUrl();
+    }
+    const list = getCurrentObjectSounds();
+    const sourceIndex = list.findIndex((x) => x.name === soundInfo.name);
+    const nextNum = getNextSoundNumber();
+    const ext = soundInfo.name.includes('.') ? soundInfo.name.slice(soundInfo.name.lastIndexOf('.')) : '.wav';
+    const newName = soundFilenameForNum(nextNum, ext);
+    const newInfo = { id: Date.now(), name: newName, src: srcCopy };
+    if (sourceIndex >= 0) list.splice(sourceIndex + 1, 0, newInfo);
+    else list.push(newInfo);
+    const tc = document.querySelector('.sounds-thumbnails-scroll');
+    if (tc) {
+        loadSoundsFromDirectory(tc);
+        setTimeout(() => {
+            const el = Array.from(tc.querySelectorAll('.sound-thumbnail-item')).find((x) => x.dataset.filename === newName);
+            if (el) selectSound(srcCopy, el, newInfo);
+        }, 30);
+    }
+}
+
+function sanitizeSoundDownloadFilename(name) {
+    const raw = name || `sound_${Date.now()}.wav`;
+    const safe = String(raw).replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^\.+/, '') || 'sound';
+    return /\.(wav|mp3|ogg|m4a|aac|flac|webm)$/i.test(safe) ? safe : `${safe}.wav`;
+}
+
+function downloadSoundAssetToComputer(src, filename) {
+    const name = sanitizeSoundDownloadFilename(filename);
+    const a = document.createElement('a');
+    a.href = src;
+    a.download = name;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+function removeSoundAssetContextMenu() {
+    const el = document.getElementById('__sound_asset_ctx_menu');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
+let _soundAssetCtxMenuDismissBound = false;
+function bindSoundAssetContextMenuDismiss() {
+    if (_soundAssetCtxMenuDismissBound) return;
+    _soundAssetCtxMenuDismissBound = true;
+    document.addEventListener(
+        'mousedown',
+        (ev) => {
+            const menu = document.getElementById('__sound_asset_ctx_menu');
+            if (!menu || menu.contains(ev.target)) return;
+            removeSoundAssetContextMenu();
+        },
+        true
+    );
+}
+
+function showSoundAssetSaveMenu(clientX, clientY, soundInfo) {
+    bindSoundAssetContextMenuDismiss();
+    removeSoundAssetContextMenu();
+    const menu = document.createElement('div');
+    menu.id = '__sound_asset_ctx_menu';
+    menu.setAttribute('role', 'menu');
+    menu.className = 'ctx-menu';
+    const dupBtn = document.createElement('button');
+    dupBtn.type = 'button';
+    dupBtn.textContent = 'Duplicate';
+    dupBtn.setAttribute('role', 'menuitem');
+    dupBtn.className = 'ctx-menu-item';
+    dupBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        removeSoundAssetContextMenu();
+        duplicateObjectSound(soundInfo).catch((e) => console.warn(e));
+    });
+    menu.appendChild(dupBtn);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Save audio';
+    btn.setAttribute('role', 'menuitem');
+    btn.className = 'ctx-menu-item';
+    btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        downloadSoundAssetToComputer(soundInfo.src, soundInfo.name);
+        removeSoundAssetContextMenu();
+    });
+    menu.appendChild(btn);
+    document.body.appendChild(menu);
+    const mw = menu.offsetWidth;
+    const mh = menu.offsetHeight;
+    let lx = clientX;
+    let ly = clientY;
+    if (lx + mw > window.innerWidth - 8) lx = window.innerWidth - mw - 8;
+    if (ly + mh > window.innerHeight - 8) ly = window.innerHeight - mh - 8;
+    menu.style.left = `${Math.max(8, lx)}px`;
+    menu.style.top = `${Math.max(8, ly)}px`;
+}
+
+function startRenameSound(itemEl, oldFilename) {
+    if (itemEl.querySelector('.rename-input')) return;
+    const label = itemEl.querySelector('.sound-label');
+    if (!label) return;
+    const list = getCurrentObjectSounds();
+    const info = list.find((x) => x.name === oldFilename);
+    if (!info) return;
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = oldFilename;
+    input.className = 'rename-input';
+    itemEl.classList.add('renaming');
+    label.replaceWith(input);
+    input.focus();
+    input.select();
+
+    const finish = () => {
+        const raw = input.value.trim();
+        itemEl.classList.remove('renaming');
+        if (raw && raw !== oldFilename) {
+            const taken = list.some((x) => x.name === raw && x.name !== oldFilename);
+            if (!taken) {
+                info.name = raw;
+                if (currentSoundInfo && currentSoundInfo.name === oldFilename) {
+                    currentSoundFilename = raw;
+                    currentSoundInfo.name = raw;
+                }
+            }
+        }
+        label.textContent = info.name;
+        input.replaceWith(label);
+    };
+
+    input.addEventListener('blur', finish);
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            finish();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            itemEl.classList.remove('renaming');
+            label.textContent = info.name;
+            input.replaceWith(label);
+        }
+    });
+}
+
 // Load images from ./images/0/ directory
 function loadImagesFromDirectory(container) {
     const images = getCurrentObjectImages();
@@ -5557,9 +8205,11 @@ function loadImagesFromDirectory(container) {
         const label = document.createElement('span');
         label.textContent = imgInfo.name;
         label.className = 'image-label';
+        label.title = 'Click to type a new name';
 
         const deleteBtn = document.createElement('button');
-        deleteBtn.className = 'delete-btn';
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'object-delete-btn';
         deleteBtn.textContent = '×';
         deleteBtn.title = 'Delete image';
         deleteBtn.addEventListener('click', (e) => {
@@ -5569,14 +8219,26 @@ function loadImagesFromDirectory(container) {
 
         // Make thumbnail draggable for reordering
         imageItem.draggable = true;
+        let suppressNextClick = false;
+        let suppressClearTimeout = null;
         imageItem.addEventListener('dragstart', (e) => {
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/html', imgInfo.name);
+            try {
+                e.dataTransfer.setDragImage(imageItem, Math.min(48, imageItem.offsetWidth / 2), 16);
+            } catch (_) {}
             imageItem.classList.add('dragging');
         });
 
         imageItem.addEventListener('dragend', () => {
             imageItem.classList.remove('dragging');
+            imageItem.classList.remove('drag-over');
+            suppressNextClick = true;
+            if (suppressClearTimeout) clearTimeout(suppressClearTimeout);
+            suppressClearTimeout = setTimeout(() => {
+                suppressNextClick = false;
+                suppressClearTimeout = null;
+            }, 450);
         });
 
         imageItem.addEventListener('dragover', (e) => {
@@ -5585,7 +8247,8 @@ function loadImagesFromDirectory(container) {
             imageItem.classList.add('drag-over');
         });
 
-        imageItem.addEventListener('dragleave', () => {
+        imageItem.addEventListener('dragleave', (e) => {
+            if (imageItem.contains(e.relatedTarget)) return;
             imageItem.classList.remove('drag-over');
         });
 
@@ -5607,18 +8270,48 @@ function loadImagesFromDirectory(container) {
             showImageAssetSaveMenu(e.clientX, e.clientY, imgInfo);
         });
 
-        imageItem.addEventListener('click', () => {
+        imageItem.addEventListener('click', (e) => {
+            if (e.target && e.target.closest && e.target.closest('.rename-input')) return;
+            if (suppressNextClick) {
+                suppressNextClick = false;
+                if (suppressClearTimeout) {
+                    clearTimeout(suppressClearTimeout);
+                    suppressClearTimeout = null;
+                }
+                return;
+            }
             currentImageFilename = imgInfo.name;
             currentImageInfo = imgInfo;
             selectImage(imgInfo.src, imageItem);
         });
-        imageItem.addEventListener('dblclick', (e) => {
+
+        label.addEventListener('click', (e) => {
+            e.stopPropagation();
             e.preventDefault();
-            startRenameImage(imageItem, imgInfo.name);
+            if (suppressNextClick) {
+                suppressNextClick = false;
+                if (suppressClearTimeout) {
+                    clearTimeout(suppressClearTimeout);
+                    suppressClearTimeout = null;
+                }
+                return;
+            }
+            currentImageFilename = imgInfo.name;
+            currentImageInfo = imgInfo;
+            selectImage(imgInfo.src, imageItem);
+            // Editor surface focuses in selectImage; defer so the rename field keeps focus for typing.
+            queueMicrotask(() => startRenameImage(imageItem, imgInfo.name));
+        });
+
+        imageItem.addEventListener('dblclick', (e) => {
+            if (e.target && e.target.closest && e.target.closest('.image-label')) return;
+            e.preventDefault();
+            queueMicrotask(() => startRenameImage(imageItem, imgInfo.name));
         });
 
         let touchTimer;
         imageItem.addEventListener('touchstart', (e) => {
+            if (e.target && e.target.closest && e.target.closest('.rename-input')) return;
             touchTimer = setTimeout(() => {
                 startRenameImage(imageItem, imgInfo.name);
             }, 500);
@@ -5676,6 +8369,26 @@ function loadImagesFromDirectory(container) {
     }, 50);
 }
 
+/** Match thumbnail selection to objectImages[] when paths differ (e.g. resolved img.src vs stored relative path). */
+function resolveImageListEntryForSelection(list, imagePath, thumbnailElement) {
+    if (thumbnailElement && thumbnailElement.dataset && thumbnailElement.dataset.filename) {
+        const byName = list.find((x) => x.name === thumbnailElement.dataset.filename);
+        if (byName) return byName;
+    }
+    const norm = (s) => {
+        if (!s || typeof s !== 'string') return '';
+        const base = s.split('?')[0];
+        if (base.startsWith('data:')) return base;
+        try {
+            return new URL(base, window.location.href).href;
+        } catch (_) {
+            return base;
+        }
+    };
+    const target = norm(imagePath);
+    return list.find((x) => norm(x.src) === target) || null;
+}
+
 // Select and display an image
 function selectImage(imagePath, thumbnailElement) {
     // Clear previous selection
@@ -5697,7 +8410,7 @@ function selectImage(imagePath, thumbnailElement) {
     lastSelectedImage = imagePath;
     // Keep current image metadata in sync for save naming
     const list = getCurrentObjectImages();
-    const info = list.find(x => x.src.split('?')[0] === imagePath.split('?')[0]);
+    const info = resolveImageListEntryForSelection(list, imagePath, thumbnailElement);
     if (info) {
         currentImageFilename = info.name;
         currentImageInfo = info;
@@ -5712,6 +8425,12 @@ function selectImage(imagePath, thumbnailElement) {
         imageEditor.loadImage(busted);
         // update game window preview immediately
         renderGameWindowSprite();
+    }
+    const editorSurface = document.querySelector('.image-editor-surface');
+    if (editorSurface) {
+        try {
+            editorSurface.focus({ preventScroll: true });
+        } catch (_) {}
     }
 
     // Update selected object's first sprite and grid icon
@@ -5737,7 +8456,7 @@ function selectImage(imagePath, thumbnailElement) {
 // Zoom image in preview
 function zoomImage(factor) {
     imageZoom *= factor;
-    imageZoom = Math.max(0.1, Math.min(5.0, imageZoom)); // Clamp between 0.1x and 5.0x
+    imageZoom = Math.max(0.1, Math.min(12, imageZoom)); // Clamp between 0.1x and 12x
     if (imageEditor) imageEditor.setZoom(imageZoom);
 }
 
@@ -5898,24 +8617,32 @@ function handleEditAction(action) {
                 if (!tryUndoImageDeletion() && imageEditor && typeof imageEditor.undo === 'function') {
                     imageEditor.undo();
                 }
+            } else if (activeTab === 'sound') {
+                tryUndoSoundDeletion();
             } else {
                 undoLastDeletion();
             }
             break;
         case 'cut':
-            if (activeTab === 'images' && imageEditor && typeof imageEditor.cut === 'function') imageEditor.cut();
+            if (activeTab === 'code') {
+                copyCodeBlocksToClipboardInternal();
+                deleteSelectedCodeBlocks();
+            } else if (activeTab === 'images' && imageEditor && typeof imageEditor.cut === 'function') imageEditor.cut();
             else console.log('Cut action - not available in this tab');
             break;
         case 'copy':
-            if (activeTab === 'images' && imageEditor && typeof imageEditor.copy === 'function') imageEditor.copy();
+            if (activeTab === 'code') copyCodeBlocksToClipboardInternal();
+            else if (activeTab === 'images' && imageEditor && typeof imageEditor.copy === 'function') imageEditor.copy();
             else console.log('Copy action - not available in this tab');
             break;
         case 'paste':
-            if (activeTab === 'images' && imageEditor && typeof imageEditor.paste === 'function') imageEditor.paste();
+            if (activeTab === 'code') pasteCodeBlocksFromClipboardInternal();
+            else if (activeTab === 'images' && imageEditor && typeof imageEditor.paste === 'function') imageEditor.paste();
             else console.log('Paste action - not available in this tab');
             break;
         case 'selectAll':
-            if (activeTab === 'images' && imageEditor && typeof imageEditor.selectAll === 'function') imageEditor.selectAll();
+            if (activeTab === 'code') selectAllCodeBlocks();
+            else if (activeTab === 'images' && imageEditor && typeof imageEditor.selectAll === 'function') imageEditor.selectAll();
             else console.log('Select All action - not available in this tab');
             break;
     }
@@ -5933,13 +8660,17 @@ function handleEditAction(action) {
 function updateUndoMenu() {
     const objectId = String(selected_object);
     const stack = deletedImagesMap[objectId] || [];
+    const soundStack = deletedSoundsMap[objectId] || [];
     const undoMenu = document.getElementById('edit-dropdown');
     if (undoMenu) {
         const undoItems = undoMenu.querySelectorAll('.undo-menu-item');
         const undoItem = Array.from(undoItems).find(item => item.textContent.includes('Undo') || item.textContent.includes('Nothing'));
 
         if (undoItem) {
-            if (stack.length === 0) {
+            const hasUndo =
+                (activeTab === 'images' && stack.length > 0) ||
+                (activeTab === 'sound' && soundStack.length > 0);
+            if (!hasUndo) {
                 undoItem.classList.add('disabled');
                 undoItem.textContent = 'Nothing to undo';
             } else {
@@ -6020,6 +8751,96 @@ function createNewImage() {
                 thumbnailsContainer.scrollTop = thumbnailsContainer.scrollHeight;
                 const imgEl = targetEl.querySelector('img');
                 const path = imgEl ? imgEl.src : dataUrl;
+                selectImage(path, targetEl);
+            }
+        }, 30);
+    }
+}
+
+async function duplicateObjectImage(imgInfo) {
+    if (!imgInfo || !imgInfo.name) return;
+    let srcCopy;
+    try {
+        const src = imgInfo.src;
+        if (!src) {
+            srcCopy = generateBlankImageDataUrl();
+        } else if (typeof src === 'string' && src.startsWith('data:')) {
+            srcCopy = src;
+        } else {
+            const clean = src.split('?')[0];
+            const res = await fetch(clean, { credentials: 'same-origin' });
+            if (!res.ok) throw new Error('fetch failed');
+            const blob = await res.blob();
+            srcCopy = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(String(fr.result || ''));
+                fr.onerror = () => reject(new Error('read failed'));
+                fr.readAsDataURL(blob);
+            });
+        }
+    } catch (e) {
+        console.warn('Duplicate image: could not clone pixels, using blank', e);
+        srcCopy = generateBlankImageDataUrl();
+    }
+
+    const list = getCurrentObjectImages();
+    const sourceIndex = list.findIndex((x) => x.name === imgInfo.name);
+    const nextNum = getNextImageNumber();
+    const newName = `image-${nextNum}`;
+    const timestamp = Date.now();
+    const newInfo = { id: timestamp, name: newName, src: srcCopy };
+    if (typeof imgInfo.width === 'number' && typeof imgInfo.height === 'number' && imgInfo.width >= 1 && imgInfo.height >= 1) {
+        newInfo.width = imgInfo.width;
+        newInfo.height = imgInfo.height;
+    }
+    if (sourceIndex >= 0) {
+        list.splice(sourceIndex + 1, 0, newInfo);
+    } else {
+        list.push(newInfo);
+    }
+
+    currentImageFilename = newInfo.name;
+    currentImageInfo = newInfo;
+    localStorage.setItem('lastSelectedImage', srcCopy);
+    setLastSelectedImageForObject(selected_object, srcCopy);
+    selectedImage = srcCopy;
+    if (imageEditor) imageEditor.loadImage(srcCopy);
+
+    const obj = objects.find((o) => o.id == selected_object);
+    if (obj) {
+        if (!obj.media) obj.media = [];
+        if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: srcCopy });
+        else obj.media[0].path = srcCopy;
+        const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+        if (box) {
+            let img = box.querySelector('img');
+            if (!img) {
+                img = document.createElement('img');
+                box.insertBefore(img, box.firstChild);
+            }
+            img.src = srcCopy;
+            img.alt = obj.name;
+            img.style.width = '75px';
+            img.style.height = '75px';
+        }
+        renderGameWindowSprite();
+    }
+
+    const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
+    if (thumbnailsContainer) {
+        loadImagesFromDirectory(thumbnailsContainer);
+        setTimeout(() => {
+            let targetEl = thumbnailsContainer.querySelector(`.image-thumbnail-item[data-filename="${newName}"]`);
+            if (!targetEl) {
+                const items = Array.from(thumbnailsContainer.children);
+                targetEl = items[sourceIndex + 1] || items[items.length - 1] || null;
+            }
+            if (targetEl) {
+                try {
+                    targetEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+                } catch (_) {}
+                const imgEl = targetEl.querySelector('img');
+                const path = imgEl ? imgEl.src : srcCopy;
                 selectImage(path, targetEl);
             }
         }, 30);
@@ -6109,43 +8930,98 @@ function triggerUploadImage() {
 
 // Start renaming an image
 function startRenameImage(imageItem, oldFilename) {
+    if (imageItem.querySelector('.rename-input')) return;
     const label = imageItem.querySelector('.image-label');
     if (!label) return;
+
+    const prevDraggable = imageItem.draggable;
+    imageItem.draggable = false;
+    imageItem.classList.add('renaming');
 
     // Create input field
     const input = document.createElement('input');
     input.type = 'text';
     input.value = oldFilename;
     input.className = 'rename-input';
+    input.setAttribute('aria-label', 'Image name');
+    input.setAttribute('spellcheck', 'false');
+    input.autocomplete = 'off';
+    input.draggable = false;
+    input.addEventListener('mousedown', (e) => e.stopPropagation());
+    input.addEventListener('click', (e) => e.stopPropagation());
+    input.addEventListener('dblclick', (e) => e.stopPropagation());
+    input.addEventListener('dragstart', (e) => e.preventDefault());
 
     // Replace label with input
     label.parentNode.replaceChild(input, label);
-    input.focus();
-    input.select();
+    const focusInput = () => {
+        try {
+            input.focus({ preventScroll: true });
+            input.select();
+        } catch (_) {
+            input.focus();
+            input.select();
+        }
+    };
+    focusInput();
+    // Re-assert focus after editor steals it; do not select() again or caret clicks get wiped next frame.
+    requestAnimationFrame(() => {
+        try {
+            input.focus({ preventScroll: true });
+        } catch (_) {
+            input.focus();
+        }
+    });
+
+    let finished = false;
+    const restoreDraggable = () => {
+        imageItem.draggable = prevDraggable;
+        imageItem.classList.remove('renaming');
+    };
 
     // Handle input events
     const finishRename = () => {
+        if (finished) return;
+        finished = true;
         const newFilename = input.value.trim();
+        const list = getCurrentObjectImages();
+        const found = list.find(x => x.name === oldFilename);
+        const thumb = imageItem.querySelector('img');
+
         if (newFilename && newFilename !== oldFilename) {
-            console.log(`Renaming ${oldFilename} to ${newFilename}`);
-            label.textContent = newFilename;
-            imageItem.dataset.filename = newFilename;
-            const list = getCurrentObjectImages();
-            const found = list.find(x => x.name === oldFilename);
-            if (found) found.name = newFilename;
+            if (found && list.some(x => x !== found && x.name === newFilename)) {
+                label.textContent = oldFilename;
+            } else if (found) {
+                found.name = newFilename;
+                label.textContent = newFilename;
+                imageItem.dataset.filename = newFilename;
+                if (thumb) thumb.alt = newFilename;
+                if (currentImageFilename === oldFilename) currentImageFilename = newFilename;
+                if (currentImageInfo && currentImageInfo === found) currentImageInfo.name = newFilename;
+            }
         }
 
         // Replace input with label
-        input.parentNode.replaceChild(label, input);
+        if (input.parentNode) input.parentNode.replaceChild(label, input);
+        restoreDraggable();
+    };
+
+    const cancelRename = () => {
+        if (finished) return;
+        finished = true;
+        label.textContent = oldFilename;
+        if (input.parentNode) input.parentNode.replaceChild(label, input);
+        restoreDraggable();
     };
 
     input.addEventListener('blur', finishRename);
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
+            e.preventDefault();
             finishRename();
         } else if (e.key === 'Escape') {
-            // Cancel rename
-            input.parentNode.replaceChild(label, input);
+            e.preventDefault();
+            cancelRename();
         }
     });
 }
@@ -6269,6 +9145,21 @@ function createBox(boxData) {
             (rememberedBase && images.find(img => (img.src || '').split('?')[0] === rememberedBase)) ||
             (images[0] || null);
         selectedImage = chosen ? chosen.src : null;
+
+        ensureDefaultSoundForObject(obj);
+        const soundList = getCurrentObjectSounds();
+        const mediaSound = obj.media && obj.media.find((m) => m && m.type === 'sound');
+        const baseSound = mediaSound && mediaSound.path ? String(mediaSound.path).split('?')[0] : '';
+        const rememberedS = getLastSelectedSoundForObject(selected_object);
+        const rememberedSBase = rememberedS ? rememberedS.split('?')[0] : '';
+        const chosenSound =
+            (baseSound && soundList.find((s) => (s.src || '').split('?')[0] === baseSound)) ||
+            (rememberedSBase && soundList.find((s) => (s.src || '').split('?')[0] === rememberedSBase)) ||
+            (soundList[0] || null);
+        selectedSoundSrc = chosenSound ? chosenSound.src : null;
+        currentSoundInfo = chosenSound || null;
+        currentSoundFilename = chosenSound ? chosenSound.name : null;
+
         updateWorkspace();
         renderGameWindowSprite();
     });
@@ -6322,6 +9213,7 @@ function addNewObject() {
 
     // Initialize images for the new object BEFORE rendering
     ensureDefaultImageForObject(newObject);
+    ensureDefaultSoundForObject(newObject);
 
     // Re-render the grid to include the new object with its default image
     renderObjectGrid();
@@ -6388,6 +9280,9 @@ function deleteObject(objectId) {
     // Remove object images
     if (objectImages[String(objectId)]) {
         delete objectImages[String(objectId)];
+    }
+    if (objectSounds[String(objectId)]) {
+        delete objectSounds[String(objectId)];
     }
 
     console.log(`Object deleted: ${obj.name} (ID: ${objectId})`);
@@ -6464,7 +9359,8 @@ function createPlusButton() {
 
     const plusIcon = document.createElement("div");
     plusIcon.className = "plus-icon";
-    plusIcon.textContent = "+";
+    setCodeZoomBtnIcon(plusIcon, ['plus'], '+', 48);
+    try { window.lucide && window.lucide.createIcons && window.lucide.createIcons(); } catch (_) {}
     plusBox.appendChild(plusIcon);
 
     plusBox.addEventListener("click", addNewObject);
@@ -6650,14 +9546,40 @@ function serializeProject() {
 	// Ensure model is migrated and has start blocks prior to save
 	migrateCodeModel();
 	ensureStartBlocks();
+	let sw = 800;
+	let sh = 600;
+	if (projectStageWidth != null && projectStageHeight != null
+		&& projectStageWidth > 0 && projectStageHeight > 0) {
+		sw = projectStageWidth;
+		sh = projectStageHeight;
+	} else {
+		const gc = document.getElementById('game-window');
+		if (gc && gc.width > 0 && gc.height > 0) {
+			sw = gc.width;
+			sh = gc.height;
+		}
+	}
 	const project = {
 		version: 1,
+		stageWidth: sw,
+		stageHeight: sh,
 		selected_object,
 		objects: JSON.parse(JSON.stringify(objects)),
-		images: {}
+		images: {},
+		sounds: {}
 	};
 	Object.keys(objectImages).forEach((key) => {
-		project.images[key] = (objectImages[key] || []).map(img => ({ id: img.id, name: img.name, src: img.src }));
+		project.images[key] = (objectImages[key] || []).map((img) => {
+			const row = { id: img.id, name: img.name, src: img.src };
+			if (typeof img.width === 'number' && typeof img.height === 'number' && img.width >= 1 && img.height >= 1) {
+				row.width = img.width;
+				row.height = img.height;
+			}
+			return row;
+		});
+	});
+	Object.keys(objectSounds).forEach((key) => {
+		project.sounds[key] = (objectSounds[key] || []).map((s) => ({ id: s.id, name: s.name, src: s.src }));
 	});
 	return project;
 }
@@ -6708,17 +9630,40 @@ async function loadProjectFromFile(file) {
 					for (const obj of data.objects) objects.push(obj);
 					// Replace objectImages in-place
 					Object.keys(objectImages).forEach(k => { delete objectImages[k]; });
+					Object.keys(objectSounds).forEach(k => { delete objectSounds[k]; });
 					if (data.images && typeof data.images === 'object') {
 						Object.keys(data.images).forEach(k => {
 							const list = Array.isArray(data.images[k]) ? data.images[k] : [];
-							objectImages[k] = list.map(img => ({ id: img.id, name: img.name, src: img.src }));
+							objectImages[k] = list.map((img) => {
+								const row = { id: img.id, name: img.name, src: img.src };
+								if (typeof img.width === 'number' && typeof img.height === 'number' && img.width >= 1 && img.height >= 1) {
+									row.width = img.width;
+									row.height = img.height;
+								}
+								return row;
+							});
+						});
+					}
+					if (data.sounds && typeof data.sounds === 'object') {
+						Object.keys(data.sounds).forEach(k => {
+							const list = Array.isArray(data.sounds[k]) ? data.sounds[k] : [];
+							objectSounds[k] = list.map((s) => ({ id: s.id, name: s.name, src: s.src }));
 						});
 					}
 					// Migrate and ensure start blocks after load
 					migrateCodeModel();
 					ensureStartBlocks();
-					// Ensure each object has at least a default image
+					if (typeof data.stageWidth === 'number' && typeof data.stageHeight === 'number'
+						&& data.stageWidth >= 1 && data.stageHeight >= 1) {
+						projectStageWidth = Math.min(4096, Math.round(data.stageWidth));
+						projectStageHeight = Math.min(4096, Math.round(data.stageHeight));
+					} else {
+						projectStageWidth = null;
+						projectStageHeight = null;
+					}
+					// Ensure each object has at least a default image and sound clip
 					initializeDefaultImages();
+					initializeDefaultSounds();
 					// Restore selection if present
 					if (typeof data.selected_object === 'number') {
 						selected_object = data.selected_object;
@@ -6733,6 +9678,8 @@ async function loadProjectFromFile(file) {
 					try {
 						const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
 						if (thumbnailsContainer) loadImagesFromDirectory(thumbnailsContainer);
+						const soundThumbs = document.querySelector('.sounds-thumbnails-scroll');
+						if (soundThumbs) loadSoundsFromDirectory(soundThumbs);
 					} catch {}
 					try { setTimeout(renderGameWindowSprite, 30); } catch {}
 					resolve(true);
@@ -6754,6 +9701,7 @@ async function exportProjectAsHtml() {
 	try {
 		const data = serializeProject();
 		await ensureProjectImagesEmbedded(data);
+		await ensureProjectSoundsEmbedded(data);
 		const html = generateStandaloneHtml(data);
 		const blob = new Blob([html], { type: 'text/html' });
 		const url = URL.createObjectURL(blob);
@@ -6809,21 +9757,63 @@ async function ensureProjectImagesEmbedded(project) {
 	});
 	await Promise.all(tasks);
 }
+
+async function ensureProjectSoundsEmbedded(project) {
+	async function toEmbedded(src) {
+		try {
+			if (!src) return generateSilentWavDataUrl();
+			if (src.startsWith('data:')) return src;
+			const clean = src.split('?')[0];
+			const res = await fetch(clean, { credentials: 'same-origin' });
+			if (!res.ok) throw new Error('fetch failed: ' + res.status);
+			const blob = await res.blob();
+			return await new Promise((resolve) => {
+				const fr = new FileReader();
+				fr.onload = () => resolve(String(fr.result || ''));
+				fr.readAsDataURL(blob);
+			});
+		} catch (_) {
+			try { return generateSilentWavDataUrl(); } catch { return ''; }
+		}
+	}
+
+	if (!project.sounds) project.sounds = {};
+	for (const obj of project.objects || []) {
+		const key = String(obj.id);
+		if (!project.sounds[key] || project.sounds[key].length === 0) {
+			const m = obj && obj.media ? obj.media.find((x) => x && x.type === 'sound') : null;
+			const path = m && m.path ? m.path : null;
+			if (path) {
+				const src = await toEmbedded(path);
+				project.sounds[key] = [{ id: Date.now(), name: 'sound-1.wav', src }];
+			}
+		}
+	}
+	const tasks = [];
+	Object.keys(project.sounds).forEach((key) => {
+		(project.sounds[key] || []).forEach((s) => {
+			tasks.push((async () => { s.src = await toEmbedded(s.src); })());
+		});
+	});
+	await Promise.all(tasks);
+}
 function generateStandaloneHtml(project) {
-	const safeJson = JSON.stringify(project);
+	// Escape < so strings cannot contain "</script>" (or "</style>") and break the inline script/HTML.
+	const safeJson = JSON.stringify(project).replace(/</g, '\\u003c');
 	// Minimal runner uses same semantics as in-editor runtime
 	return `<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Maxiverse Export</title>
 	<style>
-	  html,body{margin:0;height:100%;background:#777;color:#fff}
+	  html,body{margin:0;height:100%;width:100%;overflow:hidden;background:#777;color:#fff}
 	  body{display:flex;align-items:center;justify-content:center}
-	  canvas{display:block;width:100vw;height:100vh;background:#777}
+	  canvas{display:block;background:#777;image-rendering:pixelated;image-rendering:crisp-edges}
 	</style>
 	</head><body>
 	<canvas id="game" tabindex="0"></canvas>
 	<script>
-	const project = ${safeJson};
+	const project = ` + safeJson + `;
 	let objects = project.objects || [];
 	const objectImages = project.images || {};
+	const objectSounds = project.sounds || {};
 	// Match editor fairness/time budget
 	const TIME_BUDGET_MS = 6;
 	const LOOP_YIELD_MS = 1000 / 60;
@@ -6836,12 +9826,72 @@ function generateStandaloneHtml(project) {
 	let runtimePositions = {};
 	let runtimeVariables = {};
 	let runtimeGlobalVariables = {};
+	let frameGlobalReadSnapshot = null;
+	function syncFrameGlobalReadSnapshotAfterPublicWrite(varName) {
+	  if (frameGlobalReadSnapshot == null) return;
+	  const v = runtimeGlobalVariables[varName];
+	  if (typeof v === 'number') frameGlobalReadSnapshot[varName] = v;
+	  else if (Array.isArray(v)) frameGlobalReadSnapshot[varName] = v;
+	}
 	let nextInstanceId = 1;
 	let instancesPendingRemoval = new Set();
-	let instancesPendingCreation = [];
 	const runtimeMouse = { x: 0, y: 0 };
 	let runtimeMousePressed = false;
 	const runtimeKeys = {};
+
+	function parseNumericInput(raw) {
+	  if (raw == null || raw === '') return 0;
+	  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : 0;
+	  if (typeof raw === 'boolean') return raw ? 1 : 0;
+	  if (typeof raw === 'string') {
+	    const s = raw.trim();
+	    if (s === '') return 0;
+	    const m = s.match(/^([+-]?(?:\\d*\\.?\\d+|\\d+\\.?\\d*))\\s*\\/\\s*([+-]?(?:\\d*\\.?\\d+|\\d+\\.?\\d*))$/);
+	    if (m) {
+	      const a = parseFloat(m[1]);
+	      const b = parseFloat(m[2]);
+	      if (b !== 0 && Number.isFinite(a) && Number.isFinite(b)) return a / b;
+	    }
+	    const n = Number(s);
+	    if (Number.isFinite(n)) return n;
+	    const f = parseFloat(s);
+	    return Number.isFinite(f) ? f : 0;
+	  }
+	  const n = Number(raw);
+	  return Number.isFinite(n) ? n : 0;
+	}
+
+	function registerRuntimeInstanceFromTemplate(instanceId, templateId) {
+	  const template = objects.find(o => o.id === templateId);
+	  if (!template) return false;
+	  runtimeInstances.push({ instanceId, templateId });
+	  runtimePositions[instanceId] = { x: 0, y: 0, layer: 0 };
+	  runtimeVariables[instanceId] = {};
+	  try {
+	    const arrs = Array.isArray(template.arrayVariables) ? template.arrayVariables : [];
+	    arrs.forEach(name => { runtimeVariables[instanceId][name] = []; });
+	  } catch (_) {}
+	  const start = (template.code || []).find(b => b && b.type === 'start');
+	  const pcT = start && typeof start.next_block_a === 'number' ? start.next_block_a : null;
+	  runtimeExecState[instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+	  return true;
+	}
+	function runInstanceStartChainSync(instanceId) {
+	  const savedFilter = __stepOnlyInstanceIds;
+	  let guard = 0;
+	  try {
+	    while (isPlaying && guard++ < 100000) {
+	      const exec = runtimeExecState[instanceId];
+	      if (!exec) break;
+	      if (exec.waitMs > 0) break;
+	      if (exec.pc == null && exec.repeatStack.length === 0) break;
+	      __stepOnlyInstanceIds = [instanceId];
+	      stepInterpreter(0);
+	    }
+	  } finally {
+	    __stepOnlyInstanceIds = savedFilter;
+	  }
+	}
 
 	function getFirstImagePathForTemplateId(tid){
 	  const list = objectImages[String(tid)]||[];
@@ -6849,12 +9899,15 @@ function generateStandaloneHtml(project) {
 	  const src = list[0].src || '';
 	  return src.split('?')[0];
 	}
+	function normalizeExportPath(p) {
+	  if (p == null || p === '') return null;
+	  return String(p).split('?')[0];
+	}
 
 	function startPlay(){
 	  runtimeInstances = [];
 	  runtimeExecState = {};
 	  instancesPendingRemoval = new Set();
-	  instancesPendingCreation = [];
 	  runtimeVariables = {};
 	  runtimeGlobalVariables = {};
 	  const controller = objects.find(o=>o.type==='controller' || o.name==='AppController');
@@ -6878,62 +9931,367 @@ function generateStandaloneHtml(project) {
 	  return { x: cx, y: cy };
 	}
 
+	const imageCache = {};
+	function resolveExportImage(inst) {
+	  const tmpl = objects.find(o => o.id === inst.templateId);
+	  if (!tmpl) return null;
+	  const pi = runtimePositions[inst.instanceId] || {};
+	  const primary = normalizeExportPath(pi.spritePath || getFirstImagePathForTemplateId(tmpl.id));
+	  const fallback = normalizeExportPath(getFirstImagePathForTemplateId(tmpl.id));
+	  const mediaP = tmpl.media && tmpl.media[0] && tmpl.media[0].path ? normalizeExportPath(tmpl.media[0].path) : null;
+	  const tryKeys = [];
+	  if (primary) tryKeys.push(primary);
+	  if (fallback && fallback !== primary) tryKeys.push(fallback);
+	  if (mediaP && tryKeys.indexOf(mediaP) < 0) tryKeys.push(mediaP);
+	  for (let ki = 0; ki < tryKeys.length; ki++) {
+	    const key = tryKeys[ki];
+	    const img = imageCache[key];
+	    if (img && img.complete && img.naturalWidth > 0) return { img, pathKey: key };
+	  }
+	  return null;
+	}
+	let touchingScratchCanvasExport = null;
+	let __touchFrameSerial = 0;
+	const __colorScratchCacheExport = { serial: -1, excludeId: null, w: 0, h: 0, fingerprint: 0 };
+	function touchingWorldFingerprintExport(inst, canvas) {
+	  let h = (canvas.width << 16) ^ canvas.height;
+	  for (let i = 0; i < runtimeInstances.length; i++) {
+	    const o = runtimeInstances[i];
+	    if (o.instanceId === inst.instanceId) continue;
+	    const p = runtimePositions[o.instanceId] || {};
+	    const x = typeof p.x === 'number' ? p.x : 0;
+	    const y = typeof p.y === 'number' ? p.y : 0;
+	    const rot = typeof p.rot === 'number' ? p.rot : 0;
+	    const ly = typeof p.layer === 'number' ? p.layer : 0;
+	    const sc = typeof p.scale === 'number' ? p.scale : 1;
+	    const al = typeof p.alpha === 'number' ? p.alpha : 1;
+	    const sp = p.spritePath != null ? String(p.spritePath) : '';
+	    h = Math.imul(h, 0x9e3779b9) + o.instanceId;
+	    h = Math.imul(h, 0x9e3779b9) + (x * 1000 | 0);
+	    h = Math.imul(h, 0x9e3779b9) + (y * 1000 | 0);
+	    h = Math.imul(h, 0x9e3779b9) + (rot * 1000 | 0);
+	    h = Math.imul(h, 0x9e3779b9) + ly;
+	    h = Math.imul(h, 0x9e3779b9) + (sc * 1000 | 0);
+	    h = Math.imul(h, 0x9e3779b9) + (al * 1000 | 0);
+	    for (let j = 0; j < sp.length; j++) h = Math.imul(h, 31) + sp.charCodeAt(j);
+	  }
+	  return h | 0;
+	}
+	const spriteImageDataTouch = {};
+	function getSpriteImageDataTouch(path, img) {
+	  if (spriteImageDataTouch[path]) return spriteImageDataTouch[path];
+	  if (!img || !img.complete || !(img.naturalWidth > 0)) return null;
+	  const c = document.createElement('canvas');
+	  c.width = img.naturalWidth;
+	  c.height = img.naturalHeight;
+	  const x = c.getContext('2d');
+	  try { x.drawImage(img, 0, 0); } catch (_) { return null; }
+	  let d;
+	  try { d = x.getImageData(0, 0, c.width, c.height).data; } catch (_) { return null; }
+	  return spriteImageDataTouch[path] = { data: d, width: c.width, height: c.height };
+	}
+	function spriteAlphaTouch(path, lx, ly, img) {
+	  const g = getSpriteImageDataTouch(path, img);
+	  if (!g) return 0;
+	  const ix = Math.floor(lx);
+	  const iy = Math.floor(ly);
+	  if (ix < 0 || iy < 0 || ix >= g.width || iy >= g.height) return 0;
+	  return g.data[(iy * g.width + ix) * 4 + 3];
+	}
+	function getBoundsTouch(inst, canvas) {
+	  const tmpl = objects.find(o => o.id === inst.templateId);
+	  if (!tmpl) return null;
+	  const res = resolveExportImage(inst);
+	  if (!res) return null;
+	  const { img, pathKey: path } = res;
+	  const perInst = runtimePositions[inst.instanceId] || {};
+	  const scale = (typeof perInst.scale === 'number') ? Math.max(0, perInst.scale) : 1;
+	  const nw = img.naturalWidth || img.width;
+	  const nh = img.naturalHeight || img.height;
+	  const dw = nw * scale;
+	  const dh = nh * scale;
+	  const p = worldToCanvas(perInst.x || 0, perInst.y || 0, canvas);
+	  return { left: p.x - dw / 2, top: p.y - dh / 2, right: p.x + dw / 2, bottom: p.y + dh / 2, dw, dh, img, path };
+	}
+	function getRotatedSpriteCanvasAABBExp(bounds, rotDeg) {
+	  if (!bounds) return null;
+	  const cx = bounds.left + bounds.dw / 2;
+	  const cy = bounds.top + bounds.dh / 2;
+	  const hw = bounds.dw / 2;
+	  const hh = bounds.dh / 2;
+	  if (rotDeg == null || rotDeg === 0 || rotDeg === 360 || rotDeg === -360) {
+	    return { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom };
+	  }
+	  const th = rotDeg * Math.PI / 180;
+	  const cos = Math.cos(th);
+	  const sin = Math.sin(th);
+	  const corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+	  let minX = Infinity;
+	  let maxX = -Infinity;
+	  let minY = Infinity;
+	  let maxY = -Infinity;
+	  for (let ci = 0; ci < 4; ci++) {
+	    const lx = corners[ci][0];
+	    const ly = corners[ci][1];
+	    const px = cx + lx * cos - ly * sin;
+	    const py = cy + lx * sin + ly * cos;
+	    if (px < minX) minX = px;
+	    if (px > maxX) maxX = px;
+	    if (py < minY) minY = py;
+	    if (py > maxY) maxY = py;
+	  }
+	  return { left: minX, top: minY, right: maxX, bottom: maxY };
+	}
+	function canvasAlphaFromInstanceExport(inst, px, py, canvas) {
+	  const b = getBoundsTouch(inst, canvas);
+	  if (!b) return 0;
+	  const perInst = runtimePositions[inst.instanceId] || {};
+	  const rotDeg = typeof perInst.rot === 'number' ? perInst.rot : 0;
+	  const th = rotDeg * Math.PI / 180;
+	  const cos = Math.cos(th);
+	  const sin = Math.sin(th);
+	  const cx = b.left + b.dw / 2;
+	  const cy = b.top + b.dh / 2;
+	  const dx = px - cx;
+	  const dy = py - cy;
+	  const lx = cos * dx + sin * dy;
+	  const ly = -sin * dx + cos * dy;
+	  const hw = b.dw / 2;
+	  const hh = b.dh / 2;
+	  if (lx < -hw || lx > hw || ly < -hh || ly > hh) return 0;
+	  const u01 = (lx + hw) / b.dw;
+	  const v01 = (ly + hh) / b.dh;
+	  if (u01 < 0 || u01 > 1 || v01 < 0 || v01 > 1) return 0;
+	  const ix = u01 * b.img.naturalWidth;
+	  const iy = v01 * b.img.naturalHeight;
+	  const raw = spriteAlphaTouch(b.path, ix, iy, b.img);
+	  const g = (typeof perInst.alpha === 'number') ? Math.max(0, Math.min(1, perInst.alpha)) : 1;
+	  return Math.round(raw * g);
+	}
+	function evalTouchingObjectExport(inst, node, canvas) {
+	  const tid = parseInt(String(node.val_a || '0'), 10);
+	  if (!Number.isFinite(tid)) return 0;
+	  const selfB = getBoundsTouch(inst, canvas);
+	  if (!selfB) return 0;
+	  const selfRot = (runtimePositions[inst.instanceId] && typeof runtimePositions[inst.instanceId].rot === 'number')
+	    ? runtimePositions[inst.instanceId].rot : 0;
+	  const selfAabb = getRotatedSpriteCanvasAABBExp(selfB, selfRot);
+	  if (!selfAabb) return 0;
+	  const ALPHA_THRESHOLD = 16;
+	  for (let i = 0; i < runtimeInstances.length; i++) {
+	    const other = runtimeInstances[i];
+	    if (other.instanceId === inst.instanceId) continue;
+	    if (other.templateId !== tid) continue;
+	    const ob = getBoundsTouch(other, canvas);
+	    if (!ob) continue;
+	    const otherRot = (runtimePositions[other.instanceId] && typeof runtimePositions[other.instanceId].rot === 'number')
+	      ? runtimePositions[other.instanceId].rot : 0;
+	    const otherAabb = getRotatedSpriteCanvasAABBExp(ob, otherRot);
+	    if (!otherAabb) continue;
+	    const left = Math.max(selfAabb.left, otherAabb.left, 0);
+	    const top = Math.max(selfAabb.top, otherAabb.top, 0);
+	    const right = Math.min(selfAabb.right, otherAabb.right, canvas.width);
+	    const bottom = Math.min(selfAabb.bottom, otherAabb.bottom, canvas.height);
+	    if (right <= left || bottom <= top) continue;
+	    const w = right - left;
+	    const h = bottom - top;
+	    const area = w * h;
+	    const stride = area > 80000 ? 3 : (area > 20000 ? 2 : 1);
+	    for (let py = Math.floor(top); py < Math.ceil(bottom); py += stride) {
+	      for (let px = Math.floor(left); px < Math.ceil(right); px += stride) {
+	        const aa = canvasAlphaFromInstanceExport(inst, px + 0.5, py + 0.5, canvas);
+	        if (aa < ALPHA_THRESHOLD) continue;
+	        const bb = canvasAlphaFromInstanceExport(other, px + 0.5, py + 0.5, canvas);
+	        if (bb >= ALPHA_THRESHOLD) return 1;
+	      }
+	    }
+	  }
+	  return 0;
+	}
+	function evalTouchingColorExport(inst, node, canvas) {
+	  const tr = Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0)));
+	  const tg = Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0)));
+	  const tb = Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0)));
+	  const selfB = getBoundsTouch(inst, canvas);
+	  if (!selfB) return 0;
+	  const sc = touchingScratchCanvasExport || (touchingScratchCanvasExport = document.createElement('canvas'));
+	  if (sc.width !== canvas.width || sc.height !== canvas.height) {
+	    sc.width = canvas.width;
+	    sc.height = canvas.height;
+	  }
+	  const sctx = sc.getContext('2d');
+	  const fp = touchingWorldFingerprintExport(inst, canvas);
+	  if (!(__colorScratchCacheExport.serial === __touchFrameSerial
+	      && __colorScratchCacheExport.excludeId === inst.instanceId
+	      && __colorScratchCacheExport.w === canvas.width
+	      && __colorScratchCacheExport.h === canvas.height
+	      && __colorScratchCacheExport.fingerprint === fp)) {
+	    sctx.fillStyle = '#777';
+	    sctx.fillRect(0, 0, canvas.width, canvas.height);
+	    sctx.imageSmoothingEnabled = false;
+	    const entries = [];
+	    for (let i = 0; i < runtimeInstances.length; i++) {
+	      const i2 = runtimeInstances[i];
+	      if (i2.instanceId === inst.instanceId) continue;
+	      const res = resolveExportImage(i2);
+	      if (res) entries.push({ inst: i2, path: res.pathKey });
+	    }
+	    entries.sort((a, b) => {
+	      const la = (runtimePositions[a.inst.instanceId] && typeof runtimePositions[a.inst.instanceId].layer === 'number') ? runtimePositions[a.inst.instanceId].layer : 0;
+	      const lb = (runtimePositions[b.inst.instanceId] && typeof runtimePositions[b.inst.instanceId].layer === 'number') ? runtimePositions[b.inst.instanceId].layer : 0;
+	      return la - lb;
+	    });
+	    for (const e of entries) {
+	      let im = imageCache[e.path];
+	      if (!im || !im.complete || !(im.naturalWidth > 0)) continue;
+	      const pi = runtimePositions[e.inst.instanceId] || {};
+	      const sca = (typeof pi.scale === 'number') ? Math.max(0, pi.scale) : 1;
+	      const dw = (im.naturalWidth || im.width) * sca;
+	      const dh = (im.naturalHeight || im.height) * sca;
+	      const p = worldToCanvas(pi.x || 0, pi.y || 0, canvas);
+	      const dx = Math.round(p.x - dw / 2);
+	      const dy = Math.round(p.y - dh / 2);
+	      if (dx + dw < 0 || dy + dh < 0 || dx > canvas.width || dy > canvas.height) continue;
+	      const al = (typeof pi.alpha === 'number') ? Math.max(0, Math.min(1, pi.alpha)) : 1;
+	      if (typeof pi.rot === 'number') {
+	        const ar = (pi.rot || 0) * Math.PI / 180;
+	        sctx.save();
+	        sctx.translate(dx + dw / 2, dy + dh / 2);
+	        sctx.rotate(ar);
+	        const pr = sctx.globalAlpha;
+	        sctx.globalAlpha = al;
+	        sctx.drawImage(im, -dw / 2, -dh / 2, dw, dh);
+	        sctx.globalAlpha = pr;
+	        sctx.restore();
+	      } else {
+	        const pr = sctx.globalAlpha;
+	        sctx.globalAlpha = al;
+	        sctx.drawImage(im, dx, dy, dw, dh);
+	        sctx.globalAlpha = pr;
+	      }
+	    }
+	    __colorScratchCacheExport.serial = __touchFrameSerial;
+	    __colorScratchCacheExport.excludeId = inst.instanceId;
+	    __colorScratchCacheExport.w = canvas.width;
+	    __colorScratchCacheExport.h = canvas.height;
+	    __colorScratchCacheExport.fingerprint = fp;
+	  }
+	  const selfRot = (runtimePositions[inst.instanceId] && typeof runtimePositions[inst.instanceId].rot === 'number')
+	    ? runtimePositions[inst.instanceId].rot : 0;
+	  const selfAabb = getRotatedSpriteCanvasAABBExp(selfB, selfRot);
+	  if (!selfAabb) return 0;
+	  const left = Math.max(Math.floor(selfAabb.left), 0);
+	  const top = Math.max(Math.floor(selfAabb.top), 0);
+	  const right = Math.min(Math.ceil(selfAabb.right), canvas.width);
+	  const bottom = Math.min(Math.ceil(selfAabb.bottom), canvas.height);
+	  if (right <= left || bottom <= top) return 0;
+	  const w = right - left;
+	  const h = bottom - top;
+	  const area = w * h;
+	  const stride = area > 80000 ? 3 : (area > 20000 ? 2 : 1);
+	  const ALPHA_THRESHOLD = 32;
+	  for (let py = top; py < bottom; py += stride) {
+	    const pyFloor = py | 0;
+	    if (pyFloor < 0 || pyFloor >= canvas.height) continue;
+	    const rowLeft = Math.max(0, left);
+	    const rowRight = Math.min(canvas.width, right);
+	    const rowW = rowRight - rowLeft;
+	    if (rowW <= 0) continue;
+	    let rowData;
+	    try { rowData = sctx.getImageData(rowLeft, pyFloor, rowW, 1).data; } catch (_) { continue; }
+	    for (let px = left; px < right; px += stride) {
+	      if (px < 0 || px >= canvas.width) continue;
+	      if (canvasAlphaFromInstanceExport(inst, px + 0.5, py + 0.5, canvas) < ALPHA_THRESHOLD) continue;
+	      const ix = (px - rowLeft) * 4;
+	      if (rowData[ix] === tr && rowData[ix + 1] === tg && rowData[ix + 2] === tb) return 1;
+	    }
+	  }
+	  return 0;
+	}
+
 	function stepInterpreter(dt){
-	  const startTime = performance.now();
+	  frameGlobalReadSnapshot=null;
 	  let totalStepsThisFrame = 0;
 	  const maxStepsPerObject = 50;
 	  const count = runtimeInstances.length;
-	  for (let i=0; i<count; i++){
-	    const inst = runtimeInstances[(rrInstanceStartIndex + i) % Math.max(1, count)];
+	  if (count === 0) return;
+	  function isAppCtrl(o){ return o && (o.type==='controller' || o.name==='AppController'); }
+	  const controllerInstances=[]; const otherInstances=[];
+	  for (let ii=0; ii<count; ii++) {
+	    const inst = runtimeInstances[ii];
+	    const o = objects.find(obj=>obj.id===inst.templateId);
+	    if (isAppCtrl(o)) controllerInstances.push(inst); else otherInstances.push(inst);
+	  }
+	  const oLen = otherInstances.length;
+	  const orderedInstances = controllerInstances.concat(oLen===0 ? [] : otherInstances.map((_, j) => otherInstances[(rrInstanceStartIndex + j) % oLen]));
+	  for (let i=0; i<orderedInstances.length; i++){
+	    const inst = orderedInstances[i];
 	    if (!inst) continue;
 	    if (__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length>0){ if (!__stepOnlyInstanceIds.includes(inst.instanceId)) continue; }
 	    const o = objects.find(obj=>obj.id===inst.templateId);
 	    const exec = runtimeExecState[inst.instanceId];
 	    if (!o || !exec) continue;
+	    if (!isAppCtrl(o) && frameGlobalReadSnapshot===null) {
+	      frameGlobalReadSnapshot={};
+	      for (const k of Object.keys(runtimeGlobalVariables)) {
+	        const v=runtimeGlobalVariables[k];
+	        if (typeof v==='number') frameGlobalReadSnapshot[k]=v;
+	        else if (Array.isArray(v)) frameGlobalReadSnapshot[k]=v;
+	      }
+	    }
+	    const useGlobalReadSnapshot = frameGlobalReadSnapshot!==null && !isAppCtrl(o);
 	    const code = o.code || [];
 	    if (exec.waitMs>0){ exec.waitMs-=dt; if (exec.waitMs>0) continue; exec.waitMs=0; if(exec.waitingBlockId!=null){ const waitingBlock=code.find(b=>b&&b.id===exec.waitingBlockId); exec.waitingBlockId=null; if(waitingBlock){ exec.pc = (typeof waitingBlock.next_block_a==='number') ? waitingBlock.next_block_a : null; } } }
 	    let steps=0;
+	    const perInstanceBudgetStart = performance.now();
 	    outerLoop: while (steps < maxStepsPerObject) {
 	    while (exec.pc!=null && steps++<maxStepsPerObject){
 	      const block = code.find(b=>b&&b.id===exec.pc); if(!block){ exec.pc=null; break; }
-	      const coerceScalarLiteral=(v)=>{ if(typeof v==='number') return v; if(typeof v==='string'){ const s=v.trim(); if(s==='') return ''; const n=Number(s); return Number.isFinite(n)?n:v; } return v; };
+	      const coerceScalarLiteral=(v)=>{ if(typeof v==='number') return v; if(typeof v==='string'){ const s=v.trim(); if(s==='') return ''; if(/^\\s*[+-]?(?:\\d*\\.?\\d+|\\d+\\.?\\d*)\\s*\\/\\s*[+-]?(?:\\d*\\.?\\d+|\\d+\\.?\\d*)\\s*$/.test(s)) return parseNumericInput(s); const n=Number(s); return Number.isFinite(n)?n:v; } return v; };
 	      const getArrayRef=(varName,instanceOnly)=>{ const name=varName||''; const store=instanceOnly ? (runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={})) : runtimeGlobalVariables; let arr=store[name]; if(!Array.isArray(arr)){ arr=[]; store[name]=arr; } return arr; };
-	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='pixel_is_rgb'){ const c=document.getElementById('game'); if(!c) return 0; const xw=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const yw=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const p=worldToCanvas(xw,yw,c); const px=Math.round(p.x); const py=Math.round(p.y); if(!Number.isFinite(px)||!Number.isFinite(py)) return 0; if(px<0||py<0||px>=c.width||py>=c.height) return 0; const cctx=c.getContext('2d'); if(!cctx) return 0; let data; try{ data=cctx.getImageData(px,py,1,1).data; }catch(_){ return 0; } const r=data[0], g=data[1], b=data[2]; const tr=Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0))); const tg=Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0))); const tb=Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0))); return (r===tr && g===tg && b===tb) ? 1 : 0; } if(node.content==='random_int'){ let a=Number((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=Number((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const xVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const yVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); switch(node.val_a){ case '+': return xVal + yVal; case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=Number(v)||0; return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=Number(aVal); let B=Number(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=Number(aVal)||0; const B=Number(bVal)||0; return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const v=runtimeGlobalVariables[varName]; return (typeof v==='number')?v:0; } } if(node.content==='array_get'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); const idxVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const idx=Math.floor(Number(idxVal)); if(!Number.isFinite(idx) || idx<0 || idx>=arr.length) return ''; return arr[idx]; } if(node.content==='array_length'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); return arr.length; } return null; };
+	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='pixel_is_rgb'){ const c=document.getElementById('game'); if(!c) return 0; const xw=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const yw=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const p=worldToCanvas(xw,yw,c); const px=Math.round(p.x); const py=Math.round(p.y); if(!Number.isFinite(px)||!Number.isFinite(py)) return 0; if(px<0||py<0||px>=c.width||py>=c.height) return 0; const cctx=c.getContext('2d'); if(!cctx) return 0; let data; try{ data=cctx.getImageData(px,py,1,1).data; }catch(_){ return 0; } const r=data[0], g=data[1], b=data[2]; const tr=Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0))); const tg=Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0))); const tb=Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0))); return (r===tr && g===tg && b===tb) ? 1 : 0; } if(node.content==='touching'){ const mode=node.touching_mode||'object'; const c=document.getElementById('game'); if(!c) return 0; if(mode==='object'){ return evalTouchingObjectExport(inst,node,c); } if(mode==='color'){ return evalTouchingColorExport(inst,node,c); } return 0; } if(node.content==='random_int'){ let a=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const rawA=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const rawB=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); const op=node.val_a||'+'; if(op==='+'){ if(typeof rawA==='string'||typeof rawB==='string') return String(rawA??'')+String(rawB??''); return parseNumericInput(rawA)+parseNumericInput(rawB);} const xVal=parseNumericInput(rawA); const yVal=parseNumericInput(rawB); switch(op){ case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=parseNumericInput(v); return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=parseNumericInput(aVal); let B=parseNumericInput(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=parseNumericInput(aVal); const B=parseNumericInput(bVal); return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=parseNumericInput(aVal); const B=parseNumericInput(bVal); return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const store=useGlobalReadSnapshot?frameGlobalReadSnapshot:runtimeGlobalVariables; const v=store[varName]; return (typeof v==='number')?v:0; } } if(node.content==='array_get'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); const idxVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const idx=Math.floor(parseNumericInput(idxVal)); if(!Number.isFinite(idx) || idx<0 || idx>=arr.length) return ''; return arr[idx]; } if(node.content==='array_length'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); return arr.length; } return null; };
 	      if (block.type==='action'){
-	        if (block.content==='move_xy'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const y=Number(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x += x; runtimePositions[inst.instanceId].y += y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='move_forward'){ const distance=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const rotDeg=runtimePositions[inst.instanceId].rot || 0; const rotRad=(rotDeg)*Math.PI/180; runtimePositions[inst.instanceId].x += Math.sin(rotRad)*distance; runtimePositions[inst.instanceId].y += Math.cos(rotRad)*distance; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='rotate'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = (runtimePositions[inst.instanceId].rot||0) + Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='set_rotation'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='set_size'){ const s=Number(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1,layer:0}; runtimePositions[inst.instanceId].scale = Math.max(0,s); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='set_layer'){ const layer=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].layer = layer; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='point_towards'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const pos=runtimePositions[inst.instanceId]; const tx=Number((block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0)); const ty=Number((block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0)); const dx=tx-(typeof pos.x==='number'?pos.x:0); const dy=ty-(typeof pos.y==='number'?pos.y:0); const ang=90 - (Math.atan2(dy,dx)*180/Math.PI); pos.rot = ang; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='change_size'){ const ds=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; const cur=runtimePositions[inst.instanceId].scale||1; runtimePositions[inst.instanceId].scale=Math.max(0,cur+ds); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='wait'){ const seconds=Math.max(0, parseFloat(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds>0){ exec.waitMs = seconds*1000; exec.waitingBlockId = block.id; exec.pc = null; } else { exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; } break; }
-	        if (block.content==='repeat'){ const times=Math.max(0, Number(block.val_a||0)); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='move_xy'){ const x=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); const y=parseNumericInput(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x += x; runtimePositions[inst.instanceId].y += y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='move_forward'){ const distance=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const rotDeg=runtimePositions[inst.instanceId].rot || 0; const rotRad=(rotDeg)*Math.PI/180; runtimePositions[inst.instanceId].x += Math.sin(rotRad)*distance; runtimePositions[inst.instanceId].y += Math.cos(rotRad)*distance; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='rotate'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = (runtimePositions[inst.instanceId].rot||0) + parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_rotation'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_size'){ const s=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1,layer:0}; runtimePositions[inst.instanceId].scale = Math.max(0,s); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_layer'){ const layer=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].layer = layer; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='point_towards'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const pos=runtimePositions[inst.instanceId]; const tx=parseNumericInput((block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0)); const ty=parseNumericInput((block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0)); const dx=tx-(typeof pos.x==='number'?pos.x:0); const dy=ty-(typeof pos.y==='number'?pos.y:0); const ang=90 - (Math.atan2(dy,dx)*180/Math.PI); pos.rot = ang; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='change_size'){ const ds=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; const cur=runtimePositions[inst.instanceId].scale||1; runtimePositions[inst.instanceId].scale=Math.max(0,cur+ds); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='wait'){ const seconds=Math.max(0, parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds>0){ exec.waitMs = seconds*1000; exec.waitingBlockId = block.id; exec.pc = null; } else { exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; } break; }
+	        if (block.content==='repeat'){ const times=Math.max(0, Math.floor(parseNumericInput(block.val_a ?? 0))); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='print'){ const val=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); try{ console.log(val);}catch(_){} exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='if'){ const condVal=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); const isTrue = !!condVal; exec.pc = isTrue ? ((typeof block.next_block_b==='number')?block.next_block_b:null) : ((typeof block.next_block_a==='number')?block.next_block_a:null); continue; }
-	        if (block.content==='set_x'){ const x=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='set_y'){ const y=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].y=y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='if'){ const condVal=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); const isTrue = !!condVal; exec.pc = isTrue ? ((typeof block.next_block_b==='number')?block.next_block_b:null) : ((typeof block.next_block_a==='number')?block.next_block_a:null); continue; }
+	        if (block.content==='set_x'){ const x=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_y'){ const y=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].y=y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='switch_image'){ const imgs=(objectImages[String(o.id)]||[]); let found=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(typeof sel==='string'){ found=imgs.find(img=>img.name===sel);} else { found=imgs.find(img=>String(img.id)===String(sel)); } } else { found=imgs.find(img=>String(img.id)===String(block.val_a)); } if(found){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].spritePath = (found.src||'').split('?')[0]; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='instantiate'){ const objId=parseInt(block.val_a,10); const template=objects.find(obj=>obj.id===objId); if(template){ const newId=nextInstanceId++; instancesPendingCreation.push({ instanceId:newId, templateId:template.id }); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='play_sound'){ const snds=(objectSounds[String(o.id)]||[]); let sfound=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(typeof sel==='string'){ sfound=snds.find(s=>s.name===sel);} else { sfound=snds.find(s=>String(s.id)===String(sel)); } } else { sfound=snds.find(s=>String(s.id)===String(block.val_a)); } if(sfound){ try{ const src=(sfound.src||''); if(src){ const a=new Audio(); a.src=src; a.volume=1; a.play().catch(()=>{});}}catch(_){} } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='instantiate'){ const objId=parseInt(block.val_a,10); const template=objects.find(obj=>obj.id===objId); if(template){ const newId=nextInstanceId++; if(registerRuntimeInstanceFromTemplate(newId, template.id)){ runInstanceStartChainSync(newId); } } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='delete_instance'){ instancesPendingRemoval.add(inst.instanceId); exec.pc=null; continue; }
-	        if (block.content==='set_variable'){ const varName=block.var_name||''; const value=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; runtimeVariables[inst.instanceId][varName]=value; } else { runtimeGlobalVariables[varName]=value; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='change_variable'){ const varName=block.var_name||''; const delta=Number(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; const curVal=runtimeVariables[inst.instanceId][varName]; const current=(typeof curVal==='number')?curVal:0; runtimeVariables[inst.instanceId][varName]=current+delta; } else { const curVal=runtimeGlobalVariables[varName]; const current=(typeof curVal==='number')?curVal:0; runtimeGlobalVariables[varName]=current+delta; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_variable'){ const varName=block.var_name||''; const value=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; runtimeVariables[inst.instanceId][varName]=value; } else { runtimeGlobalVariables[varName]=value; syncFrameGlobalReadSnapshotAfterPublicWrite(varName); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='change_variable'){ const varName=block.var_name||''; const delta=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; const curVal=runtimeVariables[inst.instanceId][varName]; const current=(typeof curVal==='number')?curVal:0; runtimeVariables[inst.instanceId][varName]=current+delta; } else { const curVal=runtimeGlobalVariables[varName]; const current=(typeof curVal==='number')?curVal:0; runtimeGlobalVariables[varName]=current+delta; syncFrameGlobalReadSnapshotAfterPublicWrite(varName); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='array_append'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const arr=getArrayRef(varName, !!block.var_instance_only); arr.push(value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='array_insert'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const idxVal=(block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0); let idx=Math.floor(Number(idxVal)); if(!Number.isFinite(idx)) idx=0; const arr=getArrayRef(varName, !!block.var_instance_only); idx=Math.max(0, Math.min(arr.length, idx)); arr.splice(idx,0,value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='array_delete'){ const varName=block.var_name||''; const idxVal=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0); const idx=Math.floor(Number(idxVal)); const arr=getArrayRef(varName, !!block.var_instance_only); if(Number.isFinite(idx) && idx>=0 && idx<arr.length){ arr.splice(idx,1); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='array_insert'){ const varName=block.var_name||''; const raw=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); const value=coerceScalarLiteral(raw); const idxVal=(block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0); let idx=Math.floor(parseNumericInput(idxVal)); if(!Number.isFinite(idx)) idx=0; const arr=getArrayRef(varName, !!block.var_instance_only); idx=Math.max(0, Math.min(arr.length, idx)); arr.splice(idx,0,value); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='array_delete'){ const varName=block.var_name||''; const idxVal=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0); const idx=Math.floor(parseNumericInput(idxVal)); const arr=getArrayRef(varName, !!block.var_instance_only); if(Number.isFinite(idx) && idx>=0 && idx<arr.length){ arr.splice(idx,1); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='forever'){ exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:Infinity, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	      }
 	      exec.pc = (typeof block.next_block_a==='number') ? block.next_block_a : null;
 	      totalStepsThisFrame += 1;
 	      if (typeof MAX_TOTAL_STEPS_PER_FRAME === 'number' && totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
-	      if (typeof TIME_BUDGET_MS === 'number' && (performance.now() - startTime) >= TIME_BUDGET_MS) break;
+	      if (typeof TIME_BUDGET_MS === 'number' && (performance.now() - perInstanceBudgetStart) >= TIME_BUDGET_MS) break;
 	    }
 	    if (exec.pc==null && exec.repeatStack.length>0){
 	      const frame=exec.repeatStack[exec.repeatStack.length-1];
 	      frame.timesRemaining-=1;
 	      if(frame.timesRemaining>0){
 	        const repeatBlock=code.find(b=>b&&b.id===frame.repeatBlockId);
+	        if(repeatBlock && repeatBlock.content==='forever'){
+	          exec.waitMs = LOOP_YIELD_MS;
+	          exec.waitingBlockId = repeatBlock.id;
+	          exec.pc = null;
+	          break outerLoop;
+	        }
 	        exec.pc = repeatBlock && (typeof repeatBlock.next_block_a==='number') ? repeatBlock.next_block_a : null;
 	        if(exec.pc!=null){ continue outerLoop; }
 	        exec.waitMs = LOOP_YIELD_MS;
@@ -6947,29 +10305,49 @@ function generateStandaloneHtml(project) {
 	    break outerLoop;
 	    }
 	  }
-	  if (instancesPendingCreation && instancesPendingCreation.length>0){
-	    const createdIds = [];
-	    for (const pending of instancesPendingCreation){ const template=objects.find(o=>o.id===pending.templateId); if(!template) continue; runtimeInstances.push({ instanceId: pending.instanceId, templateId: pending.templateId }); runtimePositions[pending.instanceId] = { x:0, y:0, layer: 0 }; runtimeVariables[pending.instanceId] = {}; try{ const arrs=Array.isArray(template.arrayVariables)?template.arrayVariables:[]; arrs.forEach(name=>{ runtimeVariables[pending.instanceId][name]=[]; }); }catch(_){} const start=(template.code||[]).find(b=>b&&b.type==='start'); const pcT = start ? start.next_block_a : null; runtimeExecState[pending.instanceId] = { pc: pcT, waitMs:0, waitingBlockId:null, repeatStack: [] }; createdIds.push(pending.instanceId); }
-	    instancesPendingCreation.length=0;
-	    if (createdIds.length>0){ const savedFilter = __stepOnlyInstanceIds; __stepOnlyInstanceIds = createdIds.slice(); try { stepInterpreter(0); } finally { __stepOnlyInstanceIds = savedFilter; } }
-	  }
-	  // Advance RR pointer when not filtering
 	  if (!(__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length>0)){
-	    if (runtimeInstances.length>0){ rrInstanceStartIndex = (rrInstanceStartIndex + 1) % runtimeInstances.length; }
+	    let nonControllerCount = 0;
+	    for (let ri = 0; ri < runtimeInstances.length; ri++) {
+	      const o = objects.find(obj=>obj.id===runtimeInstances[ri].templateId);
+	      if (!isAppCtrl(o)) nonControllerCount++;
+	    }
+	    if (nonControllerCount > 0) { rrInstanceStartIndex = (rrInstanceStartIndex + 1) % nonControllerCount; }
 	  }
+	  // Instantiate runs synchronously in the Instantiate block (runInstanceStartChainSync).
 	  if (instancesPendingRemoval && instancesPendingRemoval.size>0){
 	    runtimeInstances = runtimeInstances.filter(inst=>{ if(instancesPendingRemoval.has(inst.instanceId)){ delete runtimePositions[inst.instanceId]; delete runtimeVariables[inst.instanceId]; delete runtimeExecState[inst.instanceId]; return false; } return true; });
 	    instancesPendingRemoval.clear();
 	  }
+	  frameGlobalReadSnapshot=null;
 	}
 
 	const canvas = document.getElementById('game');
 	const gctx = canvas.getContext('2d');
-	function fit(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
+	const stageW = Math.max(1, Math.round(Number(project.stageWidth) || window.innerWidth));
+	const stageH = Math.max(1, Math.round(Number(project.stageHeight) || window.innerHeight));
+	function fit(){
+	  canvas.width = stageW;
+	  canvas.height = stageH;
+	  const vw = window.innerWidth;
+	  const vh = window.innerHeight;
+	  const sc = Math.min(vw / stageW, vh / stageH);
+	  canvas.style.width = (stageW * sc) + 'px';
+	  canvas.style.height = (stageH * sc) + 'px';
+	}
 	window.addEventListener('resize', fit);
 	fit();
 
-	canvas.addEventListener('mousemove',(e)=>{ const rect=canvas.getBoundingClientRect(); const localX=e.clientX-rect.left; const localY=e.clientY-rect.top; const cx = canvas.width/2; const cy = canvas.height/2; runtimeMouse.x = Math.round(localX - cx); runtimeMouse.y = Math.round(cy - localY); });
+	function updateExportMouse(e){
+	  const rect = canvas.getBoundingClientRect();
+	  const localX = e.clientX - rect.left;
+	  const localY = e.clientY - rect.top;
+	  const sx = canvas.width / Math.max(1e-6, rect.width);
+	  const sy = canvas.height / Math.max(1e-6, rect.height);
+	  runtimeMouse.x = Math.round((localX - rect.width / 2) * sx);
+	  runtimeMouse.y = Math.round((rect.height / 2 - localY) * sy);
+	}
+	canvas.addEventListener('mousemove', updateExportMouse);
+	canvas.addEventListener('pointermove', updateExportMouse, { passive: true });
 	canvas.addEventListener('mousedown',()=>{ runtimeMousePressed=true; });
 	canvas.addEventListener('mouseup',()=>{ runtimeMousePressed=false; });
 	canvas.addEventListener('mouseleave',()=>{ runtimeMousePressed=false; });
@@ -6978,23 +10356,22 @@ function generateStandaloneHtml(project) {
 	document.addEventListener('keydown',(e)=>{ const k=normalizeKeyName(e.key); if(isPlaying&&k==='Space'){ const t=e.target; const tag=t&&t.tagName?String(t.tagName).toLowerCase():''; if(tag!=='input'&&tag!=='textarea'&&tag!=='select'&&!(t&&t.isContentEditable))e.preventDefault(); } runtimeKeys[k]=true;},true);
 	document.addEventListener('keyup',(e)=>{ const k=normalizeKeyName(e.key); runtimeKeys[k]=false;});
 
-	const imageCache = {};
 	function render(){
 	  gctx.clearRect(0,0,canvas.width,canvas.height);
 	  gctx.fillStyle='#777';
 	  gctx.fillRect(0,0,canvas.width,canvas.height);
 	  const centerX=canvas.width/2, centerY=canvas.height/2;
-	  const visibleEntries = runtimeInstances.map(inst=>{ const tmpl=objects.find(o=>o.id===inst.templateId); const perInst=runtimePositions[inst.instanceId]||{}; const pth = perInst.spritePath || getFirstImagePathForTemplateId(tmpl.id); const path = pth ? String(pth).split('?')[0] : null; return path ? { inst, tmpl, path } : null; }).filter(Boolean);
+	  const visibleEntries = runtimeInstances.map(inst=>{ const tmpl=objects.find(o=>o.id===inst.templateId); if (!tmpl) return null; const perInst=runtimePositions[inst.instanceId]||{}; const pth = perInst.spritePath || getFirstImagePathForTemplateId(tmpl.id); const path = pth ? String(pth).split('?')[0] : null; return path ? { inst, tmpl, path } : null; }).filter(Boolean);
 	  visibleEntries.forEach((entry,index)=>{
 	    const mediaPath=entry.path;
 	    let img=imageCache[mediaPath];
 	    if(!img){ img=new Image(); imageCache[mediaPath]=img; img.src=mediaPath; img.onerror=()=>{ console.warn('Image failed to load', mediaPath); }; }
 	    const drawIfReady=()=>{
 	      if(!img.complete || !(img.naturalWidth>0 && img.naturalHeight>0)) return;
-	      gctx.imageSmoothingEnabled=true; gctx.imageSmoothingQuality='medium';
+	      gctx.imageSmoothingEnabled=false;
 	      let scale = 1;
 	      if (runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale==='number') { scale = Math.max(0, runtimePositions[entry.inst.instanceId].scale||1); }
-	      const dw=img.width*scale, dh=img.height*scale;
+	      const dw=(img.naturalWidth||img.width)*scale, dh=(img.naturalHeight||img.height)*scale;
 	      let drawX, drawY;
 	      if (runtimePositions[entry.inst.instanceId]){ const p=worldToCanvas(runtimePositions[entry.inst.instanceId].x||0, runtimePositions[entry.inst.instanceId].y||0, canvas); drawX=Math.round(p.x-dw/2); drawY=Math.round(p.y-dh/2); } else { drawX=Math.round(centerX-dw/2); drawY=Math.round(centerY-dh/2); }
 	      const alpha = (typeof runtimePositions[entry.inst.instanceId]?.alpha === 'number') ? Math.max(0, Math.min(1, runtimePositions[entry.inst.instanceId].alpha)) : 1;
@@ -7005,7 +10382,7 @@ function generateStandaloneHtml(project) {
 	}
 
 	let last=performance.now();
-	function loop(now){ const dt=now-last; last=now; stepInterpreter(dt); render(); requestAnimationFrame(loop); }
+	function loop(now){ const dt=now-last; last=now; __touchFrameSerial++; stepInterpreter(dt); render(); requestAnimationFrame(loop); }
 	startPlay();
 	requestAnimationFrame(loop);
 	</script>
@@ -7024,23 +10401,26 @@ function initApp() {
     } catch (_) {}
     console.log('🚀 DOM Content Loaded - Initializing app...');
     initializeDefaultImages();
+    initializeDefaultSounds();
     initializeTabs();
     initializeEditMenu();
     initializeFileMenu();
+    initCodeBlockKeyboardShortcuts();
     setTimeout(() => refreshObjectGridIcons(), 50);
     console.log('✅ App initialization complete');
     try {
         const topPlay = document.getElementById('topbar-play');
         if (topPlay && !topPlay.__bound) {
             topPlay.__bound = true;
+            setPlayStopButtonIcon(topPlay, false);
             topPlay.addEventListener('click', () => {
                 if (isPlaying) {
                     stopPlay();
-                    topPlay.textContent = '▶';
+                    setPlayStopButtonIcon(topPlay, false);
                     topPlay.classList.remove('active');
                 } else {
                     startPlay();
-                    topPlay.textContent = '■';
+                    setPlayStopButtonIcon(topPlay, true);
                     topPlay.classList.add('active');
                 }
             });
@@ -7052,13 +10432,15 @@ function initApp() {
             playBtn = document.createElement('button');
             playBtn.id = '__play_btn';
             playBtn.type = 'button';
-            playBtn.textContent = '▶';
             playBtn.className = 'fallback-play-btn';
+            setPlayStopButtonIcon(playBtn, false);
             playBtn.addEventListener('click', () => {
                 if (isPlaying) {
                     stopPlay();
+                    setPlayStopButtonIcon(playBtn, false);
                 } else {
                     startPlay();
+                    setPlayStopButtonIcon(playBtn, true);
                 }
             });
             wrapper.style.position = 'relative';
@@ -7101,25 +10483,37 @@ function renderGameWindowSprite() {
     if (!canvas) return;
     const gctx = canvas.getContext('2d');
     if (!gctx) return;
-    // Fit the canvas to right pane size only when changed to avoid expensive reallocation each frame
     const rect = canvas.getBoundingClientRect();
-    if (canvas.width !== rect.width || canvas.height !== rect.height) {
-        canvas.width = rect.width;
-        canvas.height = rect.height;
+    const rw = Math.max(1, Math.round(rect.width));
+    const rh = Math.max(1, Math.round(rect.height));
+    const useFixedStage = projectStageWidth != null && projectStageHeight != null
+        && projectStageWidth > 0 && projectStageHeight > 0;
+    const bw = useFixedStage ? projectStageWidth : rw;
+    const bh = useFixedStage ? projectStageHeight : rh;
+    if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+    }
+    if (useFixedStage) {
+        canvas.style.width = rw + 'px';
+        canvas.style.height = rh + 'px';
+    } else {
+        canvas.style.width = '';
+        canvas.style.height = '';
     }
     // background
     gctx.clearRect(0, 0, canvas.width, canvas.height);
     gctx.fillStyle = '#777';
     gctx.fillRect(0, 0, canvas.width, canvas.height);
-    // Set smoothing once per frame (medium for better performance). Disable per-sprite toggles below.
-    gctx.imageSmoothingEnabled = true;
-    gctx.imageSmoothingQuality = 'medium';
+    // Nearest-neighbor scaling (pixel art; no blur when sprites are scaled)
+    gctx.imageSmoothingEnabled = false;
 
-    // Draw game content. In play, draw runtime instances; otherwise center object previews.
+    // Draw game content. In play (or frozen after stop), draw runtime instances; otherwise empty stage.
+    const drawRuntimeLayout = isPlaying || runtimeInstances.length > 0;
     const centerX = canvas.width / 2;
     const centerY = canvas.height / 2;
     let visibleEntries;
-    if (isPlaying) {
+    if (drawRuntimeLayout) {
         visibleEntries = [];
         for (let i = 0; i < runtimeInstances.length; i++) {
             const inst = runtimeInstances[i];
@@ -7136,7 +10530,6 @@ function renderGameWindowSprite() {
             return layerA - layerB;
         });
     } else {
-        // Don't show object previews when not playing
         visibleEntries = [];
     }
     visibleEntries.forEach((entry, index) => {
@@ -7157,13 +10550,13 @@ function renderGameWindowSprite() {
         const drawIfReady = () => {
             if (!img.complete || img._broken || !(img.naturalWidth > 0 && img.naturalHeight > 0)) return;
             let scale = 1;
-            if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale === 'number') {
+            if (drawRuntimeLayout && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale === 'number') {
                 scale = Math.max(0, runtimePositions[entry.inst.instanceId].scale || 1);
             }
             const dw = img.width * scale;
             const dh = img.height * scale;
             let drawX, drawY;
-            if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId]) {
+            if (drawRuntimeLayout && entry.inst && runtimePositions[entry.inst.instanceId]) {
                 const p = worldToCanvas(runtimePositions[entry.inst.instanceId].x, runtimePositions[entry.inst.instanceId].y, canvas);
                 drawX = Math.round(p.x - dw / 2);
                 drawY = Math.round(p.y - dh / 2);
@@ -7177,9 +10570,8 @@ function renderGameWindowSprite() {
             }
             // Simple AABB culling to skip fully offscreen sprites
             if (drawX + dw < 0 || drawY + dh < 0 || drawX > canvas.width || drawY > canvas.height) return;
-            // Apply rotation if in play mode
-            const alpha = (isPlaying && entry.inst && typeof runtimePositions[entry.inst.instanceId]?.alpha === 'number') ? Math.max(0, Math.min(1, runtimePositions[entry.inst.instanceId].alpha)) : 1;
-            if (isPlaying && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].rot === 'number') {
+            const alpha = (drawRuntimeLayout && entry.inst && typeof runtimePositions[entry.inst.instanceId]?.alpha === 'number') ? Math.max(0, Math.min(1, runtimePositions[entry.inst.instanceId].alpha)) : 1;
+            if (drawRuntimeLayout && entry.inst && runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].rot === 'number') {
                 const angleRad = (runtimePositions[entry.inst.instanceId].rot || 0) * Math.PI / 180;
                 gctx.save();
                 gctx.translate(drawX + dw / 2, drawY + dh / 2);
@@ -7243,6 +10635,7 @@ function refreshObjectGridIcons() {
 // Image Editor Implementation
 // =========================
 function initializeImageEditor(params) {
+    const onCanvasSizeChange = typeof params.onCanvasSizeChange === 'function' ? params.onCanvasSizeChange : null;
     const canvas = params.editorCanvas;
     // Default (sync) 2D path: Firefox WebRender + desynchronized:true spiked ASYNC_IMAGE / composite time in profiling.
     const _editor2dOpts = { alpha: true, willReadFrequently: false };
@@ -7286,6 +10679,8 @@ function initializeImageEditor(params) {
     /** Batched brush: merge pointer samples to one applyBrushPolylineFrame per rAF (fewer GPU texture uploads / ASYNC_IMAGE). */
     let brushStrokeRaf = null;
     let brushStrokeAccum = null;
+    /** Incremented on each loadImage(); stale img.onload handlers must not touch the canvas or undo state. */
+    let loadImageGeneration = 0;
     function mergeBrushPolylineChunk(accum, pts) {
         if (!pts || pts.length < 4) return accum;
         if (!accum || accum.length < 2) return Float64Array.from(pts);
@@ -7455,6 +10850,34 @@ function initializeImageEditor(params) {
         }
     }
 
+    /** After undo/redo: keep objectImages, thumbnails, grid, and game preview in sync with the canvas (same as local save). */
+    function syncCanvasToCurrentAsset() {
+        const dataUrl = canvas.toDataURL('image/png');
+        updateGameObjectIcon(dataUrl);
+        imageRevision += 1;
+        const bust = dataUrl;
+        if (currentImageInfo) {
+            currentImageInfo.src = bust;
+            currentImageInfo.width = canvas.width;
+            currentImageInfo.height = canvas.height;
+        }
+        const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
+        if (selectedThumb) selectedThumb.src = bust;
+        selectedImage = bust;
+        try {
+            localStorage.setItem('lastSelectedImage', bust);
+            setLastSelectedImageForObject(selected_object, bust);
+            lastSelectedImage = bust;
+        } catch (_) {}
+        const obj = objects.find((o) => o.id == selected_object);
+        if (obj) {
+            if (!obj.media) obj.media = [];
+            if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
+            else obj.media[0].path = bust;
+        }
+        scheduleRenderGameWindowSprite();
+    }
+
     function pushUndo() {
         try {
             const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -7492,7 +10915,7 @@ function initializeImageEditor(params) {
         try { drawCrosshair(); } catch (_) {}
     }
     function setZoom(z) {
-        state.zoom = Math.max(0.1, Math.min(8, z));
+        state.zoom = Math.max(0.1, Math.min(12, z));
         updateViewTransform();
         // Coalesce: wheel / pinch can fire many events per frame — one overlay draw per rAF.
         try { scheduleDrawCrosshair(); } catch (_) {}
@@ -7505,7 +10928,7 @@ function initializeImageEditor(params) {
     }
     function zoomAboutClientPoint(clientX, clientY, newZoom) {
         const z0 = state.zoom;
-        const z1 = Math.max(0.1, Math.min(8, newZoom));
+        const z1 = Math.max(0.1, Math.min(12, newZoom));
         if (z1 === z0) return;
         // Compute cursor vector from current canvas center in screen pixels.
         const rect = canvas.getBoundingClientRect();
@@ -7553,7 +10976,11 @@ function initializeImageEditor(params) {
             imageRevision += 1;
             const isDataPersist = typeof persistedPath === 'string' && persistedPath.startsWith('data:');
             const bust = isDataPersist ? persistedPath : `${persistedPath}?v=${imageRevision}`;
-            if (currentImageInfo) currentImageInfo.src = bust;
+            if (currentImageInfo) {
+                currentImageInfo.src = bust;
+                currentImageInfo.width = canvas.width;
+                currentImageInfo.height = canvas.height;
+            }
             // Update only the selected thumbnail image to avoid re-render loops
             const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
             if (selectedThumb) selectedThumb.src = bust;
@@ -7576,7 +11003,11 @@ function initializeImageEditor(params) {
                 currentImageFilename = filename;
                 imageRevision += 1;
                 const bust = dataUrl;
-                if (currentImageInfo) currentImageInfo.src = bust;
+                if (currentImageInfo) {
+                    currentImageInfo.src = bust;
+                    currentImageInfo.width = canvas.width;
+                    currentImageInfo.height = canvas.height;
+                }
                 const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
                 if (selectedThumb) selectedThumb.src = bust;
                 selectedImage = bust;
@@ -7612,22 +11043,102 @@ function initializeImageEditor(params) {
     }
 
     function loadImage(src) {
+        loadImageGeneration += 1;
+        const myGen = loadImageGeneration;
+        flushBrushStrokeNow();
+        state.isDrawing = false;
+        if (state.selection) {
+            state.selection = null;
+            try { clearOverlay(); } catch (_) {}
+        }
+        // Clear immediately so Cmd+Z cannot revert the previous image after the UI switched thumbnails.
+        state.undoStack.length = 0;
+        state.redoStack.length = 0;
         const img = new Image();
         img.crossOrigin = 'anonymous';
         img.onload = () => {
-            // Clear canvas first, then push to undo stack to avoid preserving previous content
+            if (myGen !== loadImageGeneration) return;
+            if (!(img.naturalWidth > 0 && img.naturalHeight > 0)) return;
+            // Match editor bitmap to saved asset pixels (avoid scaling into the default 720×720 surface).
+            const nw = Math.max(1, Math.min(4096, img.naturalWidth));
+            const nh = Math.max(1, Math.min(4096, img.naturalHeight));
+            if (canvas.width !== nw || canvas.height !== nh) {
+                canvas.width = nw;
+                canvas.height = nh;
+                try { ctx.imageSmoothingEnabled = false; } catch (_) {}
+            }
+            state.undoStack.length = 0;
+            state.redoStack.length = 0;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             pushUndo();
-            const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
-            const dw = Math.round(img.width * scale);
-            const dh = Math.round(img.height * scale);
-            const dx = Math.floor((canvas.width - dw) / 2);
-            const dy = Math.floor((canvas.height - dh) / 2);
-            ctx.drawImage(img, dx, dy, dw, dh);
-            // Crosshair is on overlay, no need to redraw
-            // Do not auto-save on image load to avoid save-load loops
+            try { ctx.imageSmoothingEnabled = false; } catch (_) {}
+            ctx.drawImage(img, 0, 0, nw, nh);
+            updateViewTransform();
+            try { scheduleDrawCrosshair(); } catch (_) {}
+            try {
+                if (typeof currentImageInfo === 'object' && currentImageInfo) {
+                    currentImageInfo.width = canvas.width;
+                    currentImageInfo.height = canvas.height;
+                }
+            } catch (_) {}
+            if (onCanvasSizeChange) onCanvasSizeChange();
+        };
+        img.onerror = () => {
+            try {
+                const s = typeof src === 'string' ? src : '';
+                console.warn('loadImage failed', s.length > 96 ? `${s.slice(0, 96)}…` : s);
+            } catch (_) {}
         };
         img.src = src;
+    }
+
+    function getCanvasSize() {
+        return { width: canvas.width, height: canvas.height };
+    }
+
+    /** Resize drawing bitmap; existing art is never scaled—center-cropped if smaller, centered with padding if larger. Clears undo/redo. */
+    function setCanvasSize(nextW, nextH) {
+        const w = Math.max(1, Math.min(4096, Math.round(Number(nextW))));
+        const h = Math.max(1, Math.min(4096, Math.round(Number(nextH))));
+        if (!Number.isFinite(w) || !Number.isFinite(h)) return;
+        if (w === canvas.width && h === canvas.height) {
+            if (onCanvasSizeChange) onCanvasSizeChange();
+            return;
+        }
+        flushBrushStrokeNow();
+        cancelSelection();
+        const oldW = canvas.width;
+        const oldH = canvas.height;
+        const tmp = document.createElement('canvas');
+        tmp.width = oldW;
+        tmp.height = oldH;
+        const tctx = tmp.getContext('2d');
+        if (tctx) {
+            try { tctx.imageSmoothingEnabled = false; } catch (_) {}
+            try { tctx.drawImage(canvas, 0, 0); } catch (_) {}
+        }
+        canvas.width = w;
+        canvas.height = h;
+        try { ctx.imageSmoothingEnabled = false; } catch (_) {}
+        ctx.clearRect(0, 0, w, h);
+        if (tctx && oldW > 0 && oldH > 0) {
+            const blitW = Math.min(oldW, w);
+            const blitH = Math.min(oldH, h);
+            const srcX = Math.floor((oldW - blitW) / 2);
+            const srcY = Math.floor((oldH - blitH) / 2);
+            const dstX = Math.floor((w - blitW) / 2);
+            const dstY = Math.floor((h - blitH) / 2);
+            try {
+                ctx.drawImage(tmp, srcX, srcY, blitW, blitH, dstX, dstY, blitW, blitH);
+            } catch (_) {}
+        }
+        state.undoStack.length = 0;
+        state.redoStack.length = 0;
+        updateViewTransform();
+        drawCrosshair();
+        updateGameObjectIcon();
+        saveToDisk();
+        if (onCanvasSizeChange) onCanvasSizeChange();
     }
 
     function symmetrySegmentsForLine(x0, y0, x1, y1) {
@@ -7676,7 +11187,7 @@ function initializeImageEditor(params) {
 
     /** Integer-aligned 1×1 pixels (avoids antialiased strokes and round-cap bleed from canvas stroke()). */
     function fillBrushLinePixels(x0, y0, x1, y1) {
-        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.round(v)));
+        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.floor(v)));
         let xi = snap(x0, canvas.width);
         let yi = snap(y0, canvas.height);
         const x1i = snap(x1, canvas.width);
@@ -7707,7 +11218,7 @@ function initializeImageEditor(params) {
     function addBresenhamRectsToPath(x0, y0, x1, y1) {
         const w = canvas.width;
         const h = canvas.height;
-        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.round(v)));
+        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.floor(v)));
         let xi = snap(x0, w);
         let yi = snap(y0, h);
         const x1i = snap(x1, w);
@@ -7728,6 +11239,51 @@ function initializeImageEditor(params) {
             if (e2 < dx) {
                 err += dx;
                 yi += sy;
+            }
+        }
+    }
+
+    /** Bresenham line: invoke fn(xi, yi) for each pixel on the line (same grid as 1px brush). */
+    function forEachBresenhamPixel(x0, y0, x1, y1, w, h, fn) {
+        const snap = (v, max) => Math.max(0, Math.min(max - 1, Math.floor(v)));
+        let xi = snap(x0, w);
+        let yi = snap(y0, h);
+        const x1i = snap(x1, w);
+        const y1i = snap(y1, h);
+        const dx = Math.abs(x1i - xi);
+        const dy = Math.abs(y1i - yi);
+        const sx = xi < x1i ? 1 : -1;
+        const sy = yi < y1i ? 1 : -1;
+        let err = dx - dy;
+        for (;;) {
+            fn(xi, yi);
+            if (xi === x1i && yi === y1i) break;
+            const e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                xi += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                yi += sy;
+            }
+        }
+    }
+
+    /** Integer disk (diameter = brush size); adds "x,y" keys — no antialiased fringe colors. */
+    function addDiskPixelsToSet(cx, cy, diameter, w, h, set) {
+        const r = diameter / 2;
+        const r2 = r * r;
+        const ix = Math.round(cx);
+        const iy = Math.round(cy);
+        const ri = Math.max(0, Math.ceil(r - 1e-9));
+        for (let dy = -ri; dy <= ri; dy++) {
+            for (let dx = -ri; dx <= ri; dx++) {
+                if (dx * dx + dy * dy <= r2 + 1e-9) {
+                    const x = ix + dx;
+                    const y = iy + dy;
+                    if (x >= 0 && x < w && y >= 0 && y < h) set.add(`${x},${y}`);
+                }
             }
         }
     }
@@ -7796,18 +11352,26 @@ function initializeImageEditor(params) {
                 ctx.fill();
             }
         } else {
-            ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
-            ctx.lineWidth = state.brushSize;
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
+            const w = canvas.width;
+            const h = canvas.height;
+            const d = state.brushSize;
+            ctx.fillStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
             for (let pi = 0; pi < polys.length; pi++) {
                 const poly = polys[pi];
-                ctx.beginPath();
-                ctx.moveTo(poly[0], poly[1]);
-                for (let i = 2; i < poly.length; i += 2) {
-                    ctx.lineTo(poly[i], poly[i + 1]);
+                const pixelSet = new Set();
+                for (let i = 0; i < poly.length - 2; i += 2) {
+                    forEachBresenhamPixel(
+                        poly[i], poly[i + 1], poly[i + 2], poly[i + 3],
+                        w, h,
+                        (cx, cy) => { addDiskPixelsToSet(cx, cy, d, w, h, pixelSet); }
+                    );
                 }
-                ctx.stroke();
+                ctx.beginPath();
+                for (const key of pixelSet) {
+                    const comma = key.indexOf(',');
+                    ctx.rect(+key.slice(0, comma), +key.slice(comma + 1), 1, 1);
+                }
+                ctx.fill();
             }
         }
         ctx.restore();
@@ -7825,16 +11389,22 @@ function initializeImageEditor(params) {
                 fillBrushLinePixels(a, b, c, d);
             }
         } else {
-            ctx.strokeStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
-            ctx.lineWidth = state.brushSize;
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
+            const w = canvas.width;
+            const h = canvas.height;
+            const d = state.brushSize;
+            ctx.fillStyle = isErase ? 'rgba(0,0,0,1)' : rgbaString();
             for (let s = 0; s < segs.length; s++) {
-                const [a, b, c, d] = segs[s];
+                const [a, b, c, d_] = segs[s];
+                const pixelSet = new Set();
+                forEachBresenhamPixel(a, b, c, d_, w, h, (cx, cy) => {
+                    addDiskPixelsToSet(cx, cy, d, w, h, pixelSet);
+                });
                 ctx.beginPath();
-                ctx.moveTo(a, b);
-                ctx.lineTo(c, d);
-                ctx.stroke();
+                for (const key of pixelSet) {
+                    const comma = key.indexOf(',');
+                    ctx.rect(+key.slice(0, comma), +key.slice(comma + 1), 1, 1);
+                }
+                ctx.fill();
             }
         }
         ctx.restore();
@@ -7909,7 +11479,7 @@ function initializeImageEditor(params) {
         // Crosshair center marker (no shadowBlur — that forces an expensive blur pass every redraw)
         octx.strokeStyle = '#ffffff';
         octx.lineWidth = hw;
-        octx.globalAlpha = 0.85;
+        octx.globalAlpha = 0.48;
 
         // Draw horizontal line
         octx.beginPath();
@@ -8056,8 +11626,8 @@ function initializeImageEditor(params) {
 
     function bucketFillAt(x, y) {
         pushUndo();
-        const ix = Math.max(0, Math.min(canvas.width - 1, Math.round(x)));
-        const iy = Math.max(0, Math.min(canvas.height - 1, Math.round(y)));
+        const ix = Math.max(0, Math.min(canvas.width - 1, Math.floor(x)));
+        const iy = Math.max(0, Math.min(canvas.height - 1, Math.floor(y)));
         const target = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const { data, width, height } = target;
         const idx = (iy * width + ix) * 4;
@@ -8461,34 +12031,33 @@ function initializeImageEditor(params) {
         drawCrosshair();
     }
 
-    /** Map client coords to canvas bitmap using a cached getBoundingClientRect (same math as canvasToLocalFromClientRect). */
+    /** Map client coords to canvas bitmap using a cached getBoundingClientRect (same math as canvasToLocalFromClientRect; includes ancestor scale). */
     function canvasCoordsFromClientRect(clientX, clientY, rect) {
-        const x = (clientX - rect.left) / (rect.width || 1) * canvas.width;
-        const y = (clientY - rect.top) / (rect.height || 1) * canvas.height;
+        const rw = rect.width || 1;
+        const rh = rect.height || 1;
+        const x = (clientX - rect.left) / rw * canvas.width;
+        const y = (clientY - rect.top) / rh * canvas.height;
+        // getBoundingClientRect + compositor snapping can bias pointer→canvas mapping slightly
+        // positive in both axes (~¼ logical px at high zoom). Nudge back so 1px brush aligns.
+        const bias = 0.25;
+        const nx = x - bias;
+        const ny = y - bias;
         return {
-            x: Math.max(0, Math.min(canvas.width, x)),
-            y: Math.max(0, Math.min(canvas.height, y)),
+            x: Math.max(0, Math.min(canvas.width, nx)),
+            y: Math.max(0, Math.min(canvas.height, ny)),
         };
     }
 
-    /** Map pointer to canvas bitmap coords (zoom is CSS width/height + translate, no transform scale). */
+    /** Map pointer to canvas bitmap coords (pan + zoom are CSS transform on an ancestor). */
     function canvasToLocalFromClientRect(evt) {
         const rect = canvas.getBoundingClientRect();
         return canvasCoordsFromClientRect(evt.clientX, evt.clientY, rect);
     }
 
     function canvasToLocal(evt) {
-        const ow = canvas.offsetWidth || canvas.width;
-        const oh = canvas.offsetHeight || canvas.height;
-        const onCanvas = evt.target === canvas;
-        if (onCanvas && Number.isFinite(evt.offsetX) && Number.isFinite(evt.offsetY)) {
-            const x = (evt.offsetX / ow) * canvas.width;
-            const y = (evt.offsetY / oh) * canvas.height;
-            return {
-                x: Math.max(0, Math.min(canvas.width, x)),
-                y: Math.max(0, Math.min(canvas.height, y)),
-            };
-        }
+        // Always use clientX/Y + getBoundingClientRect(). offsetX/offsetY are in the element's
+        // pre-transform layout space; zoom is applied via scale() on viewTransformHost, so mixing
+        // offset coords with rect-based math skews ~½px (very visible at high zoom / 1px brush).
         return canvasToLocalFromClientRect(evt);
     }
 
@@ -8921,6 +12490,8 @@ function initializeImageEditor(params) {
         if (e.key === 'Escape') {
             const ctxMenu = document.getElementById('__image_asset_ctx_menu');
             if (ctxMenu) { e.preventDefault(); removeImageAssetContextMenu(); return; }
+            const sndMenu = document.getElementById('__sound_asset_ctx_menu');
+            if (sndMenu) { e.preventDefault(); removeSoundAssetContextMenu(); return; }
         }
         if (activeTab !== 'images') return;
         // Don't steal shortcuts while typing in inputs.
@@ -8983,6 +12554,7 @@ function initializeImageEditor(params) {
         const prev = state.undoStack.pop();
         state.redoStack.push(current);
         restore(prev);
+        syncCanvasToCurrentAsset();
     }
     function redo() {
         if (state.redoStack.length === 0) return;
@@ -8990,13 +12562,14 @@ function initializeImageEditor(params) {
         const next = state.redoStack.pop();
         state.undoStack.push(current);
         restore(next);
+        syncCanvasToCurrentAsset();
     }
 
     // Zoom buttons are wired in createImagesInterface via createZoomControlStrip (zoomImage / resetZoom → setZoom)
 
     // Public API
     const api = {
-        setTool, getTool, setColor, setBrushSize, setFill, getFill, toggleFill, setSymmetry, setZoom, clear, loadImage, undo, redo, drawCrosshair,
+        setTool, getTool, setColor, setBrushSize, setFill, getFill, toggleFill, setSymmetry, setZoom, clear, loadImage, getCanvasSize, setCanvasSize, undo, redo, drawCrosshair,
         // Used by Edit menu in the Images tab
         cut: cutSelectionToClipboard,
         copy: copySelectionToClipboard,

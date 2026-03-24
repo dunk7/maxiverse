@@ -23,9 +23,7 @@
             <button type="button" class="menu-btn file-menu-btn" onclick="toggleFileMenu()" aria-haspopup="true" aria-expanded="false" aria-controls="file-dropdown">File</button>
             <div class="undo-menu" id="file-dropdown">
               <button class="undo-menu-item" onclick="saveProjectToFile()">Save</button>
-              <div class="menu-separator"></div>
               <button class="undo-menu-item" onclick="triggerLoadProjectFromFile()">Load</button>
-              <div class="menu-separator"></div>
               <button class="undo-menu-item" onclick="exportProjectAsHtml()">Export HTML</button>
             </div>
             <input id="file-input" type="file" accept=".json,.maxiverse,.app,application/json" style="display:none" />
@@ -34,11 +32,9 @@
             <button type="button" class="menu-btn edit-menu-btn" onclick="toggleEditMenu()" aria-haspopup="true" aria-expanded="false" aria-controls="edit-dropdown">Edit</button>
             <div class="undo-menu" id="edit-dropdown">
               <button class="undo-menu-item" onclick="handleEditAction('undo')">Undo</button>
-              <div class="menu-separator"></div>
               <button class="undo-menu-item" onclick="handleEditAction('cut')">Cut</button>
               <button class="undo-menu-item" onclick="handleEditAction('copy')">Copy</button>
               <button class="undo-menu-item" onclick="handleEditAction('paste')">Paste</button>
-              <div class="menu-separator"></div>
               <button class="undo-menu-item" onclick="handleEditAction('selectAll')">Select All</button>
             </div>
           </div>
@@ -51,9 +47,10 @@
           <button type="button" class="asset-tab threed-tab" role="tab" aria-selected="false">3D</button>
         </div>
         <div class="profile-section">
-          <img src="./images/gear.png" alt="" class="profile-photo" width="28" height="28">
-          <button type="button" class="profile-btn">Profile</button>
-          <button type="button" class="play-btn" id="topbar-play" title="Play (run) / Stop" aria-label="Play or stop">▶</button>
+          <button type="button" class="profile-photo-btn" title="Profile" aria-label="Profile">
+            <img src="./images/gear.png" alt="" class="profile-photo" width="28" height="28">
+          </button>
+          <button type="button" class="play-btn" id="topbar-play" title="Play (run) / Stop" aria-label="Play or stop"></button>
         </div>
       </div>
       <div id="node-window" tabindex="0"></div>
