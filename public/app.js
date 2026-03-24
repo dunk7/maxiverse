@@ -169,10 +169,9 @@ let lastFrameTime = 0;
 const MAX_STEPS_PER_OBJECT = 16;        // quantum per instance per frame
 const MAX_TOTAL_STEPS_PER_FRAME = 5000; // hard cap across all instances per frame
 const TIME_BUDGET_MS = 6;               // soft time budget per instance (inner loop); do not cap the whole frame here or other instances starve
-const LOOP_YIELD_MS = 1000 / 60;        // yield when repeat/forever has no runnable body (avoids freezing the tab)
 // Outer repeat continuation must not use `steps` — action blocks never increment `steps` (only non-actions do).
 const MAX_REPEAT_OUTER_PASSES = Math.max(MAX_TOTAL_STEPS_PER_FRAME, 50000);
-let rrInstanceStartIndex = 0;           // round-robin start among non-controller instances
+let rrInstanceStartIndex = 0;
 // Mouse and keyboard state for input blocks
 // Optional filter: when set to an array of instanceIds, interpreter will only step those instances
 let __stepOnlyInstanceIds = null;
@@ -572,13 +571,14 @@ function registerRuntimeInstanceFromTemplate(instanceId, templateId) {
     const codeT = Array.isArray(template.code) ? template.code : [];
     const startT = codeT.find(b => b.type === 'start');
     const pcT = startT && typeof startT.next_block_a === 'number' ? startT.next_block_a : null;
-    runtimeExecState[instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+    runtimeExecState[instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [], yieldFrame: false, yieldResumePc: null };
     return true;
 }
 
 /** Run the new instance's When Created chain before the Instantiate caller's next block runs. */
 function runInstanceStartChainSync(instanceId) {
     const savedFilter = __stepOnlyInstanceIds;
+    const savedSnapshot = frameGlobalReadSnapshot;
     const ITER_GUARD = 100000;
     let n = 0;
     try {
@@ -586,12 +586,14 @@ function runInstanceStartChainSync(instanceId) {
             const exec = runtimeExecState[instanceId];
             if (!exec) break;
             if (exec.waitMs > 0) break;
+            if (exec.yieldFrame) break;
             if (exec.pc == null && exec.repeatStack.length === 0) break;
             __stepOnlyInstanceIds = [instanceId];
             stepInterpreter(0);
         }
     } finally {
         __stepOnlyInstanceIds = savedFilter;
+        frameGlobalReadSnapshot = savedSnapshot;
     }
 }
 
@@ -606,19 +608,32 @@ function stepInterpreter(dtMs) {
     let totalStepsThisFrame = 0;
     const instanceCount = runtimeInstances.length;
     if (instanceCount === 0) return;
-    // AppController runs first every frame so globals (e.g. scroll) update before other instances read them
-    const controllerInstances = [];
-    const otherInstances = [];
+    const isFilteredStep = __stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0;
+    // Resume all instances that yielded last frame (forever loops) — perfectly synchronized
+    // Skip during nested/filtered calls (e.g. runInstanceStartChainSync) to avoid clearing other instances' yields
+    if (!isFilteredStep) {
+        for (let i = 0; i < instanceCount; i++) {
+            const exec = runtimeExecState[runtimeInstances[i].instanceId];
+            if (exec && exec.yieldFrame) {
+                exec.yieldFrame = false;
+                exec.pc = exec.yieldResumePc;
+                exec.yieldResumePc = null;
+            }
+        }
+    }
+    // AppController runs first every frame so globals (e.g. scroll) update before other instances read them.
+    // Non-controller instances run in stable insertion order so all see the same snapshot values.
+    const orderedInstances = [];
     for (let i = 0; i < instanceCount; i++) {
         const inst = runtimeInstances[i];
         const o = objectById[inst.templateId];
-        if (isAppControllerTemplate(o)) controllerInstances.push(inst);
-        else otherInstances.push(inst);
+        if (isAppControllerTemplate(o)) orderedInstances.push(inst);
     }
-    const oLen = otherInstances.length;
-    const orderedInstances = controllerInstances.concat(
-        oLen === 0 ? [] : otherInstances.map((_, j) => otherInstances[(rrInstanceStartIndex + j) % oLen])
-    );
+    for (let i = 0; i < instanceCount; i++) {
+        const inst = runtimeInstances[i];
+        const o = objectById[inst.templateId];
+        if (!isAppControllerTemplate(o)) orderedInstances.push(inst);
+    }
     for (let offset = 0; offset < orderedInstances.length; offset++) {
         const inst = orderedInstances[offset];
         if (__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0) {
@@ -931,12 +946,14 @@ function stepInterpreter(dtMs) {
                 }
                 if (block.content === 'wait') {
                     const seconds = Math.max(0, parseNumericInput(resolveInput(block, 'input_a') ?? block.val_a ?? 0));
-                    // Start waiting on first encounter for THIS instance only
+                    if (seconds <= 0) {
+                        exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
+                        continue;
+                    }
                     if (exec.waitMs <= 0 || exec.waitingBlockId !== block.id) {
-                        exec.waitMs = seconds * 1000; // supports fractional seconds
+                        exec.waitMs = seconds * 1000;
                         exec.waitingBlockId = block.id;
                     }
-                    // Stop executing further this frame
                     break;
                 }
                 if (block.content === 'repeat') {
@@ -977,12 +994,15 @@ function stepInterpreter(dtMs) {
                     continue;
                 }
                 if (block.content === 'switch_image') {
-                    const imgs = getCurrentObjectImages();
+                    const imgs = objectImages[String(o.id)] || [];
                     let found = null;
                     if (block.input_a != null) {
                         const sel = resolveInput(block, 'input_a');
-                        if (typeof sel === 'string') {
-                            found = imgs.find(img => img.name === sel);
+                        if (sel == null || sel === '') {
+                            found = imgs.find(img => String(img.id) === String(block.val_a));
+                        } else if (typeof sel === 'string') {
+                            const s = sel.trim();
+                            found = imgs.find(img => img.name === s) || imgs.find(img => String(img.id) === s);
                         } else {
                             found = imgs.find(img => String(img.id) === String(sel));
                         }
@@ -991,7 +1011,7 @@ function stepInterpreter(dtMs) {
                     }
                     if (found) {
                         if (!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId] = { x: 0, y: 0 };
-                        runtimePositions[inst.instanceId].spritePath = found.src;
+                        runtimePositions[inst.instanceId].spritePath = (found.src || '').split('?')[0];
                     }
                     exec.pc = (typeof block.next_block_a === 'number') ? block.next_block_a : null;
                     continue;
@@ -1001,10 +1021,13 @@ function stepInterpreter(dtMs) {
                     let sfound = null;
                     if (block.input_a != null) {
                         const sel = resolveInput(block, 'input_a');
-                        if (typeof sel === 'string') {
-                            sfound = snds.find((s) => s.name === sel);
+                        if (sel == null || sel === '') {
+                            sfound = snds.find((s) => String(s.id) === String(block.val_a));
+                        } else if (typeof sel === 'string') {
+                            const s = sel.trim();
+                            sfound = snds.find((x) => x.name === s) || snds.find((x) => String(x.id) === s);
                         } else {
-                            sfound = snds.find((s) => String(s.id) === String(sel));
+                            sfound = snds.find((x) => String(x.id) === String(sel));
                         }
                     } else {
                         sfound = snds.find((s) => String(s.id) === String(block.val_a));
@@ -1124,8 +1147,8 @@ function stepInterpreter(dtMs) {
             if (frame.timesRemaining > 0) {
                 const repeatBlock = codeMap ? codeMap[frame.repeatBlockId] : code.find(b => b && b.id === frame.repeatBlockId);
                 if (repeatBlock && repeatBlock.content === 'forever') {
-                    exec.waitMs = LOOP_YIELD_MS;
-                    exec.waitingBlockId = repeatBlock.id;
+                    exec.yieldFrame = true;
+                    exec.yieldResumePc = (typeof repeatBlock.next_block_a === 'number') ? repeatBlock.next_block_a : null;
                     exec.pc = null;
                     break outerInstanceLoop;
                 }
@@ -1133,9 +1156,9 @@ function stepInterpreter(dtMs) {
                 if (exec.pc != null) {
                     continue outerInstanceLoop;
                 }
-                // No first block (empty repeat body): outerInstanceLoop would spin forever without advancing steps
-                exec.waitMs = LOOP_YIELD_MS;
-                exec.waitingBlockId = repeatBlock ? repeatBlock.id : null;
+                // No first block (empty repeat body): yield to prevent infinite spin
+                exec.yieldFrame = true;
+                exec.yieldResumePc = null;
                 break outerInstanceLoop;
             }
             exec.repeatStack.pop();
@@ -1147,17 +1170,7 @@ function stepInterpreter(dtMs) {
 
         if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) { break; }
     }
-    // Advance round-robin among non-controller instances only (controllers always run first)
-    if (!(__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0)) {
-        let nonControllerCount = 0;
-        for (let i = 0; i < runtimeInstances.length; i++) {
-            const o = objectById[runtimeInstances[i].templateId];
-            if (!isAppControllerTemplate(o)) nonControllerCount++;
-        }
-        if (nonControllerCount > 0) {
-            rrInstanceStartIndex = (rrInstanceStartIndex + 1) % nonControllerCount;
-        }
-    }
+    
     // Instantiate is handled synchronously in the Instantiate block (runInstanceStartChainSync).
     // Remove any instances that requested deletion this frame
     if (instancesPendingRemoval && instancesPendingRemoval.size > 0) {
@@ -1176,10 +1189,6 @@ function stepInterpreter(dtMs) {
         instancesPendingRemoval.clear();
     }
     frameGlobalReadSnapshot = null;
-    const filteredStep = __stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0;
-    if (isPlaying && !filteredStep) {
-        renderGameWindowSprite();
-    }
 }
 function runWhenCreatedChains() {
     // No-op: interpreter now runs chains over time in stepInterpreter
@@ -1212,21 +1221,24 @@ function startPlay() {
         const code = Array.isArray(controller.code) ? controller.code : [];
         const start = code.find(b => b.type === 'start');
         const pc = start && typeof start.next_block_a === 'number' ? start.next_block_a : null;
-        runtimeExecState[instId] = { pc: pc, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+        runtimeExecState[instId] = { pc: pc, waitMs: 0, waitingBlockId: null, repeatStack: [], yieldFrame: false, yieldResumePc: null };
     } else {
         console.warn('No AppController found to start.');
     }
     resetRuntimePositions();
     playStartTime = performance.now();
     lastFrameTime = playStartTime;
+    const FRAME_MS = 1000 / 60;
     const loop = () => {
         if (!isPlaying) return;
-        __touchFrameSerial++;
-        const now = performance.now();
-        const dt = now - lastFrameTime;
-        lastFrameTime = now;
-        stepInterpreter(dt);
         playLoopHandle = requestAnimationFrame(loop);
+        const now = performance.now();
+        const elapsed = now - lastFrameTime;
+        if (elapsed < FRAME_MS) return;
+        lastFrameTime = now - (elapsed % FRAME_MS);
+        __touchFrameSerial++;
+        stepInterpreter(FRAME_MS);
+        renderGameWindowSprite();
     };
     playLoopHandle = requestAnimationFrame(loop);
 }
@@ -1389,6 +1401,120 @@ async function pasteCodeBlocksFromClipboardInternal() {
     codeSelectionOwnerId = selected_object;
     updateWorkspace();
 }
+
+const CODE_BLOCK_DUPLICATE_OFFSET = 24;
+
+function removeCodeBlockContextMenu() {
+    const el = document.getElementById('__code_block_ctx_menu');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+let _codeBlockCtxMenuDismissBound = false;
+function bindCodeBlockContextMenuDismiss() {
+    if (_codeBlockCtxMenuDismissBound) return;
+    _codeBlockCtxMenuDismissBound = true;
+    document.addEventListener('mousedown', (ev) => {
+        const menu = document.getElementById('__code_block_ctx_menu');
+        if (!menu || menu.contains(ev.target)) return;
+        removeCodeBlockContextMenu();
+    }, true);
+}
+function showCodeBlockContextMenu(clientX, clientY) {
+    bindCodeBlockContextMenuDismiss();
+    removeCodeBlockContextMenu();
+    const menu = document.createElement('div');
+    menu.id = '__code_block_ctx_menu';
+    menu.setAttribute('role', 'menu');
+    menu.className = 'ctx-menu';
+    const dupBtn = document.createElement('button');
+    dupBtn.type = 'button';
+    dupBtn.textContent = 'Duplicate';
+    dupBtn.setAttribute('role', 'menuitem');
+    dupBtn.className = 'ctx-menu-item';
+    dupBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        removeCodeBlockContextMenu();
+        duplicateSelectedCodeBlocksInternal();
+    });
+    menu.appendChild(dupBtn);
+    document.body.appendChild(menu);
+    const w = menu.offsetWidth;
+    const h = menu.offsetHeight;
+    let lx = clientX;
+    let ly = clientY;
+    if (lx + w > window.innerWidth - 8) lx = window.innerWidth - w - 8;
+    if (ly + h > window.innerHeight - 8) ly = window.innerHeight - h - 8;
+    menu.style.left = `${Math.max(8, lx)}px`;
+    menu.style.top = `${Math.max(8, ly)}px`;
+}
+
+function duplicateSelectedCodeBlocksInternal() {
+    const selectedObj = objects.find(o => o.id == selected_object);
+    if (!selectedObj || selectedCodeBlockIds.size === 0) return;
+    const payloadBlocks = selectedObj.code.filter(b => selectedCodeBlockIds.has(b.id)).map(b => JSON.parse(JSON.stringify(b)));
+    if (payloadBlocks.length === 0) return;
+    const hasStart = selectedObj.code.some(b => b.type === 'start');
+    const oldIds = new Set(payloadBlocks.map(b => b.id));
+    const idMap = new Map();
+    let maxId = selectedObj.code.length ? Math.max(...selectedObj.code.map(b => b.id)) : 0;
+    for (const b of payloadBlocks) {
+        maxId++;
+        idMap.set(b.id, maxId);
+    }
+    const ox = CODE_BLOCK_DUPLICATE_OFFSET;
+    const oy = CODE_BLOCK_DUPLICATE_OFFSET;
+    const refKeys = ['next_block_a', 'next_block_b', 'input_a', 'input_b'];
+    const newBlocks = [];
+    for (const b of payloadBlocks) {
+        const nb = JSON.parse(JSON.stringify(b));
+        nb.id = idMap.get(b.id);
+        for (const k of refKeys) {
+            if (typeof nb[k] === 'number') {
+                nb[k] = oldIds.has(nb[k]) ? idMap.get(nb[k]) : null;
+            }
+        }
+        const pos = nb.position || { x: 0, y: 0 };
+        nb.position = { x: pos.x + ox, y: pos.y + oy };
+        if (nb.type === 'start' && hasStart) {
+            nb.type = 'action';
+            nb.content = 'wait';
+            nb.val_a = 0;
+        }
+        newBlocks.push(nb);
+    }
+    selectedObj.code.push(...newBlocks);
+    rebuildCodeMaps();
+    const newIds = newBlocks.map(b => b.id);
+    updateWorkspace();
+    // Re-apply after DOM rebuild: syncCodeSelectionOwnership may clear the set (e.g. owner id mismatch), and classes must run when nodes exist.
+    codeSelectionOwnerId = selected_object;
+    selectedCodeBlockIds.clear();
+    newIds.forEach(id => selectedCodeBlockIds.add(id));
+    applyCodeBlockSelectionClasses();
+    requestAnimationFrame(() => applyCodeBlockSelectionClasses());
+}
+
+function onCodeBlockLayerContextMenu(e) {
+    if (activeTab !== 'code') return;
+    const block = e.target.closest && e.target.closest('.node-block');
+    if (!block) return;
+    const tag = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : '';
+    if (tag === 'select' || tag === 'input' || tag === 'textarea' || (e.target.closest && e.target.closest('select'))) {
+        return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const id = parseInt(block.dataset.codeId, 10);
+    const selectedObj = objects.find(obj => obj.id == selected_object);
+    if (!selectedObj) return;
+    syncCodeSelectionOwnership(selectedObj);
+    if (!selectedCodeBlockIds.has(id)) {
+        if (!e.shiftKey) selectedCodeBlockIds.clear();
+        selectedCodeBlockIds.add(id);
+        applyCodeBlockSelectionClasses();
+    }
+    showCodeBlockContextMenu(e.clientX, e.clientY);
+}
+
 function deleteSelectedCodeBlocks() {
     const selectedObj = objects.find(o => o.id == selected_object);
     if (!selectedObj) return;
@@ -1654,6 +1780,7 @@ function initCodeBlockKeyboardShortcuts() {
             return;
         }
         if (e.key === 'Escape') {
+            removeCodeBlockContextMenu();
             selectedCodeBlockIds.clear();
             applyCodeBlockSelectionClasses();
         }
@@ -1708,15 +1835,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         span.appendChild(btn);
@@ -1783,15 +1908,14 @@ function createNodeBlock(codeData, x, y) {
                 console.log('Drag already in progress, ignoring mousedown');
                 return;
             }
-            const r = document.getElementById('node-window').getBoundingClientRect();
-            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             // Ensure focus on node window and clear any lingering menu handlers
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         condSpan.appendChild(btn);
@@ -1827,15 +1951,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         rotSpan.appendChild(btn);
@@ -1864,14 +1986,13 @@ function createNodeBlock(codeData, x, y) {
                 console.log('Drag already in progress, ignoring mousedown');
                 return;
             }
-            const r = document.getElementById('node-window').getBoundingClientRect();
-            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         sizeSpan.appendChild(btn);
@@ -1900,14 +2021,13 @@ function createNodeBlock(codeData, x, y) {
                 console.log('Drag already in progress, ignoring mousedown');
                 return;
             }
-            const r = document.getElementById('node-window').getBoundingClientRect();
-            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         sizeSpan.appendChild(btn);
@@ -1932,15 +2052,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         layerSpan.appendChild(btn);
@@ -1966,14 +2084,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window').getBoundingClientRect();
-            connectMouse.x = e.clientX - r.left; connectMouse.y = e.clientY - r.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         opSpan.appendChild(btn);
@@ -2068,20 +2185,15 @@ function createNodeBlock(codeData, x, y) {
                 // Prevent multiple simultaneous drag operations
                 if (isConnecting) return;
 
-                const container = document.getElementById('node-window');
-                if (!container) return;
-
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left;
-                connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true;
                 connectStartTime = Date.now();
                 connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -2158,12 +2270,8 @@ function createNodeBlock(codeData, x, y) {
             // Prevent multiple simultaneous drag operations
             if (isConnecting) return;
 
-            const r = document.getElementById('node-window');
-            if (!r) return;
-
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left;
-            connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             // Ensure canvas focus and clear any lingering menu handlers
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
@@ -2171,8 +2279,7 @@ function createNodeBlock(codeData, x, y) {
             isConnecting = true;
             connectStartTime = Date.now();
             connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         span.appendChild(btn);
@@ -2198,12 +2305,8 @@ function createNodeBlock(codeData, x, y) {
             // Prevent multiple simultaneous drag operations
             if (isConnecting) return;
 
-            const r = document.getElementById('node-window');
-            if (!r) return;
-
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left;
-            connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             // Ensure canvas focus and clear any lingering menu handlers
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
@@ -2211,8 +2314,7 @@ function createNodeBlock(codeData, x, y) {
             isConnecting = true;
             connectStartTime = Date.now();
             connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         span.appendChild(btn);
@@ -2233,7 +2335,7 @@ function createNodeBlock(codeData, x, y) {
         label.append(')');
     } else if (codeData.content === 'play_sound') {
         label.textContent = '';
-        label.append('Play Sound (');
+        label.append('Start Sound (');
         const span = document.createElement('span');
         const select = document.createElement('select');
         const snds = getCurrentObjectSounds();
@@ -2297,15 +2399,13 @@ function createNodeBlock(codeData, x, y) {
             btn.addEventListener('mousedown', (e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (isConnecting) return;
-                const container = document.getElementById('node-window'); if (!container) return;
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -2387,15 +2487,13 @@ function createNodeBlock(codeData, x, y) {
             btn.addEventListener('mousedown', (e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (isConnecting) return;
-                const container = document.getElementById('node-window'); if (!container) return;
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -2520,15 +2618,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         valSpan.appendChild(btn);
@@ -2576,15 +2672,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         valSpan.appendChild(btn);
@@ -2636,15 +2730,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         valSpan.appendChild(btn);
@@ -2706,15 +2798,13 @@ function createNodeBlock(codeData, x, y) {
         btnA.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         valSpan.appendChild(btnA);
@@ -2725,15 +2815,13 @@ function createNodeBlock(codeData, x, y) {
         btnB.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'b' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         idxSpan.appendChild(btnB);
@@ -2786,15 +2874,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         idxSpan.appendChild(btn);
@@ -2870,15 +2956,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const r = document.getElementById('node-window'); if (!r) return;
-            const rect = r.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         idxSpan.appendChild(btn);
@@ -2938,15 +3022,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const container = document.getElementById('node-window'); if (!container) return;
-            const rect = container.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         aSpan.appendChild(btn);
@@ -2988,15 +3070,13 @@ function createNodeBlock(codeData, x, y) {
             btn.addEventListener('mousedown', (e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (isConnecting) return;
-                const container = document.getElementById('node-window'); if (!container) return;
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -3026,15 +3106,13 @@ function createNodeBlock(codeData, x, y) {
         btn.addEventListener('mousedown', (e) => {
             e.stopPropagation(); e.preventDefault();
             if (isConnecting) return;
-            const container = document.getElementById('node-window'); if (!container) return;
-            const rect = container.getBoundingClientRect();
-            connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+            if (!getCodeScrollContainer()) return;
+            setConnectMouseFromClientEvent(e);
             const nodeWindow = document.getElementById('node-window');
             if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
             clearMenuDocHandlers();
             isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which: 'a' };
-            document.addEventListener('mousemove', handleConnectMouseMove);
-            document.addEventListener('mouseup', handleConnectMouseUp, true);
+            attachConnectDragListeners();
             drawConnections();
         });
         aSpan.appendChild(btn);
@@ -3073,15 +3151,13 @@ function createNodeBlock(codeData, x, y) {
             btn.addEventListener('mousedown', (e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (isConnecting) return;
-                const container = document.getElementById('node-window'); if (!container) return;
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -3128,15 +3204,13 @@ function createNodeBlock(codeData, x, y) {
             btn.addEventListener('mousedown', (e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (isConnecting) return;
-                const container = document.getElementById('node-window'); if (!container) return;
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex', '0'); try { nodeWindow.focus(); } catch (_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true; connectStartTime = Date.now(); connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -3188,16 +3262,14 @@ function createNodeBlock(codeData, x, y) {
             btn.addEventListener('mousedown', (e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (isConnecting) return;
-                const container = document.getElementById('node-window'); if (!container) return;
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left; connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true; connectStartTime = Date.now();
                 connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -3340,12 +3412,8 @@ function createNodeBlock(codeData, x, y) {
                     return;
                 }
 
-                const container = document.getElementById('node-window');
-                if (!container) return;
-
-                const rect = container.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left;
-                connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
 
                 // Ensure canvas has focus and no lingering menu handlers intercept events
                 const nodeWindow = document.getElementById('node-window');
@@ -3355,8 +3423,7 @@ function createNodeBlock(codeData, x, y) {
                 isConnecting = true;
                 connectStartTime = Date.now();
                 connectFromInput = { blockId: codeData.id, which };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             containerEl.appendChild(btn);
@@ -3402,20 +3469,15 @@ function createNodeBlock(codeData, x, y) {
                     return;
                 }
 
-                const containerEl = document.getElementById('node-window');
-                if (!containerEl) return;
-
-                const rect = containerEl.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left;
-                connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true;
                 connectStartTime = Date.now();
                 connectFromInput = { blockId: codeData.id, which: 'a' };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             container.appendChild(btn);
@@ -3442,20 +3504,15 @@ function createNodeBlock(codeData, x, y) {
                     return;
                 }
 
-                const containerEl = document.getElementById('node-window');
-                if (!containerEl) return;
-
-                const rect = containerEl.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left;
-                connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true;
                 connectStartTime = Date.now();
                 connectFromInput = { blockId: codeData.id, which: 'a' };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             container.appendChild(btn);
@@ -3482,20 +3539,15 @@ function createNodeBlock(codeData, x, y) {
                     return;
                 }
 
-                const containerEl = document.getElementById('node-window');
-                if (!containerEl) return;
-
-                const rect = containerEl.getBoundingClientRect();
-                connectMouse.x = e.clientX - rect.left;
-                connectMouse.y = e.clientY - rect.top;
+                if (!getCodeScrollContainer()) return;
+                setConnectMouseFromClientEvent(e);
                 const nodeWindow = document.getElementById('node-window');
                 if (nodeWindow) { if (!nodeWindow.hasAttribute('tabindex')) nodeWindow.setAttribute('tabindex','0'); try { nodeWindow.focus(); } catch(_) {} }
                 clearMenuDocHandlers();
                 isConnecting = true;
                 connectStartTime = Date.now();
                 connectFromInput = { blockId: codeData.id, which: 'a' };
-                document.addEventListener('mousemove', handleConnectMouseMove);
-                document.addEventListener('mouseup', handleConnectMouseUp, true);
+                attachConnectDragListeners();
                 drawConnections();
             });
             container.appendChild(btn);
@@ -3917,7 +3969,7 @@ function showAddBlockMenu(anchorBlock, anchorCodeData, branch, customPosition = 
     addItem('Point Towards (x, y)', 'point_towards');
     // Looks / appearance
     addItem('Switch Image', 'switch_image');
-    addItem('Play Sound', 'play_sound');
+    addItem('Start Sound', 'play_sound');
     addItem('Set Size', 'set_size');
     addItem('Change Size By', 'change_size');
     addItem('Set Opacity', 'set_opacity');
@@ -4647,6 +4699,24 @@ let connectFromInput = null; // { blockId, which }
 let connectFromNext = null; // { blockId, which }
 let lastConnectEndedAt = 0;
 let connectStartTime = 0;
+let connectDragMoved = false;
+
+function setConnectMouseFromClientEvent(e) {
+    const container = getCodeScrollContainer();
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const sl = container.scrollLeft || 0;
+    const st = container.scrollTop || 0;
+    connectMouse.x = (e.clientX - rect.left) + sl;
+    connectMouse.y = (e.clientY - rect.top) + st;
+}
+
+function attachConnectDragListeners() {
+    connectDragMoved = false;
+    document.addEventListener('mousemove', handleConnectMouseMove);
+    document.addEventListener('mouseup', handleConnectMouseUp, true);
+    window.addEventListener('mouseup', handleConnectMouseUp, true);
+}
 
 // connectMouse: scroll content coords = scrollLeft + (clientX - hostBorderLeft).
 // Layer has transform: scale(z); layer-local (unscaled) coords = (screen - layerOrigin) / z.
@@ -4732,8 +4802,7 @@ function startConnectFromBlock(blockId) {
     isConnecting = true;
     connectStartTime = Date.now();
     connectFromBlockId = blockId;
-    document.addEventListener('mousemove', handleConnectMouseMove);
-    document.addEventListener('mouseup', handleConnectMouseUp, true);
+    attachConnectDragListeners();
 }
 
 function startConnectFromNext(blockId, which) {
@@ -4742,11 +4811,11 @@ function startConnectFromNext(blockId, which) {
     connectStartTime = Date.now();
     connectFromNext = { blockId, which: which === 'b' ? 'b' : 'a' };
     console.log('connectFromNext set to:', connectFromNext);
-    document.addEventListener('mousemove', handleConnectMouseMove);
-    document.addEventListener('mouseup', handleConnectMouseUp, true);
+    attachConnectDragListeners();
 }
 
 function handleConnectMouseMove(e) {
+    connectDragMoved = true;
     const container = getCodeScrollContainer();
     if (!container) return;
     const rect = container.getBoundingClientRect();
@@ -4836,8 +4905,8 @@ function handleConnectMouseUp(e) {
             }
         }
 
-        if (!foundValidTarget && selectedObj) {
-            // No input button found - create new action block at mouse position
+        if (!foundValidTarget && connectDragMoved && selectedObj) {
+            // No input button found - create new action block at mouse position (only after a real drag)
             const source = selectedObj.code.find(c => c.id === connectFromBlockId);
             if (source) {
                 try {
@@ -4893,19 +4962,6 @@ function handleConnectMouseUp(e) {
             }
         }
 
-        if (!foundValidTarget) {
-            const anyBlock = el && (el.classList && el.classList.contains('node-block') ? el : el.closest && el.closest('.node-block'));
-            if (anyBlock && selectedObj) {
-                const providerId = parseInt(anyBlock.dataset.codeId, 10);
-                const provider = selectedObj.code.find(c => c.id === providerId);
-                if (provider && provider.type === 'value') {
-                    foundValidTarget = true;
-                    const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
-                    if (target) connectProviderToInput(selectedObj, target, connectFromInput.which, providerId);
-                }
-            }
-        }
-
         // If dropped on blank space and this input already had a connection, disconnect instead of creating
         if (!foundValidTarget && selectedObj) {
             const isBlankDrop = !el || !(
@@ -4923,8 +4979,8 @@ function handleConnectMouseUp(e) {
             }
         }
 
-        if (!foundValidTarget && selectedObj) {
-            // No provider block found - create new block at mouse position
+        if (!foundValidTarget && connectDragMoved && selectedObj) {
+            // No provider block found - create new block at mouse position (only after a real drag, not a click)
             const target = selectedObj.code.find(c => c.id === connectFromInput.blockId);
             if (target) {
                 try {
@@ -5002,7 +5058,7 @@ function handleConnectMouseUp(e) {
             }
         }
 
-        if (!foundValidTarget && selectedObj) {
+        if (!foundValidTarget && connectDragMoved && selectedObj) {
             // No block found at mouse position - create new action block
             console.log('No valid target found, triggering drag-to-create for action block');
             const source = selectedObj.code.find(c => c.id === connectFromNext.blockId);
@@ -5064,6 +5120,7 @@ function cleanupDragState() {
     connectFromNext = null;
     document.removeEventListener('mousemove', handleConnectMouseMove);
     document.removeEventListener('mouseup', handleConnectMouseUp, true);
+    window.removeEventListener('mouseup', handleConnectMouseUp, true);
     // Also clear any menu click handlers that might intercept the next drag start
     clearMenuDocHandlers();
     drawConnections();
@@ -5729,6 +5786,7 @@ function showImageAssetSaveMenu(clientX, clientY, imgInfo) {
 // Update workspace with node blocks or images interface
 function updateWorkspace() {
     const nodeWindow = document.getElementById('node-window');
+    removeCodeBlockContextMenu();
 
     const scrollHostBefore = getCodeScrollContainer();
     const prevScrollLeft = scrollHostBefore ? scrollHostBefore.scrollLeft : 0;
@@ -5760,6 +5818,7 @@ function updateWorkspace() {
 
         syncCodeSelectionOwnership(selectedObj);
         zoomLayer.addEventListener('mousedown', onCodeZoomLayerMouseDown);
+        zoomLayer.addEventListener('contextmenu', onCodeBlockLayerContextMenu);
 
         selectedObj.code.forEach(codeData => {
             const block = createNodeBlock(
@@ -6215,8 +6274,10 @@ function createImagesInterface(container) {
         const moreBtn = colorPopupRoot.querySelector('.image-color-popup-more');
         const custom = colorPopupRoot.querySelector('.image-color-popup-custom');
         const panel = colorPopupRoot.querySelector('.image-color-popup-panel');
+        const sampleRow = colorPopupRoot.querySelector('.image-color-popup-sample-row');
         if (!grid || !moreBtn || !custom || !panel) return;
         grid.style.display = '';
+        if (sampleRow) sampleRow.style.display = '';
         moreBtn.style.display = '';
         custom.setAttribute('hidden', '');
         panel.classList.remove('image-color-popup-panel--custom');
@@ -6239,6 +6300,15 @@ function createImagesInterface(container) {
         if (top < margin) top = margin;
         panel.style.left = `${left}px`;
         panel.style.top = `${top}px`;
+    }
+    function syncRgbReadout() {
+        const rgb = hexToRgbVals(colorInput.value);
+        const text = rgb ? `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})` : '';
+        if (!colorPopupRoot) return;
+        const pal = colorPopupRoot.querySelector('.image-color-popup-rgb--palette');
+        const cust = colorPopupRoot.querySelector('.image-color-popup-rgb--custom');
+        if (pal) pal.textContent = text;
+        if (cust) cust.textContent = text;
     }
     function ensureColorPopup() {
         if (colorPopupRoot) return;
@@ -6268,12 +6338,65 @@ function createImagesInterface(container) {
                 paintAlpha = 1;
                 syncPaintAlphaUI();
                 updateColorPreview();
+                syncRgbReadout();
                 applyColorFromUI();
                 pushRecentImageColor(n);
                 closeColorPopup();
             });
             grid.appendChild(b);
         });
+        const sampleRow = document.createElement('div');
+        sampleRow.className = 'image-color-popup-sample-row';
+        const sampleBtn = document.createElement('button');
+        sampleBtn.type = 'button';
+        sampleBtn.className = 'image-color-popup-sample';
+        sampleBtn.setAttribute('aria-label', 'Sample color from screen');
+        sampleBtn.title = 'Pick a color from anywhere on the screen (eyedropper)';
+        setIcon(sampleBtn, ['pipette', 'eyedropper'], '◐');
+        refreshLucideIcons();
+        const eyeDropperAvailable =
+            typeof window.EyeDropper === 'function' && window.isSecureContext;
+        if (!eyeDropperAvailable) {
+            sampleBtn.disabled = true;
+            sampleBtn.title = !window.isSecureContext
+                ? 'Screen sampling needs HTTPS or localhost (secure context)'
+                : 'Screen sampling is not supported in this browser';
+        }
+        const rgbReadoutPalette = document.createElement('span');
+        rgbReadoutPalette.className = 'image-color-popup-rgb image-color-popup-rgb--palette';
+        rgbReadoutPalette.setAttribute('aria-live', 'polite');
+        sampleBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (typeof window.EyeDropper !== 'function' || !window.isSecureContext) return;
+            let openPromise;
+            try {
+                openPromise = new EyeDropper().open();
+            } catch (_) {
+                return;
+            }
+            closeColorPopup();
+            openPromise
+                .then((result) => {
+                    const hex = normalizeImageHex(result.sRGBHex);
+                    if (!hex) return;
+                    colorInput.value = hex;
+                    paintAlpha = 1;
+                    syncPaintAlphaUI();
+                    updateColorPreview();
+                    applyColorFromUI();
+                    pushRecentImageColor(hex);
+                    requestAnimationFrame(() => {
+                        openColorPopup();
+                        syncRgbReadout();
+                    });
+                })
+                .catch((err) => {
+                    if (err && err.name === 'AbortError') return;
+                });
+        });
+        sampleRow.appendChild(sampleBtn);
+        sampleRow.appendChild(rgbReadoutPalette);
         const moreBtn = document.createElement('button');
         moreBtn.type = 'button';
         moreBtn.className = 'image-color-popup-more';
@@ -6325,6 +6448,16 @@ function createImagesInterface(container) {
         hexInput.setAttribute('aria-label', 'Hex color');
         hexWrap.appendChild(hexLabel);
         hexWrap.appendChild(hexInput);
+        const rgbRowCustom = document.createElement('div');
+        rgbRowCustom.className = 'image-color-popup-rgb-row';
+        const rgbLabelCustom = document.createElement('span');
+        rgbLabelCustom.className = 'image-color-popup-rgb-label';
+        rgbLabelCustom.textContent = 'RGB';
+        const rgbReadoutCustom = document.createElement('span');
+        rgbReadoutCustom.className = 'image-color-popup-rgb image-color-popup-rgb--custom';
+        rgbReadoutCustom.setAttribute('aria-live', 'polite');
+        rgbRowCustom.appendChild(rgbLabelCustom);
+        rgbRowCustom.appendChild(rgbReadoutCustom);
         const nativeLink = document.createElement('button');
         nativeLink.type = 'button';
         nativeLink.className = 'image-color-popup-native';
@@ -6376,6 +6509,7 @@ function createImagesInterface(container) {
             paintAlpha = 1;
             syncPaintAlphaUI();
             updateColorPreview();
+            syncRgbReadout();
             applyColorFromUI();
             if (commitRecent) pushRecentImageColor(hex);
         }
@@ -6395,16 +6529,19 @@ function createImagesInterface(container) {
             e.preventDefault();
             e.stopPropagation();
             resetColorPopupToPalette();
+            syncRgbReadout();
             requestAnimationFrame(() => positionColorPopup());
         });
         moreBtn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
             grid.style.display = 'none';
+            sampleRow.style.display = 'none';
             moreBtn.style.display = 'none';
             customPanel.removeAttribute('hidden');
             panel.classList.add('image-color-popup-panel--custom');
             syncCustomFromInput();
+            syncRgbReadout();
             requestAnimationFrame(() => {
                 positionColorPopup();
                 hueInput.focus();
@@ -6433,6 +6570,7 @@ function createImagesInterface(container) {
             paintAlpha = 1;
             syncPaintAlphaUI();
             updateColorPreview();
+            syncRgbReadout();
             applyColorFromUI();
             drawSvPlane();
         });
@@ -6490,14 +6628,17 @@ function createImagesInterface(container) {
         customPanel.appendChild(svCanvas);
         customPanel.appendChild(hueInput);
         customPanel.appendChild(hexWrap);
+        customPanel.appendChild(rgbRowCustom);
         customPanel.appendChild(nativeLink);
         panel.appendChild(grid);
+        panel.appendChild(sampleRow);
         panel.appendChild(moreBtn);
         panel.appendChild(customPanel);
         backdrop.addEventListener('click', closeColorPopup);
         colorPopupRoot.appendChild(backdrop);
         colorPopupRoot.appendChild(panel);
         document.body.appendChild(colorPopupRoot);
+        refreshLucideIcons();
     }
     function openColorPopup() {
         if (paintAlpha < 0.5) return;
@@ -6512,6 +6653,7 @@ function createImagesInterface(container) {
             requestAnimationFrame(() => positionColorPopup());
         });
         document.addEventListener('keydown', onColorPopupEsc);
+        syncRgbReadout();
     }
 
     renderRecentPalette();
@@ -6603,6 +6745,7 @@ function createImagesInterface(container) {
         paintAlpha = 1;
         syncPaintAlphaUI();
         updateColorPreview();
+        syncRgbReadout();
         applyColorFromUI();
     }
     function onColorPickerChange() {
@@ -7008,13 +7151,15 @@ function drawWaveformPeaks(canvas, peaks, progress01, trimOpt) {
         ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
         ctx.fillRect(0, 0, w * trimA, h);
         ctx.fillRect(w * trimB, 0, w * (1 - trimB), h);
-        ctx.strokeStyle = 'rgba(255, 200, 90, 0.95)';
-        ctx.lineWidth = 2;
+        const xTrimA = Math.round(w * trimA) + 0.5;
+        const xTrimB = Math.round(w * trimB) + 0.5;
+        ctx.strokeStyle = 'rgba(0, 255, 204, 0.95)';
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(w * trimA, 0);
-        ctx.lineTo(w * trimA, h);
-        ctx.moveTo(w * trimB, 0);
-        ctx.lineTo(w * trimB, h);
+        ctx.moveTo(xTrimA, 0);
+        ctx.lineTo(xTrimA, h);
+        ctx.moveTo(xTrimB, 0);
+        ctx.lineTo(xTrimB, h);
         ctx.stroke();
     }
 
@@ -7239,6 +7384,8 @@ function createSoundInterface(container) {
     waveformWorkspace.className = 'sound-waveform-workspace';
     const waveformStack = document.createElement('div');
     waveformStack.className = 'sound-waveform-stack';
+    const waveformFrame = document.createElement('div');
+    waveformFrame.className = 'sound-waveform-frame';
     const waveformCanvas = document.createElement('canvas');
     waveformCanvas.className = 'sound-waveform-canvas';
     waveformCanvas.setAttribute('aria-label', 'Waveform');
@@ -7258,15 +7405,10 @@ function createSoundInterface(container) {
     handleEnd.title = 'Drag inward from the end';
     trimOverlay.appendChild(handleStart);
     trimOverlay.appendChild(handleEnd);
-    waveformStack.appendChild(waveformCanvas);
-    waveformStack.appendChild(trimOverlay);
+    waveformFrame.appendChild(waveformCanvas);
+    waveformFrame.appendChild(trimOverlay);
+    waveformStack.appendChild(waveformFrame);
     waveformWorkspace.appendChild(waveformStack);
-
-    const scrubBar = document.createElement('div');
-    scrubBar.className = 'sound-scrub-bar';
-    const scrubFill = document.createElement('div');
-    scrubFill.className = 'sound-scrub-fill';
-    scrubBar.appendChild(scrubFill);
 
     const cropRow = document.createElement('div');
     cropRow.className = 'sound-crop-row';
@@ -7299,7 +7441,6 @@ function createSoundInterface(container) {
 
     previewContainer.appendChild(metaRow);
     previewContainer.appendChild(waveformWorkspace);
-    previewContainer.appendChild(scrubBar);
     previewContainer.appendChild(cropRow);
 
     rightPanel.appendChild(previewContainer);
@@ -7326,7 +7467,7 @@ function createSoundInterface(container) {
     }
 
     function clientXToTime01(clientX) {
-        const rect = waveformStack.getBoundingClientRect();
+        const rect = waveformCanvas.getBoundingClientRect();
         const rw = rect.width || 1;
         return Math.max(0, Math.min(1, (clientX - rect.left) / rw));
     }
@@ -7494,11 +7635,6 @@ function createSoundInterface(container) {
         refreshLucideIcons();
     }
 
-    function setScrub(p) {
-        const x = Math.max(0, Math.min(100, p * 100));
-        scrubFill.style.width = `${x}%`;
-    }
-
     function redrawMainWave() {
         if (!mainPeaks) {
             const ctx = waveformCanvas.getContext('2d');
@@ -7520,7 +7656,6 @@ function createSoundInterface(container) {
         const prog = dur > 0 ? t / dur : 0;
         const trim = getTrimNormalized();
         drawWaveformPeaks(waveformCanvas, mainPeaks, prog, trim || undefined);
-        setScrub(prog);
         timeEl.textContent = `${formatTime(t)} / ${formatTime(dur)}`;
         updateTrimHandlePositions();
     }
@@ -7546,7 +7681,6 @@ function createSoundInterface(container) {
         };
         soundTabAudio.onended = () => {
             updatePlayIcon(false);
-            if (!isLooping) setScrub(0);
             redrawMainWave();
         };
         soundTabAudio.ontimeupdate = () => {
@@ -7580,7 +7714,7 @@ function createSoundInterface(container) {
         });
         ro.observe(previewContainer);
         ro.observe(waveformWorkspace);
-        ro.observe(waveformStack);
+        ro.observe(waveformFrame);
     } catch (_) {}
 
     function applySoundSelection(src, itemEl, info) {
@@ -7781,13 +7915,10 @@ function createSoundInterface(container) {
         const rw = rect.width || 1;
         const x = Math.max(0, Math.min(1, (clientX - rect.left) / rw));
         soundTabAudio.currentTime = x * dur;
-        setScrub(x);
         redrawMainWave();
     }
 
     waveformCanvas.addEventListener('click', (e) => seekFromClientX(e.clientX));
-
-    scrubBar.addEventListener('click', (e) => seekFromClientX(e.clientX));
 
     loadSoundsFromDirectory(thumbnailsContainer);
 
@@ -7857,7 +7988,6 @@ function loadSoundsFromDirectory(container) {
         });
 
         thumbWrap.appendChild(waveMini);
-        thumbWrap.appendChild(deleteBtn);
 
         const label = document.createElement('span');
         label.className = 'sound-label';
@@ -7866,6 +7996,7 @@ function loadSoundsFromDirectory(container) {
 
         item.appendChild(thumbWrap);
         item.appendChild(label);
+        item.appendChild(deleteBtn);
 
         item.addEventListener('click', () => {
             selectSound(soundInfo.src, item, soundInfo);
@@ -8390,7 +8521,8 @@ function resolveImageListEntryForSelection(list, imagePath, thumbnailElement) {
 }
 
 // Select and display an image
-function selectImage(imagePath, thumbnailElement) {
+function selectImage(imagePath, thumbnailElement, options) {
+    const updateSprite = !options || options.updateSprite !== false;
     // Clear previous selection
     document.querySelectorAll('.image-thumbnail-item').forEach(item => {
         item.classList.remove('selected');
@@ -8437,20 +8569,33 @@ function selectImage(imagePath, thumbnailElement) {
     const obj = objects.find(o => o.id == selected_object);
     if (obj) {
         if (!obj.media) obj.media = [];
-        if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: busted });
-        else obj.media[0].path = busted;
-        const box = document.querySelector(`.box[data-id="${obj.id}"]`);
-        if (box) {
-            let img = box.querySelector('img');
-            if (!img) {
-                img = document.createElement('img');
-                box.insertBefore(img, box.firstChild);
+        if (obj.media.length === 0) {
+            obj.media.push({ id: 1, name: 'sprite', type: 'image', path: busted });
+            const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+            if (box) {
+                let img = box.querySelector('img');
+                if (!img) {
+                    img = document.createElement('img');
+                    box.insertBefore(img, box.firstChild);
+                }
+                img.src = busted;
+                img.alt = obj.name;
             }
-            img.src = busted;
-            img.alt = obj.name;
+            renderGameWindowSprite();
+        } else if (updateSprite) {
+            obj.media[0].path = busted;
+            const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+            if (box) {
+                let img = box.querySelector('img');
+                if (!img) {
+                    img = document.createElement('img');
+                    box.insertBefore(img, box.firstChild);
+                }
+                img.src = busted;
+                img.alt = obj.name;
+            }
+            renderGameWindowSprite();
         }
-        // refresh game window
-        renderGameWindowSprite();
     }
 }
 // Zoom image in preview
@@ -8718,30 +8863,11 @@ function createNewImage() {
     selectedImage = dataUrl;
     if (imageEditor) imageEditor.loadImage(dataUrl);
 
-    // Update selected object's media and grid icon
-    const obj = objects.find(o => o.id == selected_object);
-    if (obj) {
-        if (!obj.media) obj.media = [];
-        if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: dataUrl });
-        else obj.media[0].path = dataUrl;
-        const box = document.querySelector(`.box[data-id="${obj.id}"]`);
-        if (box) {
-            let img = box.querySelector('img');
-            if (!img) { img = document.createElement('img'); box.insertBefore(img, box.firstChild); }
-            img.src = dataUrl;
-            img.alt = obj.name;
-            img.style.width = "75px";
-            img.style.height = "75px";
-        }
-        renderGameWindowSprite();
-    }
-
     // Refresh thumbnails and visually select the new image
     const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
     if (thumbnailsContainer) {
         loadImagesFromDirectory(thumbnailsContainer);
         setTimeout(() => {
-            // Prefer a direct attribute lookup for the new item
             let targetEl = thumbnailsContainer.querySelector(`.image-thumbnail-item[data-filename="${newInfo.name}"]`);
             if (!targetEl) {
                 const items = Array.from(thumbnailsContainer.children);
@@ -8751,7 +8877,7 @@ function createNewImage() {
                 thumbnailsContainer.scrollTop = thumbnailsContainer.scrollHeight;
                 const imgEl = targetEl.querySelector('img');
                 const path = imgEl ? imgEl.src : dataUrl;
-                selectImage(path, targetEl);
+                selectImage(path, targetEl, { updateSprite: false });
             }
         }, 30);
     }
@@ -8806,26 +8932,6 @@ async function duplicateObjectImage(imgInfo) {
     selectedImage = srcCopy;
     if (imageEditor) imageEditor.loadImage(srcCopy);
 
-    const obj = objects.find((o) => o.id == selected_object);
-    if (obj) {
-        if (!obj.media) obj.media = [];
-        if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: srcCopy });
-        else obj.media[0].path = srcCopy;
-        const box = document.querySelector(`.box[data-id="${obj.id}"]`);
-        if (box) {
-            let img = box.querySelector('img');
-            if (!img) {
-                img = document.createElement('img');
-                box.insertBefore(img, box.firstChild);
-            }
-            img.src = srcCopy;
-            img.alt = obj.name;
-            img.style.width = '75px';
-            img.style.height = '75px';
-        }
-        renderGameWindowSprite();
-    }
-
     const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
     if (thumbnailsContainer) {
         loadImagesFromDirectory(thumbnailsContainer);
@@ -8841,7 +8947,7 @@ async function duplicateObjectImage(imgInfo) {
                 } catch (_) {}
                 const imgEl = targetEl.querySelector('img');
                 const path = imgEl ? imgEl.src : srcCopy;
-                selectImage(path, targetEl);
+                selectImage(path, targetEl, { updateSprite: false });
             }
         }, 30);
     }
@@ -8880,24 +8986,6 @@ function triggerUploadImage() {
                 selectedImage = dataUrl;
                 if (imageEditor) imageEditor.loadImage(dataUrl);
 
-                // Update selected object's media and grid icon
-                const obj = objects.find(o => o.id == selected_object);
-                if (obj) {
-                    if (!obj.media) obj.media = [];
-                    if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: dataUrl });
-                    else obj.media[0].path = dataUrl;
-                    const box = document.querySelector(`.box[data-id="${obj.id}"]`);
-                    if (box) {
-                        let img = box.querySelector('img');
-                        if (!img) { img = document.createElement('img'); box.insertBefore(img, box.firstChild); }
-                        img.src = dataUrl;
-                        img.alt = obj.name;
-                        img.style.width = "75px";
-                        img.style.height = "75px";
-                    }
-                    renderGameWindowSprite();
-                }
-
                 // Refresh thumbnails and select the uploaded one
                 const thumbnailsContainer = document.querySelector('.images-thumbnails-scroll');
                 if (thumbnailsContainer) {
@@ -8912,7 +9000,7 @@ function triggerUploadImage() {
                             thumbnailsContainer.scrollTop = thumbnailsContainer.scrollHeight;
                             const imgEl = targetEl.querySelector('img');
                             const path = imgEl ? imgEl.src : dataUrl;
-                            selectImage(path, targetEl);
+                            selectImage(path, targetEl, { updateSprite: false });
                         }
                     }, 30);
                 }
@@ -9584,9 +9672,28 @@ function serializeProject() {
 	return project;
 }
 
-function saveProjectToFile() {
+async function saveProjectToFile() {
 	try {
 		const data = serializeProject();
+		await ensureProjectImagesEmbedded(data);
+		await ensureProjectSoundsEmbedded(data);
+		// Sync each object's media paths with the embedded data URLs
+		for (const obj of data.objects || []) {
+			const key = String(obj.id);
+			const imgs = data.images[key];
+			if (imgs && imgs.length > 0 && imgs[0].src) {
+				if (!obj.media) obj.media = [];
+				if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: imgs[0].src });
+				else obj.media[0].path = imgs[0].src;
+			}
+			const snds = data.sounds[key];
+			if (snds && snds.length > 0 && snds[0].src) {
+				if (!obj.media) obj.media = [];
+				const si = obj.media.findIndex(m => m && m.type === 'sound');
+				if (si >= 0) obj.media[si].path = snds[0].src;
+				else obj.media.push({ id: Date.now(), name: 'sound', type: 'sound', path: snds[0].src });
+			}
+		}
 		const json = JSON.stringify(data, null, 2);
 		const blob = new Blob([json], { type: 'application/json' });
 		const url = URL.createObjectURL(blob);
@@ -9649,6 +9756,23 @@ async function loadProjectFromFile(file) {
 							const list = Array.isArray(data.sounds[k]) ? data.sounds[k] : [];
 							objectSounds[k] = list.map((s) => ({ id: s.id, name: s.name, src: s.src }));
 						});
+					}
+					// Sync object media paths from loaded embedded images/sounds
+					for (const obj of objects) {
+						const key = String(obj.id);
+						const imgs = objectImages[key];
+						if (imgs && imgs.length > 0 && imgs[0].src) {
+							if (!obj.media) obj.media = [];
+							if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: imgs[0].src });
+							else obj.media[0].path = imgs[0].src;
+						}
+						const snds = objectSounds[key];
+						if (snds && snds.length > 0 && snds[0].src) {
+							if (!obj.media) obj.media = [];
+							const si = obj.media.findIndex(m => m && m.type === 'sound');
+							if (si >= 0) obj.media[si].path = snds[0].src;
+							else obj.media.push({ id: Date.now(), name: 'sound', type: 'sound', path: snds[0].src });
+						}
 					}
 					// Migrate and ensure start blocks after load
 					migrateCodeModel();
@@ -9814,9 +9938,20 @@ function generateStandaloneHtml(project) {
 	let objects = project.objects || [];
 	const objectImages = project.images || {};
 	const objectSounds = project.sounds || {};
-	// Match editor fairness/time budget
+	const objectById = {};
+	objects.forEach(o => { if (o) objectById[o.id] = o; });
+	const codeMapByTemplateId = {};
+	objects.forEach(o => {
+	  if (!o) return;
+	  const code = Array.isArray(o.code) ? o.code : [];
+	  const map = {};
+	  for (let i = 0; i < code.length; i++) {
+	    const b = code[i];
+	    if (b && typeof b.id !== 'undefined') map[b.id] = b;
+	  }
+	  codeMapByTemplateId[o.id] = map;
+	});
 	const TIME_BUDGET_MS = 6;
-	const LOOP_YIELD_MS = 1000 / 60;
 	const MAX_TOTAL_STEPS_PER_FRAME = 2000;
 	let rrInstanceStartIndex = 0;
 	let __stepOnlyInstanceIds = null;
@@ -9862,7 +9997,7 @@ function generateStandaloneHtml(project) {
 	}
 
 	function registerRuntimeInstanceFromTemplate(instanceId, templateId) {
-	  const template = objects.find(o => o.id === templateId);
+	  const template = objectById[templateId];
 	  if (!template) return false;
 	  runtimeInstances.push({ instanceId, templateId });
 	  runtimePositions[instanceId] = { x: 0, y: 0, layer: 0 };
@@ -9871,25 +10006,30 @@ function generateStandaloneHtml(project) {
 	    const arrs = Array.isArray(template.arrayVariables) ? template.arrayVariables : [];
 	    arrs.forEach(name => { runtimeVariables[instanceId][name] = []; });
 	  } catch (_) {}
-	  const start = (template.code || []).find(b => b && b.type === 'start');
+	  const cm = codeMapByTemplateId[templateId];
+	  const code = Array.isArray(template.code) ? template.code : [];
+	  const start = cm ? Object.values(cm).find(b => b && b.type === 'start') : code.find(b => b && b.type === 'start');
 	  const pcT = start && typeof start.next_block_a === 'number' ? start.next_block_a : null;
-	  runtimeExecState[instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [] };
+	  runtimeExecState[instanceId] = { pc: pcT, waitMs: 0, waitingBlockId: null, repeatStack: [], yieldFrame: false, yieldResumePc: null };
 	  return true;
 	}
 	function runInstanceStartChainSync(instanceId) {
 	  const savedFilter = __stepOnlyInstanceIds;
+	  const savedSnapshot = frameGlobalReadSnapshot;
 	  let guard = 0;
 	  try {
 	    while (isPlaying && guard++ < 100000) {
 	      const exec = runtimeExecState[instanceId];
 	      if (!exec) break;
 	      if (exec.waitMs > 0) break;
+	      if (exec.yieldFrame) break;
 	      if (exec.pc == null && exec.repeatStack.length === 0) break;
 	      __stepOnlyInstanceIds = [instanceId];
 	      stepInterpreter(0);
 	    }
 	  } finally {
 	    __stepOnlyInstanceIds = savedFilter;
+	    frameGlobalReadSnapshot = savedSnapshot;
 	  }
 	}
 
@@ -9912,17 +10052,16 @@ function generateStandaloneHtml(project) {
 	  runtimeGlobalVariables = {};
 	  const controller = objects.find(o=>o.type==='controller' || o.name==='AppController');
 	  if (controller){
-	    // Seed public array variables
 	    try { const pubArrs = Array.isArray(controller.arrayVariables) ? controller.arrayVariables : []; pubArrs.forEach(name => { if (!Array.isArray(runtimeGlobalVariables[name])) runtimeGlobalVariables[name] = []; }); } catch(_) {}
 	    const instId = nextInstanceId++;
 	    runtimeInstances.push({ instanceId: instId, templateId: controller.id });
 	    runtimePositions[instId] = { x:0, y:0, layer: 0 };
 	    runtimeVariables[instId] = {};
-	    const start = (controller.code||[]).find(b=>b && b.type==='start');
-	    runtimeExecState[instId] = { pc: start ? start.next_block_a : null, waitMs:0, waitingBlockId:null, repeatStack: [] };
+	    const cm = codeMapByTemplateId[controller.id];
+	    const code = Array.isArray(controller.code) ? controller.code : [];
+	    const start = cm ? Object.values(cm).find(b => b && b.type === 'start') : code.find(b => b && b.type === 'start');
+	    runtimeExecState[instId] = { pc: start ? start.next_block_a : null, waitMs:0, waitingBlockId:null, repeatStack: [], yieldFrame: false, yieldResumePc: null };
 	  }
-	  // Match editor semantics: do not auto-instantiate non-controller objects.
-	  // AppController is responsible for spawning gameplay objects in exported build.
 	}
 
 	function worldToCanvas(x,y,canvas){
@@ -9933,7 +10072,7 @@ function generateStandaloneHtml(project) {
 
 	const imageCache = {};
 	function resolveExportImage(inst) {
-	  const tmpl = objects.find(o => o.id === inst.templateId);
+	  const tmpl = objectById[inst.templateId];
 	  if (!tmpl) return null;
 	  const pi = runtimePositions[inst.instanceId] || {};
 	  const primary = normalizeExportPath(pi.spritePath || getFirstImagePathForTemplateId(tmpl.id));
@@ -9999,7 +10138,7 @@ function generateStandaloneHtml(project) {
 	  return g.data[(iy * g.width + ix) * 4 + 3];
 	}
 	function getBoundsTouch(inst, canvas) {
-	  const tmpl = objects.find(o => o.id === inst.templateId);
+	  const tmpl = objectById[inst.templateId];
 	  if (!tmpl) return null;
 	  const res = resolveExportImage(inst);
 	  if (!res) return null;
@@ -10216,19 +10355,25 @@ function generateStandaloneHtml(project) {
 	  const count = runtimeInstances.length;
 	  if (count === 0) return;
 	  function isAppCtrl(o){ return o && (o.type==='controller' || o.name==='AppController'); }
-	  const controllerInstances=[]; const otherInstances=[];
-	  for (let ii=0; ii<count; ii++) {
-	    const inst = runtimeInstances[ii];
-	    const o = objects.find(obj=>obj.id===inst.templateId);
-	    if (isAppCtrl(o)) controllerInstances.push(inst); else otherInstances.push(inst);
+	  const isFilteredStep = __stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length > 0;
+	  if (!isFilteredStep) {
+	    for (let ri = 0; ri < count; ri++) {
+	      const exec = runtimeExecState[runtimeInstances[ri].instanceId];
+	      if (exec && exec.yieldFrame) {
+	        exec.yieldFrame = false;
+	        exec.pc = exec.yieldResumePc;
+	        exec.yieldResumePc = null;
+	      }
+	    }
 	  }
-	  const oLen = otherInstances.length;
-	  const orderedInstances = controllerInstances.concat(oLen===0 ? [] : otherInstances.map((_, j) => otherInstances[(rrInstanceStartIndex + j) % oLen]));
+	  const orderedInstances = [];
+	  for (let ii=0; ii<count; ii++) { const inst=runtimeInstances[ii]; const o=objectById[inst.templateId]; if(isAppCtrl(o)) orderedInstances.push(inst); }
+	  for (let ii=0; ii<count; ii++) { const inst=runtimeInstances[ii]; const o=objectById[inst.templateId]; if(!isAppCtrl(o)) orderedInstances.push(inst); }
 	  for (let i=0; i<orderedInstances.length; i++){
 	    const inst = orderedInstances[i];
 	    if (!inst) continue;
 	    if (__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length>0){ if (!__stepOnlyInstanceIds.includes(inst.instanceId)) continue; }
-	    const o = objects.find(obj=>obj.id===inst.templateId);
+	    const o = objectById[inst.templateId];
 	    const exec = runtimeExecState[inst.instanceId];
 	    if (!o || !exec) continue;
 	    if (!isAppCtrl(o) && frameGlobalReadSnapshot===null) {
@@ -10241,33 +10386,37 @@ function generateStandaloneHtml(project) {
 	    }
 	    const useGlobalReadSnapshot = frameGlobalReadSnapshot!==null && !isAppCtrl(o);
 	    const code = o.code || [];
-	    if (exec.waitMs>0){ exec.waitMs-=dt; if (exec.waitMs>0) continue; exec.waitMs=0; if(exec.waitingBlockId!=null){ const waitingBlock=code.find(b=>b&&b.id===exec.waitingBlockId); exec.waitingBlockId=null; if(waitingBlock){ exec.pc = (typeof waitingBlock.next_block_a==='number') ? waitingBlock.next_block_a : null; } } }
+	    const codeMap = codeMapByTemplateId[o.id] || null;
+	    if (exec.waitMs>0){ exec.waitMs-=dt; if (exec.waitMs>0) continue; exec.waitMs=0; if(exec.waitingBlockId!=null){ const waitingBlock=codeMap ? codeMap[exec.waitingBlockId] : code.find(b=>b&&b.id===exec.waitingBlockId); exec.waitingBlockId=null; if(waitingBlock){ exec.pc = (typeof waitingBlock.next_block_a==='number') ? waitingBlock.next_block_a : null; } } }
 	    let steps=0;
+	    let outerPasses=0;
 	    const perInstanceBudgetStart = performance.now();
-	    outerLoop: while (steps < maxStepsPerObject) {
-	    while (exec.pc!=null && steps++<maxStepsPerObject){
-	      const block = code.find(b=>b&&b.id===exec.pc); if(!block){ exec.pc=null; break; }
+	    outerLoop: while (outerPasses < 50000) {
+	    outerPasses++;
+	    while (exec.pc!=null && steps<maxStepsPerObject){
+	      const block = codeMap ? codeMap[exec.pc] : code.find(b=>b&&b.id===exec.pc); if(!block){ exec.pc=null; break; }
 	      const coerceScalarLiteral=(v)=>{ if(typeof v==='number') return v; if(typeof v==='string'){ const s=v.trim(); if(s==='') return ''; if(/^\\s*[+-]?(?:\\d*\\.?\\d+|\\d+\\.?\\d*)\\s*\\/\\s*[+-]?(?:\\d*\\.?\\d+|\\d+\\.?\\d*)\\s*$/.test(s)) return parseNumericInput(s); const n=Number(s); return Number.isFinite(n)?n:v; } return v; };
 	      const getArrayRef=(varName,instanceOnly)=>{ const name=varName||''; const store=instanceOnly ? (runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={})) : runtimeGlobalVariables; let arr=store[name]; if(!Array.isArray(arr)){ arr=[]; store[name]=arr; } return arr; };
-	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='pixel_is_rgb'){ const c=document.getElementById('game'); if(!c) return 0; const xw=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const yw=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const p=worldToCanvas(xw,yw,c); const px=Math.round(p.x); const py=Math.round(p.y); if(!Number.isFinite(px)||!Number.isFinite(py)) return 0; if(px<0||py<0||px>=c.width||py>=c.height) return 0; const cctx=c.getContext('2d'); if(!cctx) return 0; let data; try{ data=cctx.getImageData(px,py,1,1).data; }catch(_){ return 0; } const r=data[0], g=data[1], b=data[2]; const tr=Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0))); const tg=Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0))); const tb=Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0))); return (r===tr && g===tg && b===tb) ? 1 : 0; } if(node.content==='touching'){ const mode=node.touching_mode||'object'; const c=document.getElementById('game'); if(!c) return 0; if(mode==='object'){ return evalTouchingObjectExport(inst,node,c); } if(mode==='color'){ return evalTouchingColorExport(inst,node,c); } return 0; } if(node.content==='random_int'){ let a=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const rawA=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const rawB=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); const op=node.val_a||'+'; if(op==='+'){ if(typeof rawA==='string'||typeof rawB==='string') return String(rawA??'')+String(rawB??''); return parseNumericInput(rawA)+parseNumericInput(rawB);} const xVal=parseNumericInput(rawA); const yVal=parseNumericInput(rawB); switch(op){ case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=parseNumericInput(v); return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=parseNumericInput(aVal); let B=parseNumericInput(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=parseNumericInput(aVal); const B=parseNumericInput(bVal); return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=parseNumericInput(aVal); const B=parseNumericInput(bVal); return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const store=useGlobalReadSnapshot?frameGlobalReadSnapshot:runtimeGlobalVariables; const v=store[varName]; return (typeof v==='number')?v:0; } } if(node.content==='array_get'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); const idxVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const idx=Math.floor(parseNumericInput(idxVal)); if(!Number.isFinite(idx) || idx<0 || idx>=arr.length) return ''; return arr[idx]; } if(node.content==='array_length'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); return arr.length; } return null; };
+	      const resolveInput=(blockRef,key)=>{ const inputId=blockRef[key]; if(inputId==null) return null; const node=codeMap ? codeMap[inputId] : code.find(b=>b&&b.id===inputId); if(!node) return null; if(node.content==='mouse_x') return runtimeMouse.x; if(node.content==='mouse_y') return runtimeMouse.y; if(node.content==='window_width'){ const c=document.getElementById('game'); return c? c.width : window.innerWidth; } if(node.content==='window_height'){ const c=document.getElementById('game'); return c? c.height : window.innerHeight; } if(node.content==='object_x'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; return typeof pos.x==='number'?pos.x:0;} if(node.content==='object_y'){ const pos=runtimePositions[inst.instanceId]||{y:0}; return typeof pos.y==='number'?pos.y:0;} if(node.content==='rotation'){ const pos=runtimePositions[inst.instanceId]||{rot:0}; return typeof pos.rot==='number'?pos.rot:0;} if(node.content==='size'){ const pos=runtimePositions[inst.instanceId]||{scale:1}; return typeof pos.scale==='number'?pos.scale:1;} if(node.content==='mouse_pressed') return runtimeMousePressed?1:0; if(node.content==='key_pressed') return runtimeKeys[node.key_name]?1:0; if(node.content==='image_name'){ try{ const tmpl=objectById[inst.templateId]; const path=(runtimePositions[inst.instanceId]&&runtimePositions[inst.instanceId].spritePath)||(tmpl&&tmpl.media&&tmpl.media[0]&&tmpl.media[0].path?tmpl.media[0].path:null); if(!tmpl||!path) return ''; const images=objectImages[String(tmpl.id)]||[]; const base=path.split('?')[0]; const found=images.find(img=>(img.src||'').split('?')[0]===base); return (found&&found.name)?found.name:''; }catch(_){ return ''; } } if(node.content==='distance_to'){ const pos=runtimePositions[inst.instanceId]||{x:0,y:0}; const tx=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const ty=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const dx=(typeof pos.x==='number'?pos.x:0)-tx; const dy=(typeof pos.y==='number'?pos.y:0)-ty; return Math.hypot(dx,dy);} if(node.content==='pixel_is_rgb'){ const c=document.getElementById('game'); if(!c) return 0; const xw=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); const yw=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); const p=worldToCanvas(xw,yw,c); const px=Math.round(p.x); const py=Math.round(p.y); if(!Number.isFinite(px)||!Number.isFinite(py)) return 0; if(px<0||py<0||px>=c.width||py>=c.height) return 0; const cctx=c.getContext('2d'); if(!cctx) return 0; let data; try{ data=cctx.getImageData(px,py,1,1).data; }catch(_){ return 0; } const r=data[0], g=data[1], b=data[2]; const tr=Math.max(0, Math.min(255, Math.round(Number(node.rgb_r ?? 0) || 0))); const tg=Math.max(0, Math.min(255, Math.round(Number(node.rgb_g ?? 0) || 0))); const tb=Math.max(0, Math.min(255, Math.round(Number(node.rgb_b ?? 0) || 0))); return (r===tr && g===tg && b===tb) ? 1 : 0; } if(node.content==='touching'){ const mode=node.touching_mode||'object'; const c=document.getElementById('game'); if(!c) return 0; if(mode==='object'){ return evalTouchingObjectExport(inst,node,c); } if(mode==='color'){ return evalTouchingColorExport(inst,node,c); } return 0; } if(node.content==='random_int'){ let a=parseNumericInput((node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0)); let b=parseNumericInput((node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0)); if(Number.isNaN(a)) a=0; if(Number.isNaN(b)) b=0; if(a>b){ const t=a; a=b; b=t; } return Math.floor(Math.random()*(b-a+1))+a; } if(node.content==='operation'){ const rawA=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.op_x ?? 0):(node.op_x ?? 0); const rawB=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.op_y ?? 0):(node.op_y ?? 0); const op=node.val_a||'+'; if(op==='+'){ if(typeof rawA==='string'||typeof rawB==='string') return String(rawA??'')+String(rawB??''); return parseNumericInput(rawA)+parseNumericInput(rawB);} const xVal=parseNumericInput(rawA); const yVal=parseNumericInput(rawB); switch(op){ case '-': return xVal - yVal; case '*': return xVal * yVal; case '/': return (yVal===0)?0:(xVal / yVal); case '^': return Math.pow(xVal, yVal); default: return xVal + yVal; } } if(node.content==='not'){ const v=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const num=parseNumericInput(v); return num?0:1; } if(node.content==='equals'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=(aVal==null)?'':aVal; const B=(bVal==null)?'':bVal; return (A==B)?1:0; } if(node.content==='less_than'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); let A=parseNumericInput(aVal); let B=parseNumericInput(bVal); if(Number.isNaN(A)) A=0; if(Number.isNaN(B)) B=0; return (A<B)?1:0; } if(node.content==='and'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=parseNumericInput(aVal); const B=parseNumericInput(bVal); return (A!==0 && B!==0)?1:0; } if(node.content==='or'){ const aVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const bVal=(node.input_b!=null)?(resolveInput(node,'input_b') ?? node.val_b ?? 0):(node.val_b ?? 0); const A=parseNumericInput(aVal); const B=parseNumericInput(bVal); return (A!==0 || B!==0)?1:0; } if(node.content==='variable'){ const varName=node.var_name||''; if(node.var_instance_only){ const vars=runtimeVariables[inst.instanceId] || (runtimeVariables[inst.instanceId]={}); const v=vars[varName]; return (typeof v==='number')?v:0; } else { const store=useGlobalReadSnapshot?frameGlobalReadSnapshot:runtimeGlobalVariables; const v=store[varName]; return (typeof v==='number')?v:0; } } if(node.content==='array_get'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); const idxVal=(node.input_a!=null)?(resolveInput(node,'input_a') ?? node.val_a ?? 0):(node.val_a ?? 0); const idx=Math.floor(parseNumericInput(idxVal)); if(!Number.isFinite(idx) || idx<0 || idx>=arr.length) return ''; return arr[idx]; } if(node.content==='array_length'){ const arr=getArrayRef(node.var_name||'', !!node.var_instance_only); return arr.length; } return null; };
 	      if (block.type==='action'){
 	        if (block.content==='move_xy'){ const x=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); const y=parseNumericInput(resolveInput(block,'input_b') ?? block.val_b ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x += x; runtimePositions[inst.instanceId].y += y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='move_forward'){ const distance=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const rotDeg=runtimePositions[inst.instanceId].rot || 0; const rotRad=(rotDeg)*Math.PI/180; runtimePositions[inst.instanceId].x += Math.sin(rotRad)*distance; runtimePositions[inst.instanceId].y += Math.cos(rotRad)*distance; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='rotate'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = (runtimePositions[inst.instanceId].rot||0) + parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_rotation'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; runtimePositions[inst.instanceId].rot = parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_size'){ const s=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1,layer:0}; runtimePositions[inst.instanceId].scale = Math.max(0,s); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='set_opacity'){ let a=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 1); if(Number.isNaN(a)) a=1; a=Math.max(0,Math.min(1,a)); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].alpha=a; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_layer'){ const layer=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].layer = layer; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='point_towards'){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,rot:0}; const pos=runtimePositions[inst.instanceId]; const tx=parseNumericInput((block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? 0):(block.val_a ?? 0)); const ty=parseNumericInput((block.input_b!=null)?(resolveInput(block,'input_b') ?? block.val_b ?? 0):(block.val_b ?? 0)); const dx=tx-(typeof pos.x==='number'?pos.x:0); const dy=ty-(typeof pos.y==='number'?pos.y:0); const ang=90 - (Math.atan2(dy,dx)*180/Math.PI); pos.rot = ang; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='change_size'){ const ds=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,scale:1}; const cur=runtimePositions[inst.instanceId].scale||1; runtimePositions[inst.instanceId].scale=Math.max(0,cur+ds); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='wait'){ const seconds=Math.max(0, parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds>0){ exec.waitMs = seconds*1000; exec.waitingBlockId = block.id; exec.pc = null; } else { exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; } break; }
-	        if (block.content==='repeat'){ const times=Math.max(0, Math.floor(parseNumericInput(block.val_a ?? 0))); if(times<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='wait'){ const seconds=Math.max(0, parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0)); if(seconds<=0){ exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; } if(exec.waitMs<=0 || exec.waitingBlockId!==block.id){ exec.waitMs=seconds*1000; exec.waitingBlockId=block.id; } break; }
+	        if (block.content==='repeat'){ const times=Math.max(0, Math.floor(parseNumericInput(block.val_a ?? 0))); if(times<=0){ exec.pc=(typeof block.next_block_b==='number')?block.next_block_b:null; continue; } exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:times, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='print'){ const val=(block.input_a!=null)?(resolveInput(block,'input_a') ?? block.val_a ?? ''):(block.val_a ?? ''); try{ console.log(val);}catch(_){} exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='if'){ const condVal=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); const isTrue = !!condVal; exec.pc = isTrue ? ((typeof block.next_block_b==='number')?block.next_block_b:null) : ((typeof block.next_block_a==='number')?block.next_block_a:null); continue; }
 	        if (block.content==='set_x'){ const x=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0,layer:0}; runtimePositions[inst.instanceId].x=x; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='set_y'){ const y=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].y=y; exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='switch_image'){ const imgs=(objectImages[String(o.id)]||[]); let found=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(typeof sel==='string'){ found=imgs.find(img=>img.name===sel);} else { found=imgs.find(img=>String(img.id)===String(sel)); } } else { found=imgs.find(img=>String(img.id)===String(block.val_a)); } if(found){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].spritePath = (found.src||'').split('?')[0]; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='play_sound'){ const snds=(objectSounds[String(o.id)]||[]); let sfound=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(typeof sel==='string'){ sfound=snds.find(s=>s.name===sel);} else { sfound=snds.find(s=>String(s.id)===String(sel)); } } else { sfound=snds.find(s=>String(s.id)===String(block.val_a)); } if(sfound){ try{ const src=(sfound.src||''); if(src){ const a=new Audio(); a.src=src; a.volume=1; a.play().catch(()=>{});}}catch(_){} } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
-	        if (block.content==='instantiate'){ const objId=parseInt(block.val_a,10); const template=objects.find(obj=>obj.id===objId); if(template){ const newId=nextInstanceId++; if(registerRuntimeInstanceFromTemplate(newId, template.id)){ runInstanceStartChainSync(newId); } } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='switch_image'){ const imgs=(objectImages[String(o.id)]||[]); let found=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(sel==null||sel===''){ found=imgs.find(img=>String(img.id)===String(block.val_a)); } else if(typeof sel==='string'){ const s=sel.trim(); found=imgs.find(img=>img.name===s)||imgs.find(img=>String(img.id)===s); } else { found=imgs.find(img=>String(img.id)===String(sel)); } } else { found=imgs.find(img=>String(img.id)===String(block.val_a)); } if(found){ if(!runtimePositions[inst.instanceId]) runtimePositions[inst.instanceId]={x:0,y:0}; runtimePositions[inst.instanceId].spritePath = (found.src||'').split('?')[0]; } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='play_sound'){ const snds=(objectSounds[String(o.id)]||[]); let sfound=null; if(block.input_a!=null){ const sel=resolveInput(block,'input_a'); if(sel==null||sel===''){ sfound=snds.find(s=>String(s.id)===String(block.val_a)); } else if(typeof sel==='string'){ const s=sel.trim(); sfound=snds.find(x=>x.name===s)||snds.find(x=>String(x.id)===s); } else { sfound=snds.find(s=>String(s.id)===String(sel)); } } else { sfound=snds.find(s=>String(s.id)===String(block.val_a)); } if(sfound){ try{ const src=(sfound.src||''); if(src){ const a=new Audio(); a.src=src; a.volume=1; a.play().catch(()=>{});}}catch(_){} } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
+	        if (block.content==='instantiate'){ const objId=parseInt(block.val_a,10); const template=objectById[objId]; if(template){ const newId=nextInstanceId++; if(registerRuntimeInstanceFromTemplate(newId, template.id)){ runInstanceStartChainSync(newId); } } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='delete_instance'){ instancesPendingRemoval.add(inst.instanceId); exec.pc=null; continue; }
 	        if (block.content==='set_variable'){ const varName=block.var_name||''; const value=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; runtimeVariables[inst.instanceId][varName]=value; } else { runtimeGlobalVariables[varName]=value; syncFrameGlobalReadSnapshotAfterPublicWrite(varName); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	        if (block.content==='change_variable'){ const varName=block.var_name||''; const delta=parseNumericInput(resolveInput(block,'input_a') ?? block.val_a ?? 0); if(block.var_instance_only){ if(!runtimeVariables[inst.instanceId]) runtimeVariables[inst.instanceId]={}; const curVal=runtimeVariables[inst.instanceId][varName]; const current=(typeof curVal==='number')?curVal:0; runtimeVariables[inst.instanceId][varName]=current+delta; } else { const curVal=runtimeGlobalVariables[varName]; const current=(typeof curVal==='number')?curVal:0; runtimeGlobalVariables[varName]=current+delta; syncFrameGlobalReadSnapshotAfterPublicWrite(varName); } exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
@@ -10277,25 +10426,26 @@ function generateStandaloneHtml(project) {
 	        if (block.content==='forever'){ exec.repeatStack.push({ repeatBlockId:block.id, timesRemaining:Infinity, afterId:(typeof block.next_block_b==='number')?block.next_block_b:null }); exec.pc=(typeof block.next_block_a==='number')?block.next_block_a:null; continue; }
 	      }
 	      exec.pc = (typeof block.next_block_a==='number') ? block.next_block_a : null;
+	      steps += 1;
 	      totalStepsThisFrame += 1;
-	      if (typeof MAX_TOTAL_STEPS_PER_FRAME === 'number' && totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
-	      if (typeof TIME_BUDGET_MS === 'number' && (performance.now() - perInstanceBudgetStart) >= TIME_BUDGET_MS) break;
+	      if (totalStepsThisFrame >= MAX_TOTAL_STEPS_PER_FRAME) break;
+	      if ((performance.now() - perInstanceBudgetStart) >= TIME_BUDGET_MS) break;
 	    }
 	    if (exec.pc==null && exec.repeatStack.length>0){
 	      const frame=exec.repeatStack[exec.repeatStack.length-1];
 	      frame.timesRemaining-=1;
 	      if(frame.timesRemaining>0){
-	        const repeatBlock=code.find(b=>b&&b.id===frame.repeatBlockId);
+	        const repeatBlock=codeMap ? codeMap[frame.repeatBlockId] : code.find(b=>b&&b.id===frame.repeatBlockId);
 	        if(repeatBlock && repeatBlock.content==='forever'){
-	          exec.waitMs = LOOP_YIELD_MS;
-	          exec.waitingBlockId = repeatBlock.id;
+	          exec.yieldFrame = true;
+	          exec.yieldResumePc = (typeof repeatBlock.next_block_a === 'number') ? repeatBlock.next_block_a : null;
 	          exec.pc = null;
 	          break outerLoop;
 	        }
 	        exec.pc = repeatBlock && (typeof repeatBlock.next_block_a==='number') ? repeatBlock.next_block_a : null;
 	        if(exec.pc!=null){ continue outerLoop; }
-	        exec.waitMs = LOOP_YIELD_MS;
-	        exec.waitingBlockId = repeatBlock ? repeatBlock.id : null;
+	        exec.yieldFrame = true;
+	        exec.yieldResumePc = null;
 	        break outerLoop;
 	      }
 	      exec.repeatStack.pop();
@@ -10305,15 +10455,7 @@ function generateStandaloneHtml(project) {
 	    break outerLoop;
 	    }
 	  }
-	  if (!(__stepOnlyInstanceIds && Array.isArray(__stepOnlyInstanceIds) && __stepOnlyInstanceIds.length>0)){
-	    let nonControllerCount = 0;
-	    for (let ri = 0; ri < runtimeInstances.length; ri++) {
-	      const o = objects.find(obj=>obj.id===runtimeInstances[ri].templateId);
-	      if (!isAppCtrl(o)) nonControllerCount++;
-	    }
-	    if (nonControllerCount > 0) { rrInstanceStartIndex = (rrInstanceStartIndex + 1) % nonControllerCount; }
-	  }
-	  // Instantiate runs synchronously in the Instantiate block (runInstanceStartChainSync).
+	  
 	  if (instancesPendingRemoval && instancesPendingRemoval.size>0){
 	    runtimeInstances = runtimeInstances.filter(inst=>{ if(instancesPendingRemoval.has(inst.instanceId)){ delete runtimePositions[inst.instanceId]; delete runtimeVariables[inst.instanceId]; delete runtimeExecState[inst.instanceId]; return false; } return true; });
 	    instancesPendingRemoval.clear();
@@ -10360,29 +10502,68 @@ function generateStandaloneHtml(project) {
 	  gctx.clearRect(0,0,canvas.width,canvas.height);
 	  gctx.fillStyle='#777';
 	  gctx.fillRect(0,0,canvas.width,canvas.height);
+	  gctx.imageSmoothingEnabled=false;
 	  const centerX=canvas.width/2, centerY=canvas.height/2;
-	  const visibleEntries = runtimeInstances.map(inst=>{ const tmpl=objects.find(o=>o.id===inst.templateId); if (!tmpl) return null; const perInst=runtimePositions[inst.instanceId]||{}; const pth = perInst.spritePath || getFirstImagePathForTemplateId(tmpl.id); const path = pth ? String(pth).split('?')[0] : null; return path ? { inst, tmpl, path } : null; }).filter(Boolean);
-	  visibleEntries.forEach((entry,index)=>{
-	    const mediaPath=entry.path;
-	    let img=imageCache[mediaPath];
-	    if(!img){ img=new Image(); imageCache[mediaPath]=img; img.src=mediaPath; img.onerror=()=>{ console.warn('Image failed to load', mediaPath); }; }
-	    const drawIfReady=()=>{
-	      if(!img.complete || !(img.naturalWidth>0 && img.naturalHeight>0)) return;
-	      gctx.imageSmoothingEnabled=false;
-	      let scale = 1;
-	      if (runtimePositions[entry.inst.instanceId] && typeof runtimePositions[entry.inst.instanceId].scale==='number') { scale = Math.max(0, runtimePositions[entry.inst.instanceId].scale||1); }
-	      const dw=(img.naturalWidth||img.width)*scale, dh=(img.naturalHeight||img.height)*scale;
-	      let drawX, drawY;
-	      if (runtimePositions[entry.inst.instanceId]){ const p=worldToCanvas(runtimePositions[entry.inst.instanceId].x||0, runtimePositions[entry.inst.instanceId].y||0, canvas); drawX=Math.round(p.x-dw/2); drawY=Math.round(p.y-dh/2); } else { drawX=Math.round(centerX-dw/2); drawY=Math.round(centerY-dh/2); }
-	      const alpha = (typeof runtimePositions[entry.inst.instanceId]?.alpha === 'number') ? Math.max(0, Math.min(1, runtimePositions[entry.inst.instanceId].alpha)) : 1;
-	      if (typeof runtimePositions[entry.inst.instanceId]?.rot==='number'){ const angleRad=(runtimePositions[entry.inst.instanceId].rot||0)*Math.PI/180; gctx.save(); gctx.translate(drawX+dw/2, drawY+dh/2); gctx.rotate(angleRad); const prevAlpha=gctx.globalAlpha; gctx.globalAlpha = alpha; gctx.drawImage(img, -dw/2, -dh/2, dw, dh); gctx.globalAlpha=prevAlpha; gctx.restore(); } else { const prevAlpha=gctx.globalAlpha; gctx.globalAlpha = alpha; gctx.drawImage(img, drawX, drawY, dw, dh); gctx.globalAlpha=prevAlpha; }
-	    };
-	    if (img.complete) drawIfReady(); else img.onload=drawIfReady;
+	  const visibleEntries = [];
+	  for (let i = 0; i < runtimeInstances.length; i++) {
+	    const inst = runtimeInstances[i];
+	    const tmpl = objectById[inst.templateId];
+	    if (!tmpl) continue;
+	    const perInst = runtimePositions[inst.instanceId] || {};
+	    const pth = perInst.spritePath || getFirstImagePathForTemplateId(tmpl.id);
+	    const path = pth ? String(pth).split('?')[0] : null;
+	    if (path) visibleEntries.push({ inst, tmpl, path });
+	  }
+	  visibleEntries.sort((a, b) => {
+	    const la = (runtimePositions[a.inst.instanceId] && typeof runtimePositions[a.inst.instanceId].layer === 'number') ? runtimePositions[a.inst.instanceId].layer : 0;
+	    const lb = (runtimePositions[b.inst.instanceId] && typeof runtimePositions[b.inst.instanceId].layer === 'number') ? runtimePositions[b.inst.instanceId].layer : 0;
+	    return la - lb;
 	  });
+	  for (let ei = 0; ei < visibleEntries.length; ei++) {
+	    const entry = visibleEntries[ei];
+	    const mediaPath = entry.path;
+	    let img = imageCache[mediaPath];
+	    if (!img) { img = new Image(); img.crossOrigin = 'anonymous'; imageCache[mediaPath] = img; img.onerror = function(){ img._broken = true; }; img.src = mediaPath; }
+	    if (!img.complete || img._broken || !(img.naturalWidth > 0 && img.naturalHeight > 0)) continue;
+	    const perInst = runtimePositions[entry.inst.instanceId] || {};
+	    let scale = 1;
+	    if (typeof perInst.scale === 'number') scale = Math.max(0, perInst.scale || 1);
+	    const dw = (img.naturalWidth || img.width) * scale;
+	    const dh = (img.naturalHeight || img.height) * scale;
+	    const p = worldToCanvas(perInst.x || 0, perInst.y || 0, canvas);
+	    const drawX = Math.round(p.x - dw / 2);
+	    const drawY = Math.round(p.y - dh / 2);
+	    const alpha = (typeof perInst.alpha === 'number') ? Math.max(0, Math.min(1, perInst.alpha)) : 1;
+	    if (typeof perInst.rot === 'number') {
+	      const angleRad = (perInst.rot || 0) * Math.PI / 180;
+	      gctx.save();
+	      gctx.translate(drawX + dw / 2, drawY + dh / 2);
+	      gctx.rotate(angleRad);
+	      const prevAlpha = gctx.globalAlpha;
+	      gctx.globalAlpha = alpha;
+	      gctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+	      gctx.globalAlpha = prevAlpha;
+	      gctx.restore();
+	    } else {
+	      const prevAlpha = gctx.globalAlpha;
+	      gctx.globalAlpha = alpha;
+	      gctx.drawImage(img, drawX, drawY, dw, dh);
+	      gctx.globalAlpha = prevAlpha;
+	    }
+	  }
 	}
 
 	let last=performance.now();
-	function loop(now){ const dt=now-last; last=now; __touchFrameSerial++; stepInterpreter(dt); render(); requestAnimationFrame(loop); }
+	const FRAME_MS=1000/60;
+	function loop(now){
+	  requestAnimationFrame(loop);
+	  const elapsed=now-last;
+	  if(elapsed<FRAME_MS) return;
+	  last=now-(elapsed%FRAME_MS);
+	  __touchFrameSerial++;
+	  stepInterpreter(FRAME_MS);
+	  render();
+	}
 	startPlay();
 	requestAnimationFrame(loop);
 	</script>
@@ -10826,27 +11007,28 @@ function initializeImageEditor(params) {
 
     /** Refresh the node grid sprite from the editor canvas. Pass `existingDataUrl` when the caller already encoded (e.g. saveToDisk) to avoid a second toDataURL. */
     function updateGameObjectIcon(existingDataUrl) {
-        // Update the selected object's icon in the grid immediately
         const obj = objects.find(o => o.id == selected_object);
-        if (obj && obj.media && obj.media.length > 0) {
-            const dataUrl = existingDataUrl != null ? existingDataUrl : canvas.toDataURL('image/png');
+        if (!obj || !obj.media || obj.media.length === 0) return;
 
-            // Update the object's media path
-            obj.media[0].path = dataUrl;
+        const key = String(selected_object);
+        const list = objectImages[key] || [];
+        const isEditingSpriteImage = list.length > 0 && currentImageInfo === list[0];
+        if (!isEditingSpriteImage) return;
 
-            // Update the grid icon immediately
-            const box = document.querySelector(`.box[data-id="${obj.id}"]`);
-            if (box) {
-                let img = box.querySelector('img');
-                if (!img) {
-                    img = document.createElement('img');
-                    box.insertBefore(img, box.firstChild);
-                }
-                img.src = dataUrl;
-                img.alt = obj.name;
-                img.style.width = "75px";
-                img.style.height = "75px";
+        const dataUrl = existingDataUrl != null ? existingDataUrl : canvas.toDataURL('image/png');
+        obj.media[0].path = dataUrl;
+
+        const box = document.querySelector(`.box[data-id="${obj.id}"]`);
+        if (box) {
+            let img = box.querySelector('img');
+            if (!img) {
+                img = document.createElement('img');
+                box.insertBefore(img, box.firstChild);
             }
+            img.src = dataUrl;
+            img.alt = obj.name;
+            img.style.width = "75px";
+            img.style.height = "75px";
         }
     }
 
@@ -10869,12 +11051,6 @@ function initializeImageEditor(params) {
             setLastSelectedImageForObject(selected_object, bust);
             lastSelectedImage = bust;
         } catch (_) {}
-        const obj = objects.find((o) => o.id == selected_object);
-        if (obj) {
-            if (!obj.media) obj.media = [];
-            if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
-            else obj.media[0].path = bust;
-        }
         scheduleRenderGameWindowSprite();
     }
 
@@ -10984,15 +11160,7 @@ function initializeImageEditor(params) {
             // Update only the selected thumbnail image to avoid re-render loops
             const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
             if (selectedThumb) selectedThumb.src = bust;
-            // Update selected and object media path
             selectedImage = bust;
-            const obj = objects.find(o => o.id == selected_object);
-            if (obj) {
-                if (!obj.media) obj.media = [];
-                if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
-                else obj.media[0].path = bust;
-            }
-            // Update game window preview
             scheduleRenderGameWindowSprite();
         } catch (e) {
             // On network or 404, gracefully save locally via dataUrl (static hosting fallback)
@@ -11011,12 +11179,6 @@ function initializeImageEditor(params) {
                 const selectedThumb = document.querySelector('.image-thumbnail-item.selected img');
                 if (selectedThumb) selectedThumb.src = bust;
                 selectedImage = bust;
-                const obj = objects.find(o => o.id == selected_object);
-                if (obj) {
-                    if (!obj.media) obj.media = [];
-                    if (obj.media.length === 0) obj.media.push({ id: 1, name: 'sprite', type: 'image', path: bust });
-                    else obj.media[0].path = bust;
-                }
                 scheduleRenderGameWindowSprite();
                 // Optional: small toast indicating local save
                 try {
@@ -12492,6 +12654,8 @@ function initializeImageEditor(params) {
             if (ctxMenu) { e.preventDefault(); removeImageAssetContextMenu(); return; }
             const sndMenu = document.getElementById('__sound_asset_ctx_menu');
             if (sndMenu) { e.preventDefault(); removeSoundAssetContextMenu(); return; }
+            const codeCtxMenu = document.getElementById('__code_block_ctx_menu');
+            if (codeCtxMenu) { e.preventDefault(); removeCodeBlockContextMenu(); return; }
         }
         if (activeTab !== 'images') return;
         // Don't steal shortcuts while typing in inputs.

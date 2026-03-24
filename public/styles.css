@@ -1486,6 +1486,75 @@ button {
   border-color: rgba(255, 255, 255, 0.18);
 }
 
+.image-color-popup-sample-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.image-color-popup-sample {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: rgba(255, 255, 255, 0.92);
+  background: linear-gradient(180deg, rgba(0, 255, 204, 0.14) 0%, rgba(0, 255, 204, 0.06) 100%);
+  border: 1px solid rgba(0, 255, 204, 0.28);
+  border-radius: 8px;
+  cursor: pointer;
+  box-sizing: border-box;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.image-color-popup-sample svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+}
+
+.image-color-popup-sample:hover:not(:disabled) {
+  background: rgba(0, 255, 204, 0.18);
+  border-color: rgba(0, 255, 204, 0.4);
+  color: #fff;
+}
+
+.image-color-popup-sample:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.image-color-popup-rgb {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.82);
+  letter-spacing: 0.02em;
+}
+
+.image-color-popup-rgb-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.image-color-popup-rgb-label {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.5);
+}
+
 .image-color-popup-panel--custom {
   min-width: 260px;
   padding-top: 8px;
@@ -2536,7 +2605,8 @@ button {
 .image-edit-tool svg + .icon-fallback,
 .image-step-btn svg + .icon-fallback,
 .image-canvas-resize-toggle-icon svg + .icon-fallback,
-.sound-tool-btn svg + .icon-fallback {
+.sound-tool-btn svg + .icon-fallback,
+.image-color-popup-sample svg + .icon-fallback {
   display: none;
 }
 
@@ -3305,13 +3375,22 @@ input[type="color"] {
   flex-direction: column;
 }
 
+/* Outer row: only as tall as the waveform frame (canvas), not the whole workspace */
 .sound-waveform-stack {
   position: relative;
-  flex: 1 1 auto;
-  min-height: 160px;
+  flex: 0 0 auto;
   width: 100%;
   display: flex;
   flex-direction: column;
+  align-self: stretch;
+  overflow: visible;
+}
+
+/* Trim overlay is position:absolute;inset:0 on this — matches canvas height only */
+.sound-waveform-frame {
+  position: relative;
+  width: 100%;
+  flex: 0 0 auto;
   align-self: stretch;
   border-radius: var(--radius-md);
   overflow: hidden;
@@ -3340,7 +3419,7 @@ input[type="color"] {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 44px;
+  width: 28px;
   margin: 0;
   padding: 0;
   border: none;
@@ -3351,28 +3430,20 @@ input[type="color"] {
   transform: translateX(-50%);
   left: 0%;
   z-index: 3;
-  background: linear-gradient(
-    90deg,
-    rgba(18, 18, 20, 0.95) 0%,
-    rgba(255, 200, 90, 0.25) 38%,
-    rgba(255, 220, 120, 1) 50%,
-    rgba(255, 200, 90, 0.25) 62%,
-    rgba(18, 18, 20, 0.95) 100%
-  );
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.55),
-    0 4px 16px rgba(0, 0, 0, 0.5);
+  background: rgba(10, 12, 14, 0.94);
+  box-shadow: none;
+  overflow: hidden;
+}
+
+/* Accent edge faces the selected region (same side as the trim line on canvas) */
+.sound-trim-handle--start {
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  border-right: 2px solid var(--accent);
 }
 
 .sound-trim-handle--end {
-  background: linear-gradient(
-    90deg,
-    rgba(18, 18, 20, 0.95) 0%,
-    rgba(255, 200, 90, 0.25) 38%,
-    rgba(255, 220, 120, 1) 50%,
-    rgba(255, 200, 90, 0.25) 62%,
-    rgba(18, 18, 20, 0.95) 100%
-  );
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+  border-left: 2px solid var(--accent);
 }
 
 .sound-trim-handle:focus {
@@ -3380,28 +3451,23 @@ input[type="color"] {
 }
 
 .sound-trim-handle:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: 2px solid var(--accent-border-strong);
+  outline-offset: -2px;
 }
 
+/* Center grip — solid, no shadow */
 .sound-trim-handle::after {
   content: '';
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
-  width: 5px;
-  height: min(72%, 140px);
-  min-height: 48px;
-  border-radius: 3px;
-  background: repeating-linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.65) 0 3px,
-    rgba(255, 255, 255, 0.15) 3px 6px
-  );
-  opacity: 0.95;
+  width: 2px;
+  height: min(48%, 64px);
+  max-height: 100%;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.88);
   pointer-events: none;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
 }
 
 .sound-tool-btn--crop-active {
@@ -3462,24 +3528,6 @@ input[type="color"] {
   cursor: pointer;
   display: block;
   align-self: stretch;
-}
-
-.sound-scrub-bar {
-  height: 4px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  overflow: hidden;
-  cursor: pointer;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.sound-scrub-fill {
-  height: 100%;
-  width: 0%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, rgba(0, 255, 204, 0.25), rgba(0, 255, 204, 0.65));
-  pointer-events: none;
-  transition: width 0.05s linear;
 }
 
 .sound-crop-range {
